@@ -328,7 +328,8 @@ struct ComposePane: View {
                             ComposeAttach.add(
                                 data: png, filename: "pasted-image.png", mime: "image/png",
                                 to: .compose, at: at)
-                        } : nil
+                        } : nil,
+                    onDropHover: { dropTargeted = $0 }
                 )
                 .frame(maxHeight: .infinity)
                 .padding(8)

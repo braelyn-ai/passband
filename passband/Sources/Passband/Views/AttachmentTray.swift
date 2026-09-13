@@ -239,18 +239,29 @@ extension View {
         static func receive(_ providers: [NSItemProvider], slot: DraftSaver.Slot, at offset: Int?)
             -> Bool
         {
+            // Same gate as the paperclip: a daemon that cannot stage files
+            // must not be handed a drop the UI then fails on.
+            guard AppStore.shared.composeAttachmentsAvailable else { return false }
+            // Every provider loads on its own queue and lands in its own
+            // time; gathered by INDEX and added once they are all in, so two
+            // pictures dropped together keep the order they were dropped in.
+            let files = providers.filter {
+                $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+            }
+            if !files.isEmpty {
+                let gather = DropGather(count: files.count) { urls in
+                    ComposeAttach.add(urls: urls, to: slot, at: offset)
+                }
+                for (i, provider) in files.enumerated() {
+                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
+                        let url = (item as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                        Task { @MainActor in gather.landed(i, url) }
+                    }
+                }
+                return true
+            }
             var handled = false
             for provider in providers {
-                if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                    handled = true
-                    provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { item, _ in
-                        guard let data = item as? Data,
-                            let url = URL(dataRepresentation: data, relativeTo: nil)
-                        else { return }
-                        Task { @MainActor in ComposeAttach.add(urls: [url], to: slot, at: offset) }
-                    }
-                    continue
-                }
                 if let (type, mime, ext) = imageTypes.first(where: {
                     provider.hasItemConformingToTypeIdentifier($0.0.identifier)
                 }) {
@@ -266,6 +277,30 @@ extension View {
                 }
             }
             return handled
+        }
+
+        /// The urls of one drop, filled in by index as each provider answers,
+        /// handed on in drop order once every slot has been answered (a
+        /// provider that could not produce a url leaves a gap that is
+        /// skipped).
+        @MainActor
+        private final class DropGather {
+            private var slots: [URL??]
+            private var remaining: Int
+            private let done: ([URL]) -> Void
+
+            init(count: Int, done: @escaping ([URL]) -> Void) {
+                slots = Array(repeating: nil, count: count)
+                remaining = count
+                self.done = done
+            }
+
+            func landed(_ index: Int, _ url: URL?) {
+                guard slots[index] == nil else { return }
+                slots[index] = .some(url)
+                remaining -= 1
+                if remaining == 0 { done(slots.compactMap { $0 ?? nil }) }
+            }
         }
 
         /// The files on a pasteboard (a drag's, or the general one on paste).

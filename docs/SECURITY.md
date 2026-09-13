@@ -730,7 +730,9 @@ raw fetch found the write credential dead — a 403 telling the user to re-run
 re-encode allocates — or the send's own staged attachments total more than 25 MB),
 `rejected:attachment_missing` (an `attachment_ids` entry names no staged file — swept,
 deleted, or another account's — so the whole send is refused rather than going out
-with fewer files than the tray showed), `failed:fetch_original` (the forwarded
+with fewer files than the tray showed), `rejected:attachment_cid_clash` (two staged
+files carry one `content_id`, so the body's reference would resolve to a coin flip),
+`failed:fetch_original` (the forwarded
 original could not be read back, so nothing was sent), `rejected:compose`,
 `failed:gmail`, `ok`, `ok:forward`):
 

@@ -21,6 +21,9 @@ struct ComposeAttachmentsTests {
         removalClosesUpTheText()
         removalLeavesOtherMarkersAlone()
         inlineIsTheBodysWord()
+        caretFollowsAnInsertion()
+        reviewersGaps()
+        draftsOmitUnstagedMarkers()
         imagesAndFilesBucket()
         wireRestoreCarriesTheId()
 
@@ -45,7 +48,7 @@ struct ComposeAttachmentsTests {
         // the reference stays the same.
         let tricky = att("a](b).png")
         expect(ComposeMarkers.marker(for: tricky) == "![ab.png](cid:tok-1@passband)", "defused alt")
-        expect(ComposeMarkers.reference(tricky) == "cid:tok-1@passband", "reference is the raw cid")
+        expect(ComposeMarkers.reference(tricky) == "(cid:tok-1@passband)", "reference is the marker's destination, close included")
     }
 
     private static func tokensFitTheDaemonsAlphabet() {
@@ -127,7 +130,7 @@ struct ComposeAttachmentsTests {
             "every copy goes")
         // A bare reference typed by hand (no `![`) loses only the reference.
         expect(
-            ComposeMarkers.removeMarker(a, from: "see cid:tok-1@passband ok") == "see  ok",
+            ComposeMarkers.removeMarker(a, from: "see (cid:tok-1@passband) ok") == "see  ok",
             "a hand-typed reference is cut without eating the line")
     }
 
@@ -148,6 +151,69 @@ struct ComposeAttachmentsTests {
         expect(ComposeMarkers.isInline(a, in: "![anything](cid:tok-1@passband)"), "alt is irrelevant")
         // A different token is a different file.
         expect(!ComposeMarkers.isInline(a, in: "![x](cid:tok-2@passband)"), "another cid is not this one")
+    }
+
+    private static func caretFollowsAnInsertion() {
+        let a = att("shot.png")
+        let old = "hello\nworld"
+        // Dropped at the caret (after "hello"): the caret lands after the
+        // marker, ready to keep typing below it.
+        let new = ComposeMarkers.insertMarker(a, into: old, at: 5)
+        let grew = new.utf16.count - old.utf16.count
+        expect(ComposeMarkers.caretAfterEdit(old: old, new: new, caret: 5) == 5 + grew, "caret moves past the insertion")
+        // Dropped BELOW the caret: the caret stays where it was.
+        let below = ComposeMarkers.insertMarker(a, into: old, at: nil)
+        expect(ComposeMarkers.caretAfterEdit(old: old, new: below, caret: 2) == 2, "an insertion after the caret leaves it")
+        // Marker removed by the tray: the caret keeps its place, clamped.
+        let removed = ComposeMarkers.removeMarker(a, from: new)
+        expect(removed == old, "round trip")
+        expect(ComposeMarkers.caretAfterEdit(old: new, new: removed, caret: 999) == removed.utf16.count, "clamped to the shorter text")
+        expect(ComposeMarkers.caretAfterEdit(old: new, new: removed, caret: 3) == 3, "unmoved by a removal after it")
+        // Never past the end, never negative.
+        expect(ComposeMarkers.caretAfterEdit(old: "", new: "abc", caret: 0) == 3, "an insertion at 0 carries the caret")
+        expect(ComposeMarkers.caretAfterEdit(old: "abc", new: "abc", caret: -1) == 0, "negative clamps")
+    }
+
+    private static func reviewersGaps() {
+        let a = att("shot.png")
+        let m = ComposeMarkers.marker(for: a)
+        // Caret at the START of a line: no blank line above the marker.
+        expect(
+            ComposeMarkers.insertMarker(a, into: "hello\nworld", at: 6) == "hello\n\(m)\nworld",
+            "a drop at a line start adds no blank line")
+        // Two copies on ONE line both go.
+        expect(
+            ComposeMarkers.removeMarker(a, from: "x \(m) y \(m) z") == "x  y  z",
+            "every copy on a line goes")
+        // A bare reference beside ANOTHER file's marker must not eat it.
+        let b = att("b.png", cid: "bbb@passband")
+        let mb = ComposeMarkers.marker(for: b)
+        let line = "\(mb) see (cid:tok-1@passband) (x)"
+        expect(
+            ComposeMarkers.removeMarker(a, from: line) == "\(mb) see  (x)",
+            "a hand-typed reference cuts only itself")
+        // A marker padded with spaces still counts as the whole line.
+        expect(ComposeMarkers.removeMarker(a, from: "a\n  \(m)  \nb") == "a\nb", "padding is not content")
+        // A token that is a PREFIX of another's cannot claim its picture.
+        let one = att("1.png", cid: "tok-1")
+        let ten = att("10.png", cid: "tok-10")
+        expect(!ComposeMarkers.isInline(one, in: ComposeMarkers.marker(for: ten)), "tok-1 is not tok-10")
+        expect(ComposeMarkers.isInline(ten, in: ComposeMarkers.marker(for: ten)), "tok-10 is itself")
+        // Uppercase extensions still name their type.
+        expect(ComposeMarkers.mime(for: URL(fileURLWithPath: "/x/Y.JPG")) == "image/jpeg", "JPG is jpeg")
+    }
+
+    private static func draftsOmitUnstagedMarkers() {
+        var staged = att("a.png", cid: "aaa@passband")
+        staged.id = 7
+        let pending = att("b.png", cid: "bbb@passband")
+        var failed = att("c.png", cid: "ccc@passband")
+        failed.failed = true
+        let body = [staged, pending, failed].map(ComposeMarkers.marker(for:)).joined(separator: "\n") + "\nwords"
+        let out = ComposeMarkers.bodyWithoutUnstaged(body, [staged, pending, failed])
+        expect(out == ComposeMarkers.marker(for: staged) + "\nwords", "only the staged file's marker survives the draft: \(out)")
+        // Nothing pending: the body is untouched.
+        expect(ComposeMarkers.bodyWithoutUnstaged(body, [staged]) == body, "a fully staged tray changes nothing")
     }
 
     private static func imagesAndFilesBucket() {

@@ -2562,7 +2562,10 @@ final class AppStore {
         guard var next = compose, next.replyToMessageId == nil, next.forwardOfMessageId == nil,
             next.draftId == nil,
             next.to.isEmpty, next.cc.isEmpty, next.bcc.isEmpty, next.subject.isEmpty,
-            Prefs.shared.isBodyUntouched(next.body)
+            Prefs.shared.isBodyUntouched(next.body),
+            // A file dropped in the meantime is composing too: overwriting the
+            // tray with the draft's would orphan its upload and cut its marker.
+            next.attachments.isEmpty
         else { return }
         next.to = draft.to
         // Nil is a daemon too old to carry them, not an emptied field — leave
@@ -2647,7 +2650,7 @@ final class AppStore {
         guard e == epoch else { return }
         // Untouched, not empty — the seeded signature must not block the restore.
         guard var next = inlineReply, next.replyToMessageId == messageId, next.draftId == nil,
-            Prefs.shared.isBodyUntouched(next.body)
+            Prefs.shared.isBodyUntouched(next.body), next.attachments.isEmpty
         else { return }
         next.body = draft.body
         // Only a draft that actually recorded a copy list gets to state one:

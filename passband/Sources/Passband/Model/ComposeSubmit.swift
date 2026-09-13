@@ -74,7 +74,8 @@ enum ComposeSubmit {
                 forwardOfMessageId: c.forwardOfMessageId,
                 // Tray order. Every id must still resolve on the daemon or the
                 // send is refused — the tray is the promise.
-                attachmentIds: c.stagedAttachmentIds)
+                attachmentIds: c.stagedAttachmentIds,
+                attachmentBytes: c.attachments.reduce(0) { $0 + $1.size })
             capture(c, override, "sent")
             return .sent(result)
         } catch let apiError as APIError where apiError.kind == .guardBlocked {

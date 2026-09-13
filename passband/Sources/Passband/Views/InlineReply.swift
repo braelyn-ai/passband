@@ -357,7 +357,8 @@ struct InlineReply: View {
                     ComposeAttach.add(
                         data: png, filename: "pasted-image.png", mime: "image/png",
                         to: .inlineReply, at: at)
-                } : nil
+                } : nil,
+            onDropHover: { dropTargeted = $0 }
         )
         .frame(height: Self.editorHeight)
         .padding(8)
@@ -634,13 +635,15 @@ struct InlineReply: View {
         guard let compose = store.inlineReply else { return }
         // Same seed rule as the pane: an untouched signature is an empty body.
         guard !Prefs.shared.isBodyUntouched(compose.body) else {
-            // Same tray rule as the pane: a file still uploading or one that
-        // failed stops review here, in words.
-        if let problem = ComposeCopy.trayProblem(compose) {
-            patch { $0.error = problem }
+            patch { $0.error = "body is empty" }
             return
         }
-        patch { $0.error = "body is empty" }
+        // Same tray rule as the pane: a file still uploading or one that
+        // failed stops review here, in words. Outside the guard above, or a
+        // reply with words in it would sail into review with a file the
+        // send cannot name yet.
+        if let problem = ComposeCopy.trayProblem(compose) {
+            patch { $0.error = problem }
             return
         }
         patch {

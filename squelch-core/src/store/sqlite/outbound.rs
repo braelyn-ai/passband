@@ -25,6 +25,28 @@ fn map_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboundAttachmentMeta> {
 
 const META_COLS: &str = "id, filename, mime, size_bytes, content_id";
 
+/// Drop this account's leftovers: unclaimed rows past the TTL, and rows
+/// claimed by a draft that no longer exists (every draft delete cascades, so
+/// the second predicate is a belt for a row that slipped past one). Run from
+/// BOTH doors a composer uses — the upload and the draft save — so a mailbox
+/// that attaches once and never again still heals on its next autosave.
+pub(super) fn sweep(
+    conn: &Connection,
+    account_id: AccountId,
+    now: DateTime<Utc>,
+) -> rusqlite::Result<()> {
+    let cutoff = (now - OUTBOUND_UNCLAIMED_TTL).to_rfc3339();
+    conn.execute(
+        "DELETE FROM outbound_attachments
+         WHERE account_id = ?1
+           AND ((draft_id IS NULL AND created_at < ?2)
+                OR (draft_id IS NOT NULL
+                    AND draft_id NOT IN (SELECT id FROM drafts WHERE account_id = ?1)))",
+        params![account_id, cutoff],
+    )?;
+    Ok(())
+}
+
 /// The files a draft has claimed, upload order. Called with the connection
 /// already held, from the draft reads that embed it.
 pub(super) fn draft_attachments(
@@ -47,10 +69,9 @@ impl SqliteStore {
     /// the stored metadata, id included — the id is how every later request
     /// refers to the file.
     ///
-    /// SWEEPS ON THE WAY IN: every upload first deletes this account's
-    /// unclaimed rows older than [`OUTBOUND_UNCLAIMED_TTL`]. There is no
-    /// background task for this table, and the moment somebody is attaching a
-    /// file is the moment the table is being used at all.
+    /// SWEEPS ON THE WAY IN (see [`sweep`]): there is no background task for
+    /// this table, and the moment somebody is attaching a file is the moment
+    /// the table is being used at all. The draft save sweeps too.
     pub fn stage_outbound_attachment(
         &self,
         account_id: AccountId,
@@ -61,12 +82,7 @@ impl SqliteStore {
         now: DateTime<Utc>,
     ) -> Result<OutboundAttachmentMeta> {
         let conn = self.lock()?;
-        let cutoff = (now - OUTBOUND_UNCLAIMED_TTL).to_rfc3339();
-        conn.execute(
-            "DELETE FROM outbound_attachments
-             WHERE account_id = ?1 AND draft_id IS NULL AND created_at < ?2",
-            params![account_id, cutoff],
-        )?;
+        sweep(&conn, account_id, now)?;
         conn.execute(
             "INSERT INTO outbound_attachments(account_id, draft_id, filename, mime,
                  size_bytes, content_id, data, created_at)
@@ -149,6 +165,37 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// The `(id, size_bytes, content_id)` of each staged file among `ids`, in
+    /// the order asked, ids that name nothing absent — everything a send has
+    /// to refuse on, without a byte of the files themselves.
+    pub fn outbound_attachment_sizes(
+        &self,
+        account_id: AccountId,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, i64, String)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, size_bytes, content_id FROM outbound_attachments
+             WHERE account_id = ?1 AND id = ?2",
+        )?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let row = stmt
+                .query_row(params![account_id, id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .optional()?;
+            if let Some(row) = row {
+                out.push(row);
+            }
+        }
+        Ok(out)
+    }
+
     /// Drop one staged file. `false` when nothing matched, so another account's
     /// id is indistinguishable from an unknown one.
     pub fn delete_outbound_attachment(&self, account_id: AccountId, id: i64) -> Result<bool> {
@@ -189,9 +236,12 @@ impl SqliteStore {
         account_id: AccountId,
         draft_id: i64,
         ids: &[i64],
+        now: DateTime<Utc>,
     ) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
+        // The other door's sweep — see [`sweep`].
+        sweep(&tx, account_id, now)?;
         tx.execute(
             "UPDATE outbound_attachments SET draft_id = NULL
              WHERE account_id = ?1 AND draft_id = ?2",
@@ -275,7 +325,7 @@ mod tests {
             .upsert_draft(acct, None, DraftFields::default(), t0)
             .unwrap();
         store
-            .claim_outbound_attachments(acct, draft.id, &[claimed.id])
+            .claim_outbound_attachments(acct, draft.id, &[claimed.id], t0)
             .unwrap();
 
         // Two days on, a fresh upload runs the sweep.
@@ -297,6 +347,75 @@ mod tests {
     }
 
     #[test]
+    fn the_draft_save_sweeps_too_and_takes_orphans() {
+        // ISOLATING THE DRAFT-SAVE DOOR: every upload sweeps too, so the
+        // leftovers are arranged to survive the upload's sweep (the stale row
+        // is not stale YET when the fresh upload lands; the orphan is made
+        // after it) and to be taken only by the save that comes two days on.
+        let (store, acct) = store();
+        let t0 = Utc::now();
+        store
+            .stage_outbound_attachment(acct, "old.txt", "text/plain", "cid-old", b"x", t0)
+            .unwrap();
+        // Twenty-three hours on: the old row is not stale yet, so the fresh
+        // upload's own sweep leaves it; an hour after that it is.
+        let half = t0 + chrono::Duration::hours(23);
+        let fresh = store
+            .stage_outbound_attachment(acct, "new.txt", "text/plain", "cid-new", b"z", half)
+            .unwrap();
+        assert!(
+            staged(&store, "cid-old"),
+            "twenty-three hours old is not stale"
+        );
+        // A row claimed by a draft id that names nothing: an orphan. Pinned
+        // to an id no draft will ever get, rather than to a deleted draft's —
+        // `drafts.id` is a bare rowid, so the next insert would reuse it and
+        // quietly adopt the orphan.
+        let orphan = store
+            .stage_outbound_attachment(acct, "orphan.txt", "text/plain", "cid-orph", b"y", half)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE outbound_attachments SET draft_id = 999999 WHERE id = ?1",
+                params![orphan.id],
+            )
+            .unwrap();
+        // A day and a minute on, a draft SAVE (not an upload) runs the sweep:
+        // the old row is past the TTL now, the fresh one is not.
+        let later = t0 + chrono::Duration::hours(24) + chrono::Duration::minutes(1);
+        let d2 = store
+            .upsert_draft(acct, None, DraftFields::default(), later)
+            .unwrap();
+        store
+            .claim_outbound_attachments(acct, d2.id, &[fresh.id], later)
+            .unwrap();
+        // BY CONTENT ID, not by row id: the rows are bare rowids, and the
+        // swept ones' ids are handed straight to the next upload.
+        assert!(!staged(&store, "cid-old"), "stale, swept by the save");
+        assert!(
+            !staged(&store, "cid-orph"),
+            "claimed by a draft that is gone: swept whatever its age"
+        );
+        assert!(staged(&store, "cid-new"), "claimed now");
+    }
+
+    /// Whether a row with this content id exists at all.
+    fn staged(store: &SqliteStore, cid: &str) -> bool {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM outbound_attachments WHERE content_id = ?1",
+                params![cid],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            > 0
+    }
+
+    #[test]
     fn claiming_is_exact_and_never_steals_from_another_draft() {
         let (store, acct) = store();
         let now = Utc::now();
@@ -310,7 +429,7 @@ mod tests {
             .upsert_draft(acct, None, DraftFields::default(), now)
             .unwrap();
         store
-            .claim_outbound_attachments(acct, d1.id, &[a.id, b.id])
+            .claim_outbound_attachments(acct, d1.id, &[a.id, b.id], now)
             .unwrap();
         let d1 = store.list_drafts(acct).unwrap().remove(0);
         assert_eq!(
@@ -320,7 +439,7 @@ mod tests {
 
         // Removing `a` from the tray: the next save names only `b`.
         store
-            .claim_outbound_attachments(acct, d1.id, &[b.id])
+            .claim_outbound_attachments(acct, d1.id, &[b.id], now)
             .unwrap();
         let d1 = store.list_drafts(acct).unwrap().remove(0);
         assert_eq!(d1.attachments.len(), 1);
@@ -351,7 +470,7 @@ mod tests {
             .upsert_draft(acct, Some(m), DraftFields::default(), now)
             .unwrap();
         store
-            .claim_outbound_attachments(acct, d2.id, &[b.id])
+            .claim_outbound_attachments(acct, d2.id, &[b.id], now)
             .unwrap();
         let drafts = store.list_drafts(acct).unwrap();
         let d2 = drafts.iter().find(|d| d.id == d2.id).unwrap();
@@ -371,7 +490,7 @@ mod tests {
             .upsert_draft(acct, None, DraftFields::default(), now)
             .unwrap();
         store
-            .claim_outbound_attachments(acct, d.id, &[a.id])
+            .claim_outbound_attachments(acct, d.id, &[a.id], now)
             .unwrap();
         assert!(store.delete_draft(acct, d.id).unwrap());
         assert!(store.outbound_attachment(acct, a.id).unwrap().is_none());

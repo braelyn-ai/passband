@@ -85,11 +85,14 @@ enum ComposeMarkers {
         return "![\(alt)](cid:\(attachment.contentId))"
     }
 
-    /// The substring the daemon tests for. Both sides look for the raw
-    /// `cid:<token>`, so the marker's alt text is free to change without
-    /// changing what is inline.
+    /// The substring that says the body places this file: the marker's
+    /// destination, closing parenthesis included, so a token that happens to
+    /// be a prefix of another's (`tok-1` / `tok-10`) cannot claim its
+    /// picture. The daemon's `mark_inline` tests the rendered html for the
+    /// same reference with the same closing (`src="cid:token"`). The alt
+    /// text is free to change without changing what is inline.
     static func reference(_ attachment: ComposeAttachment) -> String {
-        "cid:\(attachment.contentId)"
+        "(cid:\(attachment.contentId))"
     }
 
     /// Whether the body places this file inline. The single source of truth.
@@ -150,17 +153,48 @@ enum ComposeMarkers {
             // Walk back to the `![` that opens this marker and forward to the
             // `)` that closes it; a reference not inside a marker (typed by
             // hand) is left alone by cutting only the reference itself.
+            // The reference ends with the marker's own `)`, so the close is
+            // in hand; walk back to the `![` that opens it.
             let open = out[..<range.lowerBound].range(of: "![", options: .backwards)
-            let close = out[range.upperBound...].firstIndex(of: ")")
-            if let open, let close,
-                !out[open.upperBound..<range.lowerBound].contains(")")
-            {
-                out.removeSubrange(open.lowerBound...close)
+            if let open, !out[open.upperBound..<range.lowerBound].contains(")") {
+                out.removeSubrange(open.lowerBound..<range.upperBound)
             } else {
                 out.removeSubrange(range)
             }
         }
         return out
+    }
+
+    /// The body a DRAFT records: every marker whose file has no daemon id
+    /// yet (still uploading, or failed) taken out. See `DraftSaver.save`.
+    static func bodyWithoutUnstaged(_ body: String, _ attachments: [ComposeAttachment]) -> String {
+        attachments.filter { $0.id == nil }.reduce(body) { body, att in
+            removeMarker(att, from: body)
+        }
+    }
+
+    /// Where the editor's caret goes after the body changed UNDER it — a
+    /// marker inserted by a drop or a paste, or removed by the tray — rather
+    /// than by typing: past an insertion that landed at or before the caret,
+    /// unmoved by one after it, and where it was (clamped) for anything that
+    /// is not a clean insertion. UTF-16 units, NSTextView's own.
+    static func caretAfterEdit(old: String, new: String, caret: Int) -> Int {
+        let o = Array(old.utf16), n = Array(new.utf16)
+        let grew = n.count - o.count
+        guard grew > 0 else { return min(max(caret, 0), n.count) }
+        // Where the insertion STARTS, found from the end: the marker lands on
+        // its own line, so the run inserted at the caret begins with a line
+        // break that the text after the caret may begin with too — matched
+        // from the front that break reads as unchanged and the insertion
+        // appears one unit late, past a caret sitting exactly at the drop
+        // point. Matched from the back the ambiguity resolves to the
+        // LEFTMOST start, which is the one a caret at the drop point wants.
+        var suffix = 0
+        while suffix < o.count, suffix < n.count, o[o.count - 1 - suffix] == n[n.count - 1 - suffix] {
+            suffix += 1
+        }
+        let start = max(0, n.count - suffix - grew)
+        return caret >= start ? min(caret + grew, n.count) : caret
     }
 
     /// The mime a file is uploaded under, from its extension. Unknown

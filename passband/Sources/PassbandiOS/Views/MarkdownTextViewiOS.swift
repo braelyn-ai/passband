@@ -46,6 +46,7 @@ struct MarkdownTextView: UIViewRepresentable {
     /// with; its files come in through the paperclip's document picker.
     var onDropFiles: (([URL], Int?) -> Void)? = nil
     var onPasteImage: ((Data, Int?) -> Void)? = nil
+    var onDropHover: ((Bool) -> Void)? = nil
 
     func makeUIView(context: Context) -> HighlightingTextView {
         let view = HighlightingTextView()

@@ -9315,6 +9315,11 @@ async fn staging_a_file_answers_its_metadata_and_serves_it_back() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
     assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        resp.headers()[header::CACHE_CONTROL],
+        "no-store",
+        "an unsent composition's bytes are not something to leave in a cache"
+    );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&bytes[..], b"PNGBYTES");
 
@@ -9380,6 +9385,13 @@ async fn staging_polices_what_it_stores() {
     // A filename is a name, never a path.
     let meta = stage(&app, "..%2F..%2Fevil.txt", "text/plain", "t1", b"1").await;
     assert_eq!(meta["filename"], "....evil.txt");
+
+    // A text file whose bytes are not UTF-8 is a blob: the MIME writer would
+    // otherwise declare a charset the bytes do not have.
+    let latin1 = stage(&app, "caf.txt", "text/plain", "t2", b"caf\xe9").await;
+    assert_eq!(latin1["mime"], "application/octet-stream");
+    let utf8 = stage(&app, "cafe.txt", "text/plain", "t3", "café".as_bytes()).await;
+    assert_eq!(utf8["mime"], "text/plain");
 
     // Empty is refused; the bearer is required.
     let resp = app
@@ -9448,6 +9460,27 @@ async fn a_draft_claims_exactly_the_files_it_names() {
     let draft = put_draft(
         &app,
         serde_json::json!({ "to": "alice@example.com", "body": "files, edited" }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
+
+    // `[]` releases every file, and the released file is still staged.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [] }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 0);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{b}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "released, not deleted");
+    // Claimed again for the rest of the test.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [b] }),
     )
     .await;
     assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
@@ -9603,4 +9636,284 @@ async fn stats_advertise_compose_attachments() {
     let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["compose_attachments"], true);
+}
+
+#[tokio::test]
+async fn a_failed_send_keeps_its_staged_files_and_its_draft() {
+    // Gmail refuses the message: the files are still on the tray, so the
+    // sender can fix whatever it was and send again without re-attaching.
+    let (base, handle) = mock_gmail_seq(vec![(500, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "x", "attachment_ids": [deck] }),
+    )
+    .await;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see attached",
+                "confirm": true,
+                "draft_id": draft["id"],
+                "attachment_ids": [deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(handle.await.unwrap().len(), 1);
+    assert!(
+        store.outbound_attachment(acct, deck).unwrap().is_some(),
+        "a failed send consumes nothing"
+    );
+    assert_eq!(
+        store.list_drafts(acct).unwrap().len(),
+        1,
+        "and the draft still holds it"
+    );
+    assert_eq!(store.list_drafts(acct).unwrap()[0].attachments.len(), 1);
+}
+
+#[tokio::test]
+async fn a_guard_blocked_send_keeps_its_staged_files() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+                "confirm": true,
+                "attachment_ids": [deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(handle.await.unwrap().len(), 0);
+    assert!(
+        store.outbound_attachment(acct, deck).unwrap().is_some(),
+        "the verdict is the first act; the file waits for the second"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_attachment_ids_send_one_part() {
+    let (base, handle) = mock_gmail(1).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see attached",
+                "confirm": true,
+                "attachment_ids": [deck, deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert_eq!(mime.matches("filename=\"deck.pdf\"").count(), 1);
+}
+
+#[tokio::test]
+async fn an_upload_past_the_router_default_body_limit_is_accepted_and_the_cap_is_not() {
+    // The `/client/*` router's default body limit is 2 MB; the upload route
+    // carries its own. 3 MB proves the layer is really on the route; 26 MB
+    // proves the cap still holds.
+    let Harness { app, .. } = harness(|_, _| {});
+    let three = vec![0x42u8; 3 * 1024 * 1024];
+    let resp = app
+        .clone()
+        .oneshot(upload(
+            "big.bin",
+            Some("application/octet-stream"),
+            Some("big1"),
+            &three,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["size"], 3 * 1024 * 1024);
+
+    let huge = vec![0x42u8; 26 * 1024 * 1024];
+    let resp = app
+        .oneshot(upload(
+            "huge.bin",
+            Some("application/octet-stream"),
+            Some("huge1"),
+            &huge,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_fan_out_carries_the_files_to_every_member_and_consumes_them() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, "{}".to_string()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let group = store
+        .create_send_group(
+            acct,
+            "Pair",
+            squelch_core::types::GroupMode::Individual,
+            "",
+            &["ann@fund.com", "bo@fund.com"].map(|addr| {
+                squelch_core::store::sqlite::groups::NewGroupMember {
+                    addr: addr.into(),
+                    display_name: None,
+                }
+            }),
+        )
+        .unwrap();
+    let shot = stage(&app, "shot.png", "image/png", "shot-1", b"PNG").await["id"]
+        .as_i64()
+        .unwrap();
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": group,
+                "subject": "Update #3",
+                "body": "the chart ![shot](cid:shot-1) and the deck",
+                "body_format": "markdown",
+                "confirm": true,
+                "attachment_ids": [shot, deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    for req in &reqs {
+        let mime = sent_mime(req);
+        assert!(
+            mime.contains("Content-Disposition: inline; filename=\"shot.png\""),
+            "{mime}"
+        );
+        assert!(mime.contains("Content-ID: <shot-1>"));
+        assert!(mime.contains("Content-Disposition: attachment; filename=\"deck.pdf\""));
+    }
+    assert!(store.outbound_attachment(acct, shot).unwrap().is_none());
+    assert!(store.outbound_attachment(acct, deck).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn attachments_over_the_message_ceiling_are_refused_before_their_bytes_are_read() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let thirteen = vec![0x41u8; 13 * 1024 * 1024];
+    let a = stage(&app, "a.bin", "application/octet-stream", "a1", &thirteen).await["id"]
+        .as_i64()
+        .unwrap();
+    let b = stage(&app, "b.bin", "application/octet-stream", "b1", &thirteen).await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "two big ones",
+                "confirm": true,
+                "attachment_ids": [a, b]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(handle.await.unwrap().len(), 0);
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("rejected:too_large"))
+    );
+    // Refused, not consumed.
+    assert!(store.outbound_attachment(acct, a).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn two_files_sharing_a_content_id_are_refused() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let a = stage(&app, "a.png", "image/png", "same", b"A").await["id"]
+        .as_i64()
+        .unwrap();
+    let b = stage(&app, "b.png", "image/png", "same", b"B").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "![a](cid:same)",
+                "body_format": "markdown",
+                "confirm": true,
+                "attachment_ids": [a, b]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("content id")
+    );
+    assert_eq!(handle.await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn the_guard_reads_an_attached_message_too() {
+    // An attached .eml is RFC822 text carrying whatever its bodies carried.
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let eml = "From: a@x.com\r\nSubject: keys\r\n\r\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n";
+    let id = stage(&app, "thread.eml", "message/rfc822", "e1", eml.as_bytes()).await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see the thread below",
+                "confirm": true,
+                "attachment_ids": [id]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(handle.await.unwrap().len(), 0);
 }

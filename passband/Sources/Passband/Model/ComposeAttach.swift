@@ -67,6 +67,9 @@ enum ComposeAttach {
     static func add(
         data: Data, filename: String, mime: String, to slot: DraftSaver.Slot, at offset: Int? = nil
     ) -> Int? {
+        // THE ONE DOOR, so the gate is here whatever opened it: a daemon that
+        // cannot stage files gets no row, no marker and no upload to fail.
+        guard AppStore.shared.composeAttachmentsAvailable else { return nil }
         // Edit phase only. Review is for reading what goes out, and a file
         // arriving there — a drop that missed, a late paste — would change
         // the mail under the sender's eyes without the ceremony noticing.
@@ -102,7 +105,7 @@ enum ComposeAttach {
             do {
                 let staged = try await APIClient.shared.stageAttachment(
                     filename: filename, mime: mime, contentId: attachment.contentId, data: data)
-                patch(slot, composer) { next in
+                let landed = patch(slot, composer) { next in
                     guard let i = next.attachments.firstIndex(where: { $0.key == attachment.key })
                     else { return }
                     next.attachments[i].id = staged.id
@@ -112,8 +115,11 @@ enum ComposeAttach {
                     next.attachments[i].mime = staged.mime
                 }
                 // The id is what the draft has to record; arm a save now
-                // rather than waiting for the next keystroke.
-                DraftSaver.shared.noteChange(slot)
+                // rather than waiting for the next keystroke — for THIS
+                // composer only. A slot that moved on holds a stranger's
+                // draft, and marking it touched would be marking it for a
+                // save it never asked for.
+                if landed { DraftSaver.shared.noteChange(slot) }
             } catch {
                 patch(slot, composer) { next in
                     guard let i = next.attachments.firstIndex(where: { $0.key == attachment.key })
@@ -189,7 +195,11 @@ enum ComposeAttach {
     /// bytes were seen at drop time.
     static func warm(_ attachment: ComposeAttachment) async -> PlatformImage? {
         if let hit = thumbs[attachment.contentId] { return hit }
-        guard attachment.isImage, let id = attachment.id else { return nil }
+        // The reader's own ceiling: a 24 MB photo is not fetched back for a
+        // 38pt tile; the glyph stands in.
+        guard attachment.isImage, let id = attachment.id,
+            attachment.size <= AttachmentKinds.thumbMaxBytes
+        else { return nil }
         if let running = thumbFetches[attachment.contentId] { return await running.value }
         let key = attachment.contentId
         let task = Task<PlatformImage?, Never> {
@@ -237,12 +247,15 @@ enum ComposeAttach {
     }
 
     /// Patch the slot ONLY IF it still holds composer `id` — every write after
-    /// an await goes through here. See the file header.
+    /// an await goes through here. See the file header. Returns whether it
+    /// did.
+    @discardableResult
     private static func patch(
         _ slot: DraftSaver.Slot, _ id: UUID, _ mutate: (inout ComposeState) -> Void
-    ) {
-        guard var next = read(slot), next.id == id else { return }
+    ) -> Bool {
+        guard var next = read(slot), next.id == id else { return false }
         mutate(&next)
         write(slot, next)
+        return true
     }
 }

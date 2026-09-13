@@ -678,7 +678,12 @@ pub async fn get_attachment(
     // Metadata exists but the bytes were never stored (over the ingest cap): 410.
     let bytes =
         data.ok_or_else(|| ApiError::new(StatusCode::GONE, "attachment bytes not stored"))?;
-    Ok(attachment_response(&filename, &mime, bytes))
+    Ok(attachment_response(
+        &filename,
+        &mime,
+        bytes,
+        "private, max-age=3600",
+    ))
 }
 
 /// One attachment's bytes as a response, under the header discipline that IS
@@ -686,7 +691,16 @@ pub async fn get_attachment(
 /// inbound door above and the staged-upload door below: a file the user
 /// attached themselves is served with exactly the caution a stranger's gets,
 /// because the byte endpoint cannot tell a screenshot from a renamed html.
-fn attachment_response(filename: &str, mime: &str, bytes: Vec<u8>) -> Response {
+///
+/// `cache` is the door's own policy: the inbound door may let a browser keep
+/// a photo for an hour, the staged-upload door is `no-store` like every other
+/// read of an unsent composition.
+fn attachment_response(
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    cache: &'static str,
+) -> Response {
     let ctype = safe_content_type(mime);
     let disposition = format!(
         "attachment; filename=\"{}\"",
@@ -713,7 +727,7 @@ fn attachment_response(filename: &str, mime: &str, bytes: Vec<u8>) -> Response {
     );
     h.insert(
         header::CACHE_CONTROL,
-        header::HeaderValue::from_static("private, max-age=3600"),
+        header::HeaderValue::from_static(cache),
     );
     resp
 }
@@ -867,11 +881,22 @@ pub async fn stage_compose_attachment(
         return Err(ApiError::bad_request("attachment is empty"));
     }
     let filename = clean_upload_filename(&q.filename);
-    let mime = clean_upload_mime(
+    let mut mime = clean_upload_mime(
         headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok()),
     );
+    // A `text/*` PART GOES OUT DECLARED `charset="utf-8"` (the MIME writer
+    // states the charset of the bytes it is handed, which for a forward's
+    // decoded parts is always UTF-8). An upload's bytes are whatever the file
+    // held — a Windows-1252 `notes.txt`, a UTF-16 export — and stamping UTF-8
+    // on those would render as mojibake at the other end. A text file whose
+    // bytes are not UTF-8 is therefore stored as a blob: it arrives intact,
+    // and the recipient's client works out the encoding the way it would for
+    // any download.
+    if mime.starts_with("text/") && std::str::from_utf8(&body).is_err() {
+        mime = "application/octet-stream".to_string();
+    }
     let content_id = match q.content_id.as_deref().map(str::trim) {
         Some(token) if content_id_ok(token) => token.to_string(),
         Some(_) => return Err(ApiError::bad_request("content_id must be a plain token")),
@@ -916,6 +941,7 @@ pub async fn get_compose_attachment(
         &att.meta.filename,
         &att.meta.mime,
         att.data,
+        "no-store",
     ))
 }
 
@@ -956,6 +982,42 @@ async fn load_send_attachments(
         }
     }
     let count = wanted.len();
+    // METADATA FIRST. Every file passes the per-file cap on its own, so ten
+    // of them could be 250 MB — pulled through the store mutex just to be
+    // refused. The sizes say everything the refusals need to know.
+    let sizes = {
+        let wanted = wanted.clone();
+        store_call(state, move |store, account_id| {
+            store.outbound_attachment_sizes(account_id, &wanted)
+        })
+        .await?
+    };
+    if sizes.len() != count {
+        audit_action(state, "send", target, "rejected:attachment_missing").await;
+        return Err(ApiError::bad_request(
+            "an attached file is no longer staged; remove it and attach it again",
+        ));
+    }
+    let total: i64 = sizes.iter().map(|(_, size, _)| size).sum();
+    if total > MAX_SEND_ATTACHMENT_BYTES as i64 {
+        audit_action(state, "send", target, "rejected:too_large").await;
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "attachments total more than 25 MB",
+        ));
+    }
+    // TWO PARTS WITH ONE CONTENT-ID would leave the html's reference pointing
+    // at whichever the recipient's client picks. The token is client-minted,
+    // so a collision is a client bug — refused here, where it costs nothing,
+    // rather than shipped as a coin flip.
+    let mut cids: Vec<&str> = sizes.iter().map(|(_, _, cid)| cid.as_str()).collect();
+    cids.sort_unstable();
+    if cids.windows(2).any(|w| w[0] == w[1]) {
+        audit_action(state, "send", target, "rejected:attachment_cid_clash").await;
+        return Err(ApiError::bad_request(
+            "two attached files share a content id; remove one and attach it again",
+        ));
+    }
     let rows = store_call(state, move |store, account_id| {
         store.outbound_attachments(account_id, &wanted)
     })
@@ -964,14 +1026,6 @@ async fn load_send_attachments(
         audit_action(state, "send", target, "rejected:attachment_missing").await;
         return Err(ApiError::bad_request(
             "an attached file is no longer staged; remove it and attach it again",
-        ));
-    }
-    let total: usize = rows.iter().map(|a| a.data.len()).sum();
-    if total > MAX_SEND_ATTACHMENT_BYTES {
-        audit_action(state, "send", target, "rejected:too_large").await;
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "attachments total more than 25 MB",
         ));
     }
     Ok(rows
@@ -2121,7 +2175,7 @@ pub async fn put_draft(
         // Claim under the same store call, then re-read: the row the upsert
         // returned was read before the claim and would list the OLD files.
         if let Some(ids) = attachment_ids {
-            store.claim_outbound_attachments(account_id, draft.id, &ids)?;
+            store.claim_outbound_attachments(account_id, draft.id, &ids, Utc::now())?;
             if let Some(fresh) = store.draft_by_id(account_id, draft.id)? {
                 draft = fresh;
             }
@@ -4124,8 +4178,11 @@ async fn forward_send(
     };
     // A forward of a 25 MB message is a memory spike and then an opaque failure
     // (see [`MAX_FORWARD_RAW_BYTES`]). Checked on the DECODED length, before the
-    // parse allocates its own copy of every part.
-    if forward_raw_too_large(raw.len()) {
+    // parse allocates its own copy of every part — and counting the sender's
+    // own staged files, which ride in the same message and were each under
+    // the cap on their own.
+    let staged: usize = attachments.iter().map(|a| a.data.len()).sum();
+    if forward_raw_too_large(raw.len() + staged) {
         audit_action(state, "send", target, "rejected:too_large").await;
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -4747,6 +4804,62 @@ pub async fn unsubscribe_resolution(
     )
     .await;
     Ok(Json(json!({ "sender": sender, "resolution": resolution })))
+}
+
+#[cfg(test)]
+mod upload_policy_tests {
+    use super::*;
+
+    #[test]
+    fn filenames_are_names_and_bounded() {
+        assert_eq!(clean_upload_filename("../../evil.txt"), "....evil.txt");
+        assert_eq!(clean_upload_filename("a\\b/c.pdf"), "abc.pdf");
+        assert_eq!(clean_upload_filename("  spaced.png  "), "spaced.png");
+        assert_eq!(clean_upload_filename("ctl\u{7}chars\n.txt"), "ctlchars.txt");
+        assert_eq!(clean_upload_filename(""), "attachment");
+        assert_eq!(clean_upload_filename("   "), "attachment");
+        assert_eq!(
+            clean_upload_filename("résumé.pdf"),
+            "résumé.pdf",
+            "unicode stays"
+        );
+        let long = "x".repeat(200) + ".pdf";
+        assert_eq!(clean_upload_filename(&long).chars().count(), 80);
+    }
+
+    #[test]
+    fn mimes_are_bare_media_types_or_a_blob() {
+        assert_eq!(clean_upload_mime(Some("image/PNG; charset=x")), "image/png");
+        assert_eq!(clean_upload_mime(None), "application/octet-stream");
+        assert_eq!(
+            clean_upload_mime(Some("nonsense")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            clean_upload_mime(Some("multipart/mixed; boundary=b")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            clean_upload_mime(Some("text/plain\r\nX: y")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            clean_upload_mime(Some("application/vnd.ms-excel")),
+            "application/vnd.ms-excel"
+        );
+    }
+
+    #[test]
+    fn content_ids_are_a_bounded_header_safe_alphabet() {
+        assert!(content_id_ok("a1b2-c3_d4.e5@passband"));
+        assert!(!content_id_ok(""));
+        assert!(!content_id_ok("a b"));
+        assert!(!content_id_ok("a\"b"));
+        assert!(!content_id_ok("a>b"));
+        assert!(!content_id_ok("a/b"));
+        assert!(content_id_ok(&"a".repeat(128)));
+        assert!(!content_id_ok(&"a".repeat(129)));
+    }
 }
 
 #[cfg(test)]

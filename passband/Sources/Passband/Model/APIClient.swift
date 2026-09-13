@@ -110,7 +110,15 @@ actor APIClient {
             guard let value, !value.isEmpty else { return nil }
             return URLQueryItem(name: key, value: value)
         }
-        if !pairs.isEmpty { comps.queryItems = pairs.sorted { $0.name < $1.name } }
+        if !pairs.isEmpty {
+            comps.queryItems = pairs.sorted { $0.name < $1.name }
+            // `URLComponents` leaves a literal `+` in a query value, and the
+            // daemon's form decoder reads a literal `+` as a SPACE — so a
+            // file called `C++ notes.pdf` would be staged as `C   notes.pdf`.
+            // Encode it, so what is sent is what was named.
+            comps.percentEncodedQuery = comps.percentEncodedQuery?
+                .replacingOccurrences(of: "+", with: "%2B")
+        }
         guard let url = comps.url else { throw APIError(.network, 0, "bad server url") }
 
         var req = URLRequest(url: url, timeoutInterval: timeout)
@@ -649,7 +657,8 @@ actor APIClient {
         body: String, replyToMessageId: Int? = nil, to: String? = nil, cc: String? = nil,
         bcc: String? = nil, groupId: Int? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
-        replyAll: Bool = false, forwardOfMessageId: Int? = nil, attachmentIds: [Int] = []
+        replyAll: Bool = false, forwardOfMessageId: Int? = nil, attachmentIds: [Int] = [],
+        attachmentBytes: Int = 0
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
@@ -685,10 +694,14 @@ actor APIClient {
                 // Omitted when empty, like everything else here.
                 attachment_ids: attachmentIds.isEmpty ? nil : attachmentIds),
             // A send that re-reads and base64s megabytes of files, then
-            // hands them to Gmail, gets the forward's budget rather than a
-            // JSON round-trip's.
+            // hands them to Gmail, gets a budget sized to what it carries —
+            // the forward's floor plus a second per 50 KB. A 20 MB send on
+            // a slow uplink that timed out CLIENT-side while the daemon
+            // finished would be retried, and the recipient would get it
+            // twice.
             timeout: forwardOfMessageId == nil && attachmentIds.isEmpty
-                ? Self.requestTimeout : Self.forwardTimeout)
+                ? Self.requestTimeout
+                : Self.forwardTimeout + TimeInterval(attachmentBytes / 50_000))
     }
 
     // MARK: - compose attachments

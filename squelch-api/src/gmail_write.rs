@@ -339,16 +339,17 @@ pub fn build_reply_rfc822(parts: &ReplyParts) -> Result<Vec<u8>, WriteError> {
 /// references is one the recipient would simply never see — and a part with no
 /// `Content-ID` at all cannot be referenced, so it is never inline.
 ///
-/// The test is the raw `cid:<token>` substring, which is what the renderer
-/// writes and what the recipient's client looks for; the token's own alphabet
-/// (see the upload handler) has no character that could make one token a
-/// prefix of another's reference inside a quoted attribute.
+/// The test is the EXACT attribute the renderer writes, `src="cid:<token>"`,
+/// closing quote included: a bare `cid:<token>` substring would let a token
+/// that is a prefix of another's (`1` and `10`) claim the other's picture,
+/// and would match the words `cid:x` typed into a sentence. What is matched
+/// is what the recipient's client resolves, and nothing else.
 pub fn mark_inline(attachments: &mut [MailAttachment], html: Option<&str>) {
     for att in attachments.iter_mut() {
         att.is_inline = match (&att.content_id, html) {
             (Some(cid), Some(html)) => {
                 let token = content_id_token(cid);
-                !token.is_empty() && html.contains(&format!("cid:{token}"))
+                !token.is_empty() && html.contains(&format!("src=\"cid:{token}\""))
             }
             _ => false,
         };
@@ -434,6 +435,15 @@ fn body_with_attachments(text: &str, html: Option<&str>, attachments: &[MailAtta
         out.push_str(&format!("--{mix}--\r\n"));
     }
     out
+}
+
+/// How long a `messages.send` may take: the client's ordinary minute, plus a
+/// second for every 50 KB of the message — a 25 MB attachment is ~34 MB on the
+/// wire, and 50 KB/s is a slow uplink, not a broken one. The Swift client
+/// sizes its own wait the same way (`APIClient.actionSend`), so neither side
+/// gives up on a send the other is still finishing.
+pub fn send_budget(raw_len: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(60 + (raw_len / 50_000) as u64)
 }
 
 /// The `messages.send` JSON body: `raw` base64url-encoded WITHOUT padding as
@@ -811,12 +821,25 @@ impl GmailWriteClient {
     /// POST a JSON body with the write bearer token. Never logs the token or
     /// the body.
     async fn post_json(&self, url: &str, body: &Value) -> Result<Value, WriteError> {
+        self.post_json_within(url, body, None).await
+    }
+
+    /// [`Self::post_json`] with its own budget, for a request whose body is
+    /// megabytes rather than a few hundred bytes: the client's flat 60 s is
+    /// sized for a reply, and a 30 MB message on a slow uplink would time out
+    /// HERE while Gmail was still receiving it — and then be sent again.
+    async fn post_json_within(
+        &self,
+        url: &str,
+        body: &Value,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Value, WriteError> {
         let token = self.write_token().await?;
-        let resp = self
-            .http
-            .post(url)
-            .bearer_auth(&token)
-            .json(body)
+        let mut req = self.http.post(url).bearer_auth(&token).json(body);
+        if let Some(timeout) = timeout {
+            req = req.timeout(timeout);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| WriteError::Transport(format!("gmail request failed: {e}")))?;
@@ -939,7 +962,9 @@ impl GmailWriteClient {
     pub async fn send(&self, raw: &[u8], thread_id: Option<&str>) -> Result<SentRef, WriteError> {
         let url = format!("{}/messages/send", self.base);
         let body = send_body(raw, thread_id);
-        let v = self.post_json(&url, &body).await?;
+        let v = self
+            .post_json_within(&url, &body, Some(send_budget(raw.len())))
+            .await?;
         Ok(SentRef {
             id: v["id"].as_str().map(str::to_string),
             thread_id: v["threadId"].as_str().map(str::to_string),
@@ -3880,6 +3905,18 @@ mod tests {
         assert!(atts[0].is_inline);
         assert!(!atts[1].is_inline, "a cid nobody references is a file");
         assert!(!atts[2].is_inline);
+        // A token that is a PREFIX of another's cannot claim its picture, and
+        // the words `cid:cid-a` in a sentence are not a reference.
+        let mut pair = vec![png("1.png", "1"), png("10.png", "10")];
+        mark_inline(
+            &mut pair,
+            Some("<p>see <img src=\"cid:10\" alt=\"x\"> and cid:1 too</p>"),
+        );
+        assert!(
+            !pair[0].is_inline,
+            "`1` is not `10`, and prose is not a reference"
+        );
+        assert!(pair[1].is_inline);
         // No html at all: nothing can be inline, whatever the flags said.
         atts[0].is_inline = true;
         mark_inline(&mut atts, None);
