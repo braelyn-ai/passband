@@ -1002,7 +1002,7 @@ export function App() {
         ) : (
           masthead
         )}
-        <p style={styles.tagline}>fuck email. lets make it bearable</p>
+        <p style={styles.tagline}>email sucks. lets make it bearable</p>
         <div style={styles.slot}>
           {joining ? (
             <Waitlist />
