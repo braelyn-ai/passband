@@ -266,7 +266,8 @@ pub async fn healthz() -> &'static str {
 /// itself. It is escaped either way, so this is not what stops a script; it is
 /// what stops the page from repeating an arbitrary stranger-supplied string
 /// back to whoever was sent the link.
-/// Any other parameter a link picked up on the way (a mail client's own
+/// Appearance middleware handles `?theme=light|dark`. Any other parameter
+/// a link picked up on the way (a mail client's own
 /// tracking cruft) is ignored rather than refused: it must not be able to break
 /// a signup.
 pub async fn signup_form(State(state): State<ControlState>, RawQuery(query): RawQuery) -> Response {
@@ -711,7 +712,8 @@ pub async fn console_auth(
 /// THE CONSOLE HOP WITH ITS INPUT REMOVED. `/console/auth` needs a label because
 /// a tenant console is a per-label web page that has to be returned to; the app
 /// is one app for every mailbox, so there is nothing for a caller to name and
-/// this route accepts nothing at all. Which tenant this was for is DISCOVERED
+/// this route accepts no identity input. The appearance middleware accepts
+/// `?theme=light|dark` for the return page. Which tenant this was for is DISCOVERED
 /// from the mailbox Google names, on the way back.
 ///
 /// THAT MAKES IT THE SAFER OF THE TWO, not the looser one. `/console/auth` had
