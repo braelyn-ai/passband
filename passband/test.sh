@@ -19,9 +19,36 @@ run_suite() {
   shift
   echo "==> $name"
   xcrun swiftc -swift-version 6 -parse-as-library -Onone \
-    -o "$BUILD/$name" "$@"
+    -o "$BUILD/$name" Sources/Passband/Lib/RehearsalMode.swift "$@"
   "$BUILD/$name"
 }
+
+# The real poller against a cancellation-oblivious transport: mailbox switches
+# must detach old requests before the next mailbox starts warming.
+run_suite sitrep-poller \
+  Sources/Passband/Lib/Concurrency.swift \
+  Sources/Passband/Model/SitrepPoller.swift \
+  Tests/SitrepPollerTests.swift
+
+run_suite onboarding-rehearsal \
+  Sources/Passband/Model/OnboardingRehearsal.swift \
+  Tests/OnboardingRehearsalTests.swift
+
+run_suite rehearsal-api \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/APIError.swift \
+  Sources/Passband/Model/OnboardingRehearsal.swift \
+  Sources/Passband/Model/RehearsalAPI.swift \
+  Tests/RehearsalAPITests.swift
+
+# Credential validation must never succeed against the fixture transport.
+run_suite credential-probe \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/APIError.swift \
+  Sources/Passband/Model/APIClient.swift \
+  Tests/CredentialProbeTests.swift
 
 run_suite anthropic-stream \
   Sources/Passband/Assistant/JSONValue.swift \
@@ -289,3 +316,13 @@ run_suite settings-search \
 run_suite from-operator \
   Sources/Passband/Lib/FromOperator.swift \
   Tests/FromOperatorTests.swift
+
+# The actual onboarding controller with in-memory collaborators: the store
+# stub flips the real RehearsalMode flag the way the real one does.
+run_suite tour-controller \
+  Sources/Passband/Model/PracticeTourStep.swift \
+  Sources/Passband/Model/TourController.swift \
+  Tests/TourControllerTests.swift
+
+# Full connection rehearsal must work even when normal onboarding was completed.
+"$BUILD/tour-controller" --onboarding-rehearsal --rehearse-connection

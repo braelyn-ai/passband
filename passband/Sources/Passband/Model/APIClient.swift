@@ -81,9 +81,8 @@ actor APIClient {
         config = nil
     }
 
-    var isConfigured: Bool { config != nil }
-
     private func requireConfig() throws -> Config {
+        if RehearsalMode.isEnabled { return Config(baseURL: "https://rehearsal.invalid", token: "practice") }
         guard let config else { throw APIError(.network, 0, "client not configured") }
         return config
     }
@@ -123,7 +122,13 @@ actor APIClient {
 
     /// Perform a request and return the raw body. Non-2xx throws an APIError
     /// whose message comes from the server's `{"error": …}` body when present.
-    private func perform(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    private func perform(_ req: URLRequest, allowPractice: Bool = true) async throws -> (Data, HTTPURLResponse) {
+        if RehearsalMode.isEnabled {
+            guard allowPractice else {
+                throw APIError(.badRequest, 400, "Finish the practice inbox before changing accounts.")
+            }
+            return try await RehearsalAPI.shared.response(for: req)
+        }
         let data: Data
         let response: URLResponse
         do {
@@ -352,6 +357,10 @@ actor APIClient {
     /// host that answers but is not a daemon must fail the same way it fails at
     /// the Connect gate.
     func probe(baseURL: String, token: String) async throws {
+        // A credential check must never accept the practice transport's stats.
+        guard !RehearsalMode.isEnabled else {
+            throw APIError(.badRequest, 400, "Finish the practice inbox before changing accounts.")
+        }
         var base = baseURL
         while base.hasSuffix("/") { base.removeLast() }
         guard let url = URL(string: base + "/client/stats") else {
@@ -361,7 +370,10 @@ actor APIClient {
         req.httpMethod = Method.GET.rawValue
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, _) = try await perform(req)
+        let (data, _) = try await perform(req, allowPractice: false)
+        guard !RehearsalMode.isEnabled else {
+            throw APIError(.badRequest, 400, "The mailbox changed during the credential check. Try again.")
+        }
         _ = try decode(StoreStats.self, from: data)
     }
 

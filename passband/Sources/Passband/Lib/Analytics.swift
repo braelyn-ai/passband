@@ -36,6 +36,10 @@ enum Analytics {
     private static let host = "https://us.i.posthog.com"
 
     private static let client: PostHogClient? = {
+        // A tester rehearsing the onboarding is not a user onboarding: no
+        // uploader at all for that launch. The customer's practice inbox runs
+        // in the ordinary app and reports like the rest of it (see `capture`).
+        guard !RehearsalMode.launchedStandalone else { return nil }
         let env = ProcessInfo.processInfo.environment
         let key = env["PASSBAND_POSTHOG_KEY"] ?? apiKey
         let endpoint = env["PASSBAND_POSTHOG_HOST"] ?? host
@@ -93,7 +97,7 @@ enum Analytics {
         "shipment_cleared",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
-        "tour_completed", "tour_skipped", "whats_new_shown",
+        "tour_started", "tour_completed", "tour_skipped", "whats_new_shown",
         "invite_sent", "invite_nudge_accepted", "invite_nudge_dismissed",
         "group_created", "group_updated", "group_deleted",
     ]
@@ -117,10 +121,13 @@ enum Analytics {
         "process_completed", "notification_opened", "sealed_revealed",
         "connect_succeeded", "connection_lost", "connection_restored",
         "account_added",
-        // Onboarding carries one number, the step it ended on. Whether the
-        // first run explains itself is exactly the "does the product work"
-        // question this level exists for.
-        "tour_completed", "tour_skipped",
+        // Onboarding carries where it started from and the practice step it
+        // ended on. Whether the first run explains itself is exactly the
+        // "does the product work" question this level exists for. Every
+        // other event captured while the practice inbox is up carries
+        // `practice: true` (see `capture`), so a fixture rule or a fixture
+        // done never counts as the real thing.
+        "tour_started", "tour_completed", "tour_skipped",
         // Sharing carries counts and nothing else: how many invites went, how
         // many did not, and whether the one-time ask was taken up. No address
         // is anywhere near this, at any level.
@@ -152,6 +159,11 @@ enum Analytics {
             "marketing", "general", "sealed", "normal", "unset",
             // rule_created dispositions
             "surface", "squelch", "filtered",
+            // tour_started sources (TourSource). "settings" is a MainView
+            // above; "rehearsal" never leaves the machine (no client on a
+            // standalone launch) but has to be in the vocabulary or the
+            // debug assert fires on the tester's own build.
+            "first_run", "rehearsal",
             // assistant_asked models — and search_deeper_started's, which is
             // the same closed set because it is the same picker's vocabulary.
             "haiku", "opus",
@@ -168,6 +180,10 @@ enum Analytics {
             // list readable as the vocabulary of THIS event.
             "rail", "settings", "nudge",
         ])
+
+    /// The funnel events that describe onboarding rather than happen inside
+    /// it — never tagged `practice`, whatever mode the app is in.
+    private static let onboardingEvents: Set<String> = ["tour_started", "tour_completed", "tour_skipped"]
 
     /// Screen views ride at `minimal` alongside lifecycle events.
     static func screen(_ name: String) {
@@ -202,6 +218,14 @@ enum Analytics {
                 assertionFailure("analytics: value outside vocabulary for \(key)")
             }
         }
+        // The practice inbox is the real app on fixture mail, so its `e`, its
+        // rule save and its undo all arrive here as the ordinary events. One
+        // bool keeps them out of the real counts without a second vocabulary.
+        // The onboarding funnel itself is the exception: those three ARE the
+        // real thing, and a dashboard that filters practice out must keep them.
+        if RehearsalMode.isEnabled, !onboardingEvents.contains(event) {
+            safe["practice"] = true
+        }
         client?.capture(event, properties: safe)
     }
 
@@ -210,6 +234,10 @@ enum Analytics {
     /// the level gate stays in `capture`.
     static func daily(_ event: String, _ properties: [String: Any] = [:]) {
         guard level != .none else { return }  // don't stamp a day we sent nothing
+        // Not from the practice inbox: a digest of fixture counts would burn
+        // the day's stamp and silence the real one — on a first run, the
+        // install's first real digest of all.
+        guard !RehearsalMode.isEnabled else { return }
         let key = "app.passband.analytics.daily.\(event)"
         let last = UserDefaults.standard.double(forKey: key)
         let now = Date().timeIntervalSince1970

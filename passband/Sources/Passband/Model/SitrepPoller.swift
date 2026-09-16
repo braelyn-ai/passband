@@ -55,6 +55,10 @@ final class SitrepPoller {
 
     func stop() {
         resident.stop()
+        // A new mailbox must never join a request for the mailbox just left.
+        // Cancellation alone is insufficient: transports may still finish.
+        inFlight?.cancel()
+        inFlight = nil
         if let focusObserver { NotificationCenter.default.removeObserver(focusObserver) }
         focusObserver = nil
     }
@@ -86,9 +90,12 @@ final class SitrepPoller {
     /// notices the reconnect.
     @discardableResult
     func pull() async -> Bool {
+        guard !Task.isCancelled, store.connStatus == .connected else { return true }
         if let inFlight { return await inFlight.value }
-        guard store.connStatus == .connected else { return true }
-        let task = Task { await self.performPull() }
+        // Capture before scheduling: a queued task must not adopt a newer
+        // mailbox epoch when it eventually starts.
+        let e = store.epoch
+        let task = Task { await self.performPull(epoch: e) }
         inFlight = task
         let ok = await task.value
         if inFlight == task { inFlight = nil }
@@ -141,14 +148,14 @@ final class SitrepPoller {
     }
 
     /// Returns whether the daemon answered; the caller decides what a failure costs.
-    private func performPull() async -> Bool {
+    private func performPull(epoch e: Int) async -> Bool {
         // The account this pull is ABOUT. A switch bumps the store's epoch, and
         // everything below writes the read model the whole app renders — bands
         // keyed by per-daemon message ids most of all. A stale answer reports
         // `true`: nothing was asked of the NEW daemon, so there is nothing for
         // the backoff loop to back off from (and that loop is stopped by the
         // switch anyway).
-        let e = store.epoch
+        guard !Task.isCancelled, store.isCurrent(e), store.connStatus == .connected else { return true }
         do {
             async let standing = APIClient.shared.getUpdates(
                 UpdatesParams(band: .standing, limit: Self.pageLimit))
@@ -160,7 +167,7 @@ final class SitrepPoller {
             async let sealed = APIClient.shared.listSealed()
 
             let (s, f, o, st, sl) = try await (standing, fresh, open, stats, sealed)
-            guard store.isCurrent(e) else { return true }
+            guard !Task.isCancelled, store.isCurrent(e) else { return true }
             let next = SitrepData(
                 standing: s.items, new: f.items, open: o.items, stats: st, sealed: sl)
             // ASSIGN ONLY ON CHANGE: @Observable notifies on assignment, not on
@@ -242,7 +249,7 @@ final class SitrepPoller {
             await store.refreshZones()
             return true
         } catch {
-            guard store.isCurrent(e) else { return true }
+            guard !Task.isCancelled, store.isCurrent(e) else { return true }
             // Transition only, before the error lands — count outages, not
             // every failing poll of one.
             if store.refreshError == nil { Analytics.capture("connection_lost") }

@@ -226,10 +226,10 @@ struct SitrepView: View {
     /// The records zones as the pinned rail shows them: full-width rows.
     @ViewBuilder
     private var railZones: some View {
-        CalendarZone()
-        ShipmentsZone()
-        BankingZone()
-        ReceiptsZone()
+        CalendarZone().tourTarget(.calendar)
+        ShipmentsZone().tourTarget(.shipments)
+        BankingZone().tourTarget(.banking)
+        ReceiptsZone().tourTarget(.receipts)
     }
 
     /// The records as HALF-WIDTH cards for the stacked layout. Two top-aligned
@@ -239,13 +239,13 @@ struct SitrepView: View {
     private var railCards: some View {
         HStack(alignment: .top, spacing: 16) {
             VStack(spacing: 16) {
-                CalendarZone()
-                BankingZone()
+                CalendarZone().tourTarget(.calendar)
+                BankingZone().tourTarget(.banking)
             }
             .frame(maxWidth: .infinity)
             VStack(spacing: 16) {
-                ShipmentsZone()
-                ReceiptsZone()
+                ShipmentsZone().tourTarget(.shipments)
+                ReceiptsZone().tourTarget(.receipts)
             }
             .frame(maxWidth: .infinity)
         }
@@ -266,6 +266,11 @@ struct SitrepView: View {
             }
             Spacer(minLength: 12)
             IngestIndicator()
+            // Only the practice board gets the rehearsal appearance control.
+            // The launch flag stays true after returning to the real inbox.
+            if RehearsalMode.launchedStandalone && RehearsalMode.isEnabled {
+                DemoAppearancePicker()
+            }
             RetriageButton()
             if needNow > 0 {
                 HStack(spacing: 5) {
@@ -281,7 +286,7 @@ struct SitrepView: View {
             Text(Fmt.todayStamp())
                 .font(Typo.num(11, weight: .medium))
                 .foregroundStyle(Palette.inkFaint)
-            SyncLabel()
+            if !RehearsalMode.isEnabled { SyncLabel() }
         }
         .padding(.horizontal, 24)
         // THE TOP BAR. The wordmark sits on the traffic lights' line rather than
@@ -312,7 +317,15 @@ struct SitrepView: View {
                     // No closures passed down: a stored closure is never equal to
                     // last render's, so handing rows their actions that way meant
                     // SwiftUI could not skip a single one when the parent redrew.
-                    ObligationRow(update: u, index: i, cursor: cursor)
+                    if RehearsalMode.isEnabled && u.id == 1 {
+                        ObligationRow(update: u, index: i, cursor: cursor)
+                            .tourTarget(.maya)
+                    } else if RehearsalMode.isEnabled && u.id == 11 {
+                        ObligationRow(update: u, index: i, cursor: cursor)
+                            .tourTarget(.brightly)
+                    } else {
+                        ObligationRow(update: u, index: i, cursor: cursor)
+                    }
                 }
                 if overflow > 0 { expander(overflow) }
             }
@@ -875,6 +888,7 @@ private struct StatusStrip: View {
 
     var body: some View {
         HStack(spacing: 9) {
+            if !RehearsalMode.isEnabled {
             ChromeChip(tone: Palette.inkDim, help: "check for new mail now") {
                 guard !refreshing else { return }
                 refreshing = true
@@ -892,6 +906,7 @@ private struct StatusStrip: View {
                 .font(Typo.micro)
             }
             .disabled(refreshing)
+            }
 
             if let cost = store.sitrep.stats?.stage2?.est_cost_usd_today {
                 Text("triage: \(String(format: "$%.2f", cost)) today")
