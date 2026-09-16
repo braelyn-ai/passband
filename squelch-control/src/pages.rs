@@ -557,7 +557,7 @@ pub fn signup_form(
 <label for="label">Your Passband address</label>
 <input type="text" id="label" name="label" value="{label}" placeholder="yourname"
   aria-describedby="label-hint" autocomplete="off" autocapitalize="off" spellcheck="false" required>
-<p class="hint" id="label-hint">yourname<span class="suffix">.{domain}</span> · 3–30 lowercase letters, numbers or hyphens.</p>
+<p class="hint" id="label-hint">yourname<span class="suffix">.{domain}</span> · 3 to 30 lowercase letters, numbers or hyphens.</p>
 </div>
 <button type="submit">Continue to Google</button>
 <p class="hint">Google will ask to read, change, and send your Gmail. Passband needs all three.</p>
@@ -589,6 +589,13 @@ Self-host to manage it yourself.</p>
 /// The code and the URL are `user-select: all` text rather than a copy button,
 /// because a copy button is JavaScript and this page has none. The deep link is
 /// the fast path; typing the code into the app is the path that always works.
+///
+/// THE DISCLOSURE'S SUMMARY NAMES THE SYMPTOM, not the mechanism. The path that
+/// always works is folded away, and the person who needs it is the person for
+/// whom the button just did nothing: a summary reading "connect manually" is
+/// findable only by somebody who already knows that is what went wrong, which
+/// is the one thing they do not know. See [`app_signed_in`], where the same
+/// line replaced a standing "if that button does nothing" heading.
 pub fn success(
     tenant_url: &str,
     pair_code: &str,
@@ -605,7 +612,7 @@ pub fn success(
 <p><a class="button" href="{link}">Open Passband</a></p>
 <p class="alt">Need the app? <a href="{download}">Download Passband</a>.</p>
 <details>
-<summary>Connect manually</summary>
+<summary>Button did nothing? Connect manually</summary>
 <p>Open Passband, choose hosted, and enter your server and pairing code.</p>
 <p><code>{url}</code></p>
 <p><span class="code">{code}</span></p>
@@ -629,6 +636,13 @@ If it expires, request a new code in Passband.</p>
 /// the code and the server are on it as `user-select: all` text too, exactly as
 /// they are on [`success`], and for the same reason: the link is the fast path
 /// and typing is the path that always works.
+///
+/// They are folded into a disclosure now rather than standing open, and the
+/// summary carries what the old standing `<h2>If that button does nothing</h2>`
+/// carried: the SYMPTOM. Every case in the paragraph above arrives here the same
+/// way, by pressing the button and watching nothing happen, so that is what the
+/// one line they will read has to say. A summary reading "connect manually"
+/// describes the remedy to somebody who has not yet worked out they need one.
 ///
 /// NO AUTOMATIC REDIRECT, and that is deliberate rather than unfinished. This
 /// page carries a live pairing code, and a redirect that fires on load would
@@ -656,7 +670,7 @@ pub fn app_signed_in(
 <p><a class="button" href="{link}">Open Passband</a></p>
 <p class="alt">Need the app? <a href="{download}">Download Passband</a>.</p>
 <details>
-<summary>Connect manually</summary>
+<summary>Button did nothing? Connect manually</summary>
 <p>Open Passband, choose hosted, and enter your server and pairing code.</p>
 <p><code>{url}</code></p>
 <p><span class="code">{code}</span></p>
@@ -1369,6 +1383,51 @@ mod tests {
         assert!(!html.contains("<script"));
     }
 
+    /// The fallback is FOLDED AWAY BUT LABELLED WITH THE SYMPTOM, on both pages
+    /// that end a flow.
+    ///
+    /// A `contains` over the whole document cannot tell a code somebody can read
+    /// from a code sealed inside a shut `<details>`, which is how the pairing
+    /// code came to be two presses deep under a green
+    /// `the_success_page_carries_the_code_the_url_and_the_link`. So this asserts
+    /// the arrangement rather than the presence: the code is INSIDE the
+    /// disclosure, and the disclosure's summary names what went wrong rather
+    /// than what to do about it. Moving the code back into the open should fail
+    /// here and be a deliberate edit to this test.
+    #[tokio::test]
+    async fn the_finishing_pages_label_the_fallback_with_the_symptom() {
+        for html in [
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+                None,
+            ))
+            .await,
+        ] {
+            let (open, folded) = html.split_once("<details>").expect("{html}");
+            // The deep link is the page; the code is the way out when it fails.
+            // Asserted on the wrapper, not the code: the `href` above carries
+            // the same string, and a code inside a link is not one to read off.
+            assert!(open.contains("passband://pair?url="), "{html}");
+            assert!(!open.contains(r#"<span class="code">"#), "{html}");
+            assert!(
+                folded.contains(r#"<span class="code">ABCD-EFGH</span>"#),
+                "{html}"
+            );
+            // Shut, so the summary is the whole of what gets read.
+            assert!(!html.contains("<details open"), "{html}");
+            let summary = folded
+                .split_once("</summary>")
+                .expect("{html}")
+                .0
+                .to_lowercase();
+            assert!(summary.contains("did nothing"), "{html}");
+        }
+    }
+
     /// THE DOWNLOAD LIVES AT THE END OF THE FLOW, not on the landing page: that
     /// page leads with the waitlist now, so these two are the only screens that
     /// hand anybody the client. Both need it, and each for its own reason: one
@@ -1820,9 +1879,21 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// House rule: no em dashes in anything a person reads.
+    /// House rule: no typographic dashes in anything a person reads.
+    ///
+    /// THE WHOLE FAMILY, not just the em dash this started as. An en dash is the
+    /// same mistake one code point over, and it walked straight past a test
+    /// written for U+2014 alone: `3–30 lowercase letters` shipped on the signup
+    /// form under a green run of exactly this test. A rule enforced for one
+    /// member of a set it means to cover is a rule that reads as enforced and
+    /// is not. Hyphen-minus is the only dash on these pages.
+    ///
+    /// The list below is every page that renders authored copy, and adding one
+    /// is part of adding a page: the guarantee is only as wide as the list.
     #[tokio::test]
-    async fn no_em_dashes_in_user_facing_copy() {
+    async fn no_typographic_dashes_in_user_facing_copy() {
+        // Figure dash, en dash, em dash, horizontal bar, minus sign.
+        const BANNED: [char; 5] = ['\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}'];
         for html in [
             body_of(signup_form(
                 "passband.email",
@@ -1833,11 +1904,26 @@ mod tests {
             ))
             .await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+                None,
+            ))
+            .await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(
                 StatusCode::BAD_REQUEST,
                 "Nope",
                 "Try again.",
+            ))
+            .await,
+            body_of(console_problem_with_link(
+                StatusCode::BAD_REQUEST,
+                "Nope",
+                "Try again.",
+                "https://ada.passband.email",
             ))
             .await,
             body_of(admin_login(Some("no"))).await,
@@ -1849,7 +1935,9 @@ mod tests {
             .await,
             body_of(admin_page(&[], &[], None)).await,
         ] {
-            assert!(!html.contains('\u{2014}'), "{html}");
+            for dash in BANNED {
+                assert!(!html.contains(dash), "U+{:04X} in {html}", u32::from(dash));
+            }
         }
     }
 
