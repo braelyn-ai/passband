@@ -248,24 +248,6 @@ fn bound_evidence_text(value: &mut Value, budget: usize) {
     if serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= budget) {
         return;
     }
-    fn count(value: &Value) -> usize {
-        match value {
-            Value::Object(fields) => fields
-                .iter()
-                .map(|(key, value)| {
-                    if matches!(key.as_str(), "body" | "content" | "text" | "snippet")
-                        && value.is_string()
-                    {
-                        1
-                    } else {
-                        count(value)
-                    }
-                })
-                .sum(),
-            Value::Array(values) => values.iter().map(count).sum(),
-            _ => 0,
-        }
-    }
     fn trim(value: &mut Value, limit: usize) {
         match value {
             Value::Object(fields) => {
@@ -310,9 +292,39 @@ fn bound_evidence_text(value: &mut Value, budget: usize) {
             _ => {}
         }
     }
-    let fields = count(value).max(1);
-    // JSON escaping can expand a byte up to six times. Leave structural room.
-    trim(value, budget / (fields * 8));
+    // Measure encoded JSON rather than assuming every character expands 8x.
+    // The subject message gets first use of the text allowance; remaining
+    // evidence shares what is left. Metadata is never silently discarded.
+    let original = value.clone();
+    let subject = original.get("message").cloned();
+    let fit = |subject_limit: usize, other_limit: usize| {
+        let mut candidate = original.clone();
+        trim(&mut candidate, other_limit);
+        if let Some(subject) = &subject {
+            let mut subject = subject.clone();
+            trim(&mut subject, subject_limit);
+            candidate["message"] = subject;
+        }
+        candidate
+    };
+    let search = |subject_limit: Option<usize>| {
+        let (mut low, mut high) = (0, budget);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let candidate = match subject_limit {
+                Some(limit) => fit(limit, middle),
+                None => fit(middle, 0),
+            };
+            if serde_json::to_vec(&candidate).is_ok_and(|bytes| bytes.len() <= budget) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        low
+    };
+    let subject_limit = search(None);
+    *value = fit(subject_limit, search(Some(subject_limit)));
 }
 
 /// Structural validation only: no category clamps, auth detector, or score floor.
@@ -1023,8 +1035,26 @@ mod tests {
         bound_evidence_text(&mut value, 1000);
         assert_eq!(value["message_id"], 7);
         assert_eq!(value["body_truncated"], true);
-        assert!(value["body"].as_str().unwrap().len() <= 125);
+        assert!(value["body"].as_str().unwrap().len() > 900);
+        assert!(serde_json::to_vec(&value).unwrap().len() <= 1000);
     }
+    #[test]
+    fn long_thread_retains_decisive_subject_content_within_encoded_limit() {
+        let body = format!("{}Payment is due tomorrow.", "x".repeat(23_900));
+        let mut value = json!({
+            "message": {"id": 1, "body": body},
+            "thread": (2..10).map(|id| json!({"id": id, "body": "é".repeat(6000)})).collect::<Vec<_>>()
+        });
+        let before = serde_json::to_vec(&value).unwrap().len();
+        bound_evidence_text(&mut value, 30_000);
+        assert_eq!(value["message"]["body"], body);
+        assert_eq!(value["thread"].as_array().unwrap().len(), 8);
+        let after = serde_json::to_vec(&value).unwrap().len();
+        assert!(after <= 30_000);
+        assert!(after > 29_000);
+        assert!(after < before / 3);
+    }
+
     struct ExtraEvidence;
     impl EvidenceReader for ExtraEvidence {
         fn read(&self, request: &EvidenceRequest) -> Result<EvidenceResult, String> {

@@ -126,7 +126,7 @@ fn context(conn: &Connection, account: AccountId, id: i64) -> Result<AgentContex
         params![account, message.from_addr],
         |row| row.get(0),
     )?;
-    let matched_rules = rules
+    let matched_rules: Vec<_> = rules
         .iter()
         .filter(|rule| {
             crate::triage::rules::glob_match(
@@ -152,7 +152,7 @@ fn context(conn: &Connection, account: AccountId, id: i64) -> Result<AgentContex
         .collect();
     let revision = ContextRevision {
         content: fingerprint(&content)?,
-        preferences: fingerprint(&(&rules, &corrections))?,
+        preferences: fingerprint(&(&matched_rules, sender_is_contact, &corrections))?,
         user_state: fingerprint(&state)?,
         attention_revision: attention.as_ref().map(|a| a.1).unwrap_or(0),
     };
@@ -1376,7 +1376,7 @@ impl AgentTriageStore for SqliteStore {
             .split_whitespace()
             .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
             .collect::<Vec<_>>()
-            .join(" AND ");
+            .join(" OR ");
         if expression.is_empty() {
             return Ok(Vec::new());
         }
@@ -2537,7 +2537,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .agent_search_mail(1, "body", 10)
+                .agent_search_mail(1, "body invoice nonexistent", 10)
                 .unwrap()
                 .iter()
                 .map(|m| m.id)
@@ -2644,6 +2644,22 @@ mod tests {
         assert_eq!(context.matched_rules.len(), 1);
         assert_eq!(context.matched_rules[0]["id"], 1);
     }
+    #[test]
+    fn unrelated_preferences_do_not_stale_paid_work() {
+        let store = fixture();
+        let (job, before) = claim(&store, 1);
+        store.lock().unwrap().execute("INSERT INTO sender_rules(account_id,match_pattern,want_text,disposition,updated_at) VALUES(1,'other@example.org','Ignore','squelch','2026-01-01')", []).unwrap();
+        let after = store.load_agent_context(&job).unwrap();
+        assert_eq!(before.revision.preferences, after.revision.preferences);
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE sender_rules SET match_pattern='sender@test'", [])
+            .unwrap();
+        let matching = store.load_agent_context(&job).unwrap();
+        assert_ne!(before.revision.preferences, matching.revision.preferences);
+    }
+
     #[test]
     fn ingest_duplicates_are_idempotent_and_account_scoped() {
         let store = fixture();

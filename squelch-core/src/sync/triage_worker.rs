@@ -202,7 +202,12 @@ fn bounded_message(message: &AgentMessage, chars: usize) -> serde_json::Value {
 }
 
 fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnapshot {
-    let siblings = context.thread.iter().take(limit).collect::<Vec<_>>();
+    let siblings = context
+        .thread
+        .iter()
+        .filter(|m| m.id != context.message.id)
+        .take(limit)
+        .collect::<Vec<_>>();
     let mut sources = siblings.iter().map(|m| m.id).collect::<Vec<_>>();
     sources.push(context.message.id);
     sources.sort_unstable();
@@ -216,7 +221,8 @@ fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnap
             "thread": siblings.iter().map(|m| bounded_message(m, 6_000)).collect::<Vec<_>>(),
             "previous_decision": context.previous_decision,
             "attention": context.attention,
-            "sender_preferences": context.rules,
+            "sender_preferences": context.matched_rules,
+            "sender_is_contact": context.sender_is_contact,
             "user_corrections": context.corrections,
             "trigger": job.trigger,
             "access_only": context.message.is_sent || context.message.is_spam,
@@ -230,7 +236,7 @@ fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnap
         .into_iter()
         .collect(),
         rule_ids: context
-            .rules
+            .matched_rules
             .iter()
             .filter_map(|r| r.get("id").and_then(|id| id.as_i64()))
             .collect(),
@@ -344,6 +350,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut exposed_ids = context
             .thread
             .iter()
+            .filter(|message| message.id != context.message.id)
             .take(self.config.triage.context.initial_thread_messages)
             .map(|message| message.id)
             .collect::<Vec<_>>();
