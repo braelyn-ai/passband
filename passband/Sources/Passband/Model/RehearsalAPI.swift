@@ -419,7 +419,7 @@ actor RehearsalAPI {
     /// as received mail. All styling is inline; there are no remote resources,
     /// links, tracking pixels, or scripts. The plain-text alternative stays intact.
     private func renderedHTML(_ message: OnboardingRehearsal.Message) -> String? {
-        if message.category == .newsletters { return newsletterHTML(message) }
+        if message.category == .reading { return newsletterHTML(message) }
         if message.id == 11 { return brightlyHTML() }
         if [10, 18].contains(message.id) { return calendarExperienceHTML(message) }
         if [13, 14].contains(message.id) { return rainforestHTML(message) }

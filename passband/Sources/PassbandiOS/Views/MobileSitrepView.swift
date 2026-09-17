@@ -1,6 +1,6 @@
 // THE PHONE'S DASHBOARD — the ACTION half of the Mac's SitrepView, folded to one
 // column: the hero states what needs you today, For-your-eyes ranks the standing
-// band, and the newsletters zone offers the rule-onboarding it always has.
+// band, and the reading zone offers the rule-onboarding it always has.
 //
 // The Mac's other half, the pinned records rail, is a TAB here instead
 // (MobileRecordsView). That split is the phone's own: a Mac shows work surface
@@ -49,7 +49,7 @@ struct MobileSitrepView: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
 
-    /// NewslettersZone takes a cursor because the Mac drives it with the
+    /// ReadingZone takes a cursor because the Mac drives it with the
     /// keyboard. Nothing writes to this one — it is the shared component's
     /// price of admission, and holding it here keeps that zone byte-identical
     /// across the two shells rather than forking it for the phone.
@@ -92,9 +92,9 @@ struct MobileSitrepView: View {
                 if !ranked.isEmpty {
                     forYourEyes(visible: visible, overflow: overflow, queue: ranked)
                 }
-                NewslettersZone(
-                    newsletters: Newsletters.prune(
-                        store.zones.newsletters, resolved: store.resolvedIds),
+                ReadingZone(
+                    senders: Reading.prune(
+                        store.zones.reading, resolved: store.resolvedIds),
                     cursor: cursor)
                 footnote
             }

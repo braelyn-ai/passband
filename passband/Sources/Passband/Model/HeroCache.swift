@@ -1,4 +1,4 @@
-// NEWSLETTER HERO CACHE — each sender's thumbnail resolved ONCE per thread id,
+// READING HERO CACHE — each sender's thumbnail resolved ONCE per thread id,
 // negative results included (a sender with no art must not re-walk its thread on
 // every LazyVGrid recycle), downsampled at decode time so the bytes kept are the
 // bytes drawn, and decoded/sampled in a detached task with only Sendable values
@@ -29,7 +29,7 @@ final class HeroCache {
 
     /// How many resolved heroes to keep. Each is a 108px thumbnail, so the
     /// ceiling is tens of megabytes at worst — generous enough that a session's
-    /// newsletters never re-fetch, bounded so a long one cannot grow forever.
+    /// cards never re-fetch, bounded so a long list cannot grow forever.
     private static let cacheMax = 512
 
     /// threadId -> resolved hero, or nil for "checked, has none". The outer

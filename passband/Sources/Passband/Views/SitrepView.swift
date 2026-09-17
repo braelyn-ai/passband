@@ -1,5 +1,5 @@
 // SITREP VIEW — the abstracted dashboard and default surface on launch: ranked
-// standing items, newsletters, a status strip and the records rail. Mail still
+// standing items, the reading zone, a status strip and the records rail. Mail still
 // landing is a spinner in the masthead (IngestIndicator), not a board zone.
 // Owns the "sitrep" KeyContext. No persistent selection — the focus fill renders
 // only while the keyboard drives, and hover must NOT drag it.
@@ -33,7 +33,7 @@ private func eyesWalk(_ store: AppStore, weight: Double) -> [AttentionUpdate] {
 /// enter/exit CONTINUOUSLY while a scroll drags rows under it, and a `@State`
 /// write at the top of the tree re-renders the whole dashboard for every one of
 /// them — re-ranking the standing list, rebuilding every row, re-measuring every
-/// newsletter card. Held here, a write only invalidates views that actually READ
+/// reading card. Held here, a write only invalidates views that actually READ
 /// that field, and the keymap reads all of it at KEY-PRESS time rather than at
 /// render time, so most of these writes reach no observer at all.
 @MainActor
@@ -47,9 +47,9 @@ final class SitrepCursor {
     var hovering = false
     /// Whether "for your eyes" is showing past the first `eyesVisible`.
     var expanded = false
-    /// Hovered newsletter address — `e` marks that sender's whole window done,
+    /// Hovered reading-card address — `e` marks that sender's whole window done,
     /// deferring to the For-your-eyes handler when nothing hovers.
-    var newsletter: String?
+    var reading: String?
 
     /// Point the cursor at a row the POINTER is over. EVERY WRITE IS GUARDED:
     /// `@Observable` notifies on assignment, not on change, so an unguarded
@@ -215,12 +215,12 @@ struct SitrepView: View {
             forYourEyes(visible: visible, overflow: overflow)
                 .tourTarget(.eyes)
         }
-        NewslettersZone(
-            newsletters: Newsletters.prune(
-                store.zones.newsletters, resolved: store.resolvedIds),
+        ReadingZone(
+            senders: Reading.prune(
+                store.zones.reading, resolved: store.resolvedIds),
             cursor: cursor
         )
-        .tourTarget(.newsletters)
+        .tourTarget(.reading)
     }
 
     /// The records zones as the pinned rail shows them: full-width rows.
@@ -378,13 +378,13 @@ struct SitrepView: View {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 Task { await Actions.done(u) }
             },
-            // `e` first tries the hovered newsletter card; with nothing hovered
+            // `e` first tries the hovered reading card; with nothing hovered
             // it DECLINES so the for-your-eyes done handler runs instead.
             KeyBinding(declining: "e", "mark done") {
-                if let addr = cursor.newsletter,
-                    let nl = store.zones.newsletters.first(where: { $0.address == addr })
+                if let addr = cursor.reading,
+                    let rs = store.zones.reading.first(where: { $0.address == addr })
                 {
-                    Task { await markNewsletterDone(nl) }
+                    Task { await markReadingDone(rs) }
                     return true
                 }
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return false }
@@ -445,11 +445,11 @@ struct SitrepView: View {
         cursor.index = max(0, min(rows.count - 1, next))
     }
 
-    private func markNewsletterDone(_ nl: Newsletter) async {
+    private func markReadingDone(_ rs: ReadingSender) async {
         // Bulk-resolve every aggregated update; one toast, optimistic drop.
-        store.zones.newsletters.removeAll { $0.address == nl.address }
+        store.zones.reading.removeAll { $0.address == rs.address }
         do {
-            for item in nl.items {
+            for item in rs.items {
                 try await APIClient.shared.setStatus(item.id, .done)
                 // Record it as resolved, not just gone from this zone: the same
                 // message can be sitting in a band or on the mail page, and this
@@ -461,7 +461,7 @@ struct SitrepView: View {
                 await ImageStore.shared.release(messageId: item.id)
             }
             store.pushToast(
-                "done: \(SenderCache.resolved(nl.sender).displayName) (\(nl.items.count))", .info)
+                "done: \(SenderCache.resolved(rs.sender).displayName) (\(rs.items.count))", .info)
         } catch {
             store.pushToast("some marks failed; refresh to re-sync", .error)
         }
@@ -847,7 +847,7 @@ private final class RowHover {
 /// triggers. An obligation row is a stack of stacks carrying three
 /// layout-priority bands and a `Label`, and re-running its body re-measures all
 /// of that, then propagates up through the zone card and the column. A
-/// newsletter card, which has neither priorities nor a Label, went smooth as
+/// reading card, which has neither priorities nor a Label, went smooth as
 /// soon as its parent stopped redrawing; these rows did not, and this is why.
 ///
 /// Down here nothing above can be resized: a background is sized by its primary

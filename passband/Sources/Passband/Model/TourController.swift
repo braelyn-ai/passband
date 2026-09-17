@@ -8,7 +8,7 @@ import Observation
 import SwiftUI
 
 enum TourTarget: Hashable, Sendable {
-    case records, newsletters, eyes, calendar, shipments, banking, receipts, brightly, maya
+    case records, reading, eyes, calendar, shipments, banking, receipts, brightly, maya
 }
 
 /// Which card the overlay shows. `practice` is the guide over fixture mail;

@@ -122,7 +122,7 @@ private enum ChipMetrics {
 /// A glass chip action — the app's one small-button shape. Padding is fixed
 /// here on purpose: a chip that sets its own padding is a chip that drifts.
 ///
-/// `tone` is the chip's ink; a label that colours its own parts (the newsletter
+/// `tone` is the chip's ink; a label that colours its own parts (the reading
 /// rule chip) simply overrides it further down.
 struct ChromeChip<Content: View>: View {
     private let tone: Color
