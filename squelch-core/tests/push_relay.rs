@@ -132,10 +132,35 @@ struct Harness {
     handle: tokio::task::JoinHandle<squelch_core::Result<()>>,
 }
 
+fn seed_message(store: &SqliteStore, account: i64, label: i64) -> i64 {
+    use squelch_core::types::NewMessage;
+    store
+        .upsert_message(&NewMessage {
+            account_id: account,
+            gmail_msg_id: format!("push-{label}"),
+            thread_id: format!("thread{label}"),
+            from_addr: SENDER.into(),
+            from_name: None,
+            subject: "Notification".into(),
+            received_at: chrono::Utc::now(),
+            snippet: String::new(),
+            body: "An arrival".into(),
+            body_html: None,
+            is_sent: false,
+            is_spam: false,
+            to_addrs: None,
+            list_unsubscribe: None,
+            list_unsub_one_click: false,
+            auth_pass: None,
+        })
+        .unwrap()
+}
+
 impl Harness {
     /// Append one event exactly as the sync engine does — through the store, so
     /// the attached notifier fires and the pusher wakes.
     fn emit(&self, message_id: i64) -> i64 {
+        let message_id = seed_message(&self.store, self.acct, message_id);
         self.store
             .append_event(&NewEvent {
                 account_id: self.acct,
@@ -654,6 +679,7 @@ async fn a_cold_start_joins_at_the_head() {
     let (base, relay) = spawn_relay().await;
     let h = start(&base, |store, acct| {
         for message_id in 1..=3 {
+            let message_id = seed_message(store, acct, message_id);
             store
                 .append_event(&NewEvent {
                     account_id: acct,
@@ -734,10 +760,11 @@ async fn the_relay_bearer_is_presented_when_configured() {
     })
     .await;
 
+    let message_id = seed_message(&store, acct, 1);
     store
         .append_event(&NewEvent {
             account_id: acct,
-            message_id: 1,
+            message_id,
             thread_id: "t1".to_string(),
             kind: EventKind::Urgent,
             tier: Tier::PastDue,
@@ -762,4 +789,69 @@ async fn the_relay_bearer_is_presented_when_configured() {
         .expect("prompt shutdown")
         .expect("join")
         .expect("clean exit");
+}
+
+#[tokio::test]
+async fn an_opened_queued_arrival_is_skipped_before_relay_dispatch() {
+    use squelch_core::store::{SyncState, agent_triage::AgentTriageStore};
+    let (base, relay) = spawn_relay().await;
+    let h = start(&base, |store, account| {
+        let message = seed_message(store, account, 1);
+        store
+            .set_triage(
+                message,
+                account,
+                0,
+                Tier::Noise,
+                squelch_core::types::Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        store
+            .append_event(&NewEvent {
+                account_id: account,
+                message_id: message,
+                thread_id: "thread1".into(),
+                kind: EventKind::Urgent,
+                tier: Tier::Signal,
+                importance: 0,
+                sender: SENDER.into(),
+                one_line: "Login alert".into(),
+                deadline: None,
+                sealed_kind: None,
+            })
+            .unwrap()
+            .unwrap();
+        store
+            .acknowledge_agent_message(account, message, chrono::Utc::now())
+            .unwrap();
+        store.upsert_device(account, DEV_A, "ios", None).unwrap();
+        store
+            .set_sync_state(
+                account,
+                CURSOR_KEY,
+                &SyncState {
+                    uidvalidity: 0,
+                    last_uid: 0,
+                },
+            )
+            .unwrap();
+    });
+    wait_for(
+        "the suppressed event cursor",
+        Duration::from_secs(2),
+        || h.cursor() == Some(1),
+    )
+    .await;
+    assert_eq!(relay.count(), 0);
+    let fresh = h.emit(2);
+    wait_for("the new arrival push", Duration::from_secs(5), || {
+        relay.count() == 1
+    })
+    .await;
+    assert_eq!(relay.bodies()[0]["event_id"], json!(fresh));
+    h.stop().await;
 }

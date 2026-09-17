@@ -103,11 +103,7 @@ final class SitrepPoller {
     /// sitrep has news — and because this can fire per sealed message, which is
     /// a rate the full pull has no business being run at.
     ///
-    /// It writes the read model and stops there: `AuthArrival` is driven by the
-    /// CHANGE to `store.sitrep.sealed` (see ShellWatchers), so the ring, the
-    /// audited auto-reveal and the code modal all come out of the same one door
-    /// whether a poll or an event found the mail. Calling `observe` from here
-    /// as well would be a second writer of one seen-set for no gain.
+    /// Updates explicit Auth lookup without triggering notifications or modals.
     ///
     /// Silent on every failure, and it does not touch `refreshError`: this is
     /// an opportunistic extra ask, and the poll loop above is what decides
@@ -150,19 +146,15 @@ final class SitrepPoller {
         // switch anyway).
         let e = store.epoch
         do {
-            async let standing = APIClient.shared.getUpdates(
-                UpdatesParams(band: .standing, limit: Self.pageLimit))
-            async let fresh = APIClient.shared.getUpdates(
-                UpdatesParams(band: .new, limit: Self.pageLimit))
-            async let open = APIClient.shared.getUpdates(
-                UpdatesParams(band: .open, limit: Self.pageLimit))
+            async let feed = APIClient.shared.getFeed(destination: "fye", limit: Self.pageLimit)
             async let stats = APIClient.shared.getStats()
             async let sealed = APIClient.shared.listSealed()
-
-            let (s, f, o, st, sl) = try await (standing, fresh, open, stats, sealed)
+            let (page, st, sl) = try await (feed, stats, sealed)
             guard store.isCurrent(e) else { return true }
+            // One ordered list. The older bands remain empty until the shared
+            // reader state no longer needs their compatibility fields.
             let next = SitrepData(
-                standing: s.items, new: f.items, open: o.items, stats: st, sealed: sl)
+                standing: page.items.map(\.row), new: [], open: [], stats: st, sealed: sl, totalCount: page.total_count)
             // ASSIGN ONLY ON CHANGE: @Observable notifies on assignment, not on
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
@@ -185,7 +177,7 @@ final class SitrepPoller {
             //
             // Counted off `next` rather than the store: identical in either
             // branch, and this is the value we just got from the daemon.
-            Badge.refresh(next.standing)
+            Badge.set(next.totalCount ?? next.standing.count)
             // FIRST SIGHT OF THE MAILBOX = the first chance to know the human's
             // name well enough to guess. Here rather than at connect time
             // because this is where the address arrives, and unconditional

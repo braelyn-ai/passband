@@ -308,6 +308,14 @@ impl Pusher {
             }
 
             for ev in &batch {
+                if !self
+                    .store
+                    .notification_delivery_allowed(self.account_id, ev.id)?
+                {
+                    cursor = ev.id;
+                    self.set_cursor(cursor)?;
+                    continue;
+                }
                 let outcome = self.push_event(ev, &devices).await?;
                 let dead = &outcome.dead;
                 for token in dead {

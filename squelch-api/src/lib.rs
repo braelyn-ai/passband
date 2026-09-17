@@ -5,6 +5,7 @@
 //! capability. No token, secret, or message body is ever logged. See
 //! docs/SECURITY.md §4.
 
+mod agent;
 mod assistant;
 mod auth;
 mod console;
@@ -23,6 +24,7 @@ mod pair;
 mod sharing;
 mod state;
 pub mod tracking;
+mod triage;
 pub mod unsubscribe;
 
 pub use assistant::AssistantRelay;
@@ -82,6 +84,23 @@ pub fn router(state: ApiState) -> Router {
 /// everything until `squelchd token issue` or a pairing claim mints one.
 fn client_router(state: ApiState) -> Router {
     Router::new()
+        .route("/client/agent/thread/{thread_id}", get(agent::thread))
+        .route("/client/agent/search", get(agent::search))
+        .route("/client/agent/feed", get(agent::feed))
+        .route("/client/agent/records", get(agent::records))
+        .route("/client/agent/triage/{message_id}", get(agent::decision))
+        .route("/client/v2/capabilities", get(triage::capabilities))
+        .route("/client/v2/feed", get(triage::feed))
+        .route("/client/v2/messages/{message_id}", get(triage::message))
+        .route(
+            "/client/v2/messages/{message_id}/opened",
+            post(triage::opened),
+        )
+        .route(
+            "/client/v2/messages/{message_id}/corrections",
+            post(triage::correct),
+        )
+        .route("/client/v2/triage/{message_id}", get(triage::decision))
         .route("/client/updates", get(handlers::get_updates))
         .route(
             "/client/updates/{message_id}/status",

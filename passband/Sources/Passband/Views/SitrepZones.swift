@@ -490,17 +490,11 @@ struct NewslettersZone: View {
         // Always on the board, empty or not: a zone that vanishes reads as a
         // missing feature, not as "nothing this week".
         ZoneCard(
-            symbol: "envelope.open", title: "Newsletters", count: newsletters.count,
-            subtitle: "recurring noise · choose what you want",
-            // This zone is a WEEK of RECURRING senders; the rest of the noise has
-            // no other door on the dashboard.
-            trailing: AnyView(
-                ChromeChip(text: "all noise", help: "the emails tab's noise page") {
-                    store.openMail(.noise)
-                })
+            symbol: "envelope.open", title: "Reading", count: newsletters.count,
+            subtitle: "newsletters, announcements, and offers"
         ) {
             if newsletters.isEmpty {
-                EmptyNote("No recurring senders this week.")
+                EmptyNote("Nothing to read yet.")
             } else {
                 grid
             }
@@ -528,21 +522,15 @@ enum NewsletterFeed {
     /// days client-side (the wire model carries no received_at).
     private static let fetchLimit = 200
 
-    static func load() async -> [Newsletter] {
+    static func load() async -> [Newsletter]? {
         do {
-            async let updates = APIClient.shared.getUpdates(
-                UpdatesParams(tier: .noise, limit: fetchLimit))
+            async let feed = APIClient.shared.getFeed(destination: "reading", limit: fetchLimit)
             async let rules = APIClient.shared.listRules()
-            // Best-effort: an older daemon has no /client/marketing, and the
-            // zone falls back to the legacy heuristic rather than rendering empty.
-            let marketing = (try? await APIClient.shared.getMarketing()) ?? []
-            let (page, rl) = try await (updates, rules)
-            return Newsletters.derive(
-                updates: page.items, rules: rl,
-                marketingIds: Set(marketing.map(\.message_id)))
+            let (page, preferences) = try await (feed, rules)
+            return Newsletters.derive(updates: page.items.map(\.readingRow), rules: preferences)
         } catch {
-            // Non-fatal: leave the zone empty rather than surfacing token/url.
-            return []
+            // Preserve the last successful reading feed on a transient error.
+            return nil
         }
     }
 }
@@ -567,7 +555,7 @@ private struct NewsletterCard: View {
         #if os(iOS)
             return "\(newsletter.count)×"
         #else
-            return "\(newsletter.count) this week"
+            return "\(newsletter.count) emails"
         #endif
     }
 
@@ -867,3 +855,36 @@ struct RecordRowStyle: ButtonStyle {
     }
 }
 
+
+
+/// Generic records remain readable even when no specialist card exists yet.
+/// Membership comes from the agent's Records destination, independently of FYE.
+struct AgentRecordsZone: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        ZoneCard(symbol: "tray.full", title: "Records", count: store.zones.records.count) {
+            if store.zones.records.isEmpty {
+                EmptyNote("Receipts, bills, deliveries, and other records appear here.")
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(store.zones.records.prefix(20)) { item in
+                        Button {
+                            store.openThread(item.thread_id, queue: store.zones.records,
+                                focusMessage: item.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.senderString).font(Typo.rowSub).foregroundStyle(Palette.ink)
+                                Text(item.one_line).font(Typo.micro).foregroundStyle(Palette.inkDim)
+                                    .lineLimit(2)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+        }
+    }
+}

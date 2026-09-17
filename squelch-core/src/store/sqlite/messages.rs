@@ -1,10 +1,7 @@
 //! Message ingest, thread views, attachments, deadlines, sync cursors
 //! and the sealed-mail reads.
 
-use super::specialists::{
-    auto_close_bill_for_receipt_conn, upsert_calendar_conn, upsert_receipt_conn,
-    upsert_shipment_conn,
-};
+use super::specialists::{upsert_calendar_conn, upsert_receipt_conn, upsert_shipment_conn};
 use super::*;
 
 /// Apply the unsubscribe VIOLATION bump for a just-stored inbound message, in
@@ -202,31 +199,80 @@ fn insert_attachments_conn(
     Ok(())
 }
 
-/// The shared entry guard for both thread views: SECURITY — if ANY message in
-/// this thread is sealed, the whole thread is NotFound, as is a thread with no
-/// messages at all. Returns the thread's subject (its earliest message's) so the
-/// caller never re-runs the same lookup.
-fn thread_guard_and_subject(
+/// Check the current assessment and every consumed source. Unknown assessments
+/// and changed sources fail closed, including dependencies of derived summaries.
+pub(super) fn external_message_allowed_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "WITH RECURSIVE dependencies(message_id) AS (
+             SELECT ?2
+             UNION
+             SELECT d.source_message_id FROM agent_decision_sources d
+             JOIN dependencies p ON p.message_id=d.message_id
+             WHERE d.account_id=?1
+         )
+         SELECT EXISTS(SELECT 1 FROM messages WHERE account_id=?1 AND id=?2)
+           AND NOT EXISTS(
+             SELECT 1 FROM dependencies d
+             LEFT JOIN messages m ON m.id=d.message_id AND m.account_id=?1
+             LEFT JOIN agent_message_state a ON a.message_id=d.message_id AND a.account_id=?1
+             WHERE m.id IS NULL OR a.access IS NULL OR a.access!='allowed'
+           )
+           AND NOT EXISTS(
+             SELECT 1 FROM agent_decision_sources d
+             JOIN dependencies p ON p.message_id=d.message_id
+             LEFT JOIN agent_message_state a ON a.message_id=d.source_message_id AND a.account_id=?1
+             WHERE d.account_id=?1 AND (a.revision IS NULL OR a.revision!=d.source_revision)
+           )",
+        params![account_id, message_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// External full-thread reads require every sibling to be allowed. The human
+/// reader bypasses this guard and may open pending or restricted mail.
+pub(super) fn thread_guard_and_subject(
     conn: &Connection,
     account_id: AccountId,
     thread_id: &str,
 ) -> Result<String> {
-    let sealed_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM triage
-         WHERE account_id=?1 AND sensitivity='sealed'
-           AND message_id IN (SELECT id FROM messages WHERE account_id=?1 AND thread_id=?2)",
-        params![account_id, thread_id],
-        |r| r.get(0),
-    )?;
-    if sealed_count > 0 {
+    let mut stmt = conn.prepare("SELECT id FROM messages WHERE account_id=?1 AND thread_id=?2")?;
+    let ids = stmt
+        .query_map(params![account_id, thread_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if ids.is_empty() {
         return Err(CoreError::NotFound);
     }
-    let subject: Option<String> = conn
-        .query_row(THREAD_SUBJECT_SQL, params![account_id, thread_id], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    subject.ok_or(CoreError::NotFound)
+    // Reading a legacy thread is demand for assessing its unseen sources. Queue
+    // a small batch, never every ancestor at arrival. Existing assessments and
+    // active or terminal work remain untouched; access stays closed until every source passes.
+    let missing: Vec<i64> = conn
+        .prepare(
+            "SELECT m.id FROM messages m
+         LEFT JOIN agent_message_state a ON a.account_id=m.account_id AND a.message_id=m.id
+         WHERE m.account_id=?1 AND m.thread_id=?2
+           AND (a.access IS NULL OR a.access='pending')
+           AND NOT EXISTS(SELECT 1 FROM agent_triage_jobs j
+             WHERE j.account_id=m.account_id AND j.message_id=m.id
+               AND j.kind IN ('triage','access') AND j.input_revision=a.revision)
+         ORDER BY m.received_at DESC,m.id DESC LIMIT 8",
+        )?
+        .query_map(params![account_id, thread_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    super::agent_triage::ensure_agent_source_ids_conn(conn, account_id, &missing)?;
+    for id in ids {
+        if !external_message_allowed_conn(conn, account_id, id)? {
+            return Err(CoreError::NotFound);
+        }
+    }
+    conn.query_row(THREAD_SUBJECT_SQL, params![account_id, thread_id], |row| {
+        row.get(0)
+    })
+    .optional()?
+    .ok_or(CoreError::NotFound)
 }
 
 // Shared with the query-plan regression test: LIMIT 1 must seek the thread,
@@ -298,49 +344,63 @@ fn load_client_attachments_conn(
     Ok(rows)
 }
 
+pub(super) fn external_shipment_allowed_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    shipment_id: i64,
+) -> Result<bool> {
+    type ShipmentProvenance = (Option<i64>, Option<i64>, Option<i64>, String);
+    let provenance: Option<ShipmentProvenance> = conn
+        .query_row(
+            "SELECT created_by_message_id,last_message_id,item_name_msg,item_name
+             FROM shipments WHERE account_id=?1 AND id=?2",
+            params![account_id, shipment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((Some(created), Some(last), name_source, name)) = provenance else {
+        return Ok(false);
+    };
+    if !name.trim().is_empty() && name_source.is_none() {
+        return Ok(false);
+    }
+    for id in [Some(created), Some(last), name_source]
+        .into_iter()
+        .flatten()
+    {
+        if !external_message_allowed_conn(conn, account_id, id)? {
+            return Ok(false);
+        }
+        let thread: String = conn.query_row(
+            "SELECT thread_id FROM messages WHERE account_id=?1 AND id=?2",
+            params![account_id, id],
+            |r| r.get(0),
+        )?;
+        if thread_guard_and_subject(conn, account_id, &thread).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl SqliteStore {
     pub(super) fn upsert_message(&self, msg: &NewMessage) -> Result<i64> {
         let conn = self.lock()?;
         upsert_message_conn(&conn, msg)
     }
 
-    /// THE LOCAL HALF OF "NOT SPAM": clear the provider's verdict on one message
-    /// and hand the row to triage as if it had just arrived.
-    ///
-    /// The Gmail half (add INBOX, remove SPAM) is the caller's, and runs FIRST —
-    /// see the `not_spam` handler. This is deliberately not idempotent-friendly
-    /// about the queue: it always requeues, because the reason a row is here is
-    /// that the user disagreed with the only verdict it ever had.
-    ///
-    /// What it resets and why:
-    ///
-    /// - `is_spam = 0`, which is the whole visibility change. Every listing's
-    ///   predicate does the rest, with no per-surface work.
-    /// - The LLM markers back to their never-processed state, because the row
-    ///   carries the neutral seed ingest writes for spam and nothing else. It
-    ///   has no verdict to keep.
-    /// - `retriage_at = now`, for the reason `retriage_reset` gives: rescued
-    ///   spam is usually days old, past every pass's stale cutoff, so without
-    ///   the force stamp the next tick would mark it processed without asking a
-    ///   model anything and the user would get their mail back untriaged.
-    /// - The attention lifecycle back to `new`. The row was very likely stamped
-    ///   surfaced the moment the spam page listed it, and mail arriving in the
-    ///   inbox for the first time belongs in the New band — leaving the stamp
-    ///   would file it under Open, which reads as "you have seen this".
-    ///
-    /// SEALED ROWS ARE REFUSED, as everywhere: a sealed row can carry `is_spam`
-    /// (Gmail misfiling an OTP is exactly how), and unsealing one by hand is not
-    /// a thing this route gets to do. Returns whether a row changed, so a
-    /// missing, sealed or already-unspammed id all read as `false` and 404.
+    /// Clear provider spam after the caller restores the message in Gmail.
+    /// Reset human attention state and enqueue canonical triage in the same
+    /// transaction. Rescue is push-silent, including for older messages. Legacy
+    /// pass markers are cleared for compatibility with older diagnostic readers.
+    /// Returns false for an unknown, foreign-account, or already rescued message.
     pub(super) fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
         let mut conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
         let tx = conn.transaction()?;
         let cleared = tx.execute(
             "UPDATE messages SET is_spam = 0
-             WHERE account_id = ?1 AND id = ?2 AND is_spam = 1
-               AND EXISTS(SELECT 1 FROM triage t
-                          WHERE t.message_id = ?2 AND t.sensitivity != 'sealed')",
+             WHERE account_id = ?1 AND id = ?2 AND is_spam = 1",
             params![account_id, message_id],
         )?;
         if cleared == 0 {
@@ -351,7 +411,7 @@ impl SqliteStore {
                 SET stage1_model_used = NULL, model_used = NULL, needs_stage2 = 0,
                     extractor_model_used = NULL, retriage_at = ?3,
                     status = 'new', surfaced_at = NULL, resolved_at = NULL
-              WHERE account_id = ?1 AND message_id = ?2 AND sensitivity != 'sealed'",
+              WHERE account_id = ?1 AND message_id = ?2",
             params![account_id, message_id, now],
         )?;
         // The row just became visible WITHOUT passing through the upsert, so
@@ -370,8 +430,32 @@ impl SqliteStore {
             from_name.as_deref(),
             &received_at,
         )?;
+        super::agent_triage::enqueue_agent_triage_conn(
+            &tx, account_id, message_id, "not_spam", false,
+        )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub fn external_thread_allowed(&self, account_id: AccountId, thread_id: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        match thread_guard_and_subject(&conn, account_id, thread_id) {
+            Ok(_) => Ok(true),
+            Err(CoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A shipment combines tracking, status, and name fields from different
+    /// messages. Every recorded contributor must have a current allowed decision.
+    /// Legacy records without provenance remain available only to the human.
+    pub fn external_shipment_allowed(
+        &self,
+        account_id: AccountId,
+        shipment_id: i64,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        external_shipment_allowed_conn(&conn, account_id, shipment_id)
     }
 
     pub(super) fn thread_view(&self, account_id: AccountId, thread_id: &str) -> Result<ThreadView> {
@@ -418,17 +502,14 @@ impl SqliteStore {
         message_id: i64,
     ) -> Result<Option<String>> {
         let conn = self.lock()?;
-        // SECURITY: a sealed message id resolves to `None` exactly like a
-        // nonexistent one, so the `get_thread` fallback cannot confirm that a
-        // sealed message exists. A message with no triage row COALESCEs to
-        // non-sealed so plain mail still resolves.
+        if !external_message_allowed_conn(&conn, account_id, message_id)? {
+            return Ok(None);
+        }
         let thread_id: Option<String> = conn
             .query_row(
                 "SELECT m.thread_id
                  FROM messages m
-                 LEFT JOIN triage t ON t.message_id = m.id
-                 WHERE m.account_id = ?1 AND m.id = ?2
-                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'",
+                 WHERE m.account_id = ?1 AND m.id = ?2",
                 params![account_id, message_id],
                 |r| r.get(0),
             )
@@ -442,9 +523,13 @@ impl SqliteStore {
         thread_id: &str,
     ) -> Result<ClientThreadView> {
         let conn = self.lock()?;
-        // SECURITY: same sealed/nonexistent -> NotFound guard as `thread_view`,
-        // so this human-door variant never reveals a sealed thread's html.
-        let subject = thread_guard_and_subject(&conn, account_id, thread_id)?;
+        // The human can read pending and restricted mail without waiting for triage.
+        let subject = conn
+            .query_row(THREAD_SUBJECT_SQL, params![account_id, thread_id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .ok_or(CoreError::NotFound)?;
 
         // Per-message triage rides along for in-thread attention highlighting.
         // LEFT JOIN: a message somehow missing its triage row still renders,
@@ -543,8 +628,7 @@ impl SqliteStore {
                  FROM attachments a
                  JOIN messages m ON m.id = a.message_id AND m.account_id = a.account_id
                  LEFT JOIN triage t ON t.message_id = a.message_id
-                 WHERE a.account_id = ?1 AND a.id = ?2
-                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                 WHERE a.account_id = ?1 AND a.id = ?2",
                 params![account_id, attachment_id],
                 |r| {
                     Ok((
@@ -564,7 +648,7 @@ impl SqliteStore {
         within_days: Option<u32>,
     ) -> Result<Vec<Deadline>> {
         let conn = self.lock()?;
-        // SECURITY: exclude deadlines whose source message is sealed.
+        // Human deadline reads include restricted source mail; external callers check access.
         // within_days = None means "all".
         let cutoff =
             within_days.map(|d| (Utc::now() + chrono::Duration::days(d as i64)).to_rfc3339());
@@ -579,10 +663,6 @@ impl SqliteStore {
              FROM deadlines d
              WHERE d.account_id = ?1
                AND d.due_at <= ?2
-               AND NOT EXISTS (
-                   SELECT 1 FROM triage t
-                   WHERE t.message_id = d.message_id AND t.sensitivity = 'sealed'
-               )
              ORDER BY d.due_at ASC",
         )?;
         let out = stmt
@@ -653,18 +733,9 @@ impl SqliteStore {
         //    normal mail. `model_used` stays NULL, which with
         //    sensitivity='normal' is the Stage-2 queue predicate.
         let deadline_dt = triaged.deadline.as_ref().map(|d| d.due_at.to_rfc3339());
-        // AUTO-RESOLVE receipts and calendar updates: both are RECORDS, not
-        // things to act on, so they start terminal ('done' + resolved_at), stay
-        // out of the New/Attention/Aging bands, and live only in their category.
-        // Other rows start 'new'.
+        // Record kinds never decide attention state. Preserve explicit lifecycle.
         let now_s = Utc::now().to_rfc3339();
-        let auto_resolved = triaged.sensitivity != Sensitivity::Sealed
-            && (triaged.receipt.is_some() || triaged.calendar.is_some());
-        let (status, resolved_at) = if auto_resolved {
-            ("done", Some(now_s.clone()))
-        } else {
-            ("new", None)
-        };
+        let (status, resolved_at): (&str, Option<String>) = ("new", None);
         // Re-ingest PRESERVES the existing attention lifecycle: a re-sync must not
         // reopen an item the user dismissed. Receipt/calendar rows are the
         // exception, force-resolved on every ingest — the CASE keys off
@@ -844,17 +915,6 @@ impl SqliteStore {
             ],
         )?;
 
-        // 2b. LOCAL DRAFT scrub, in the SAME transaction: a re-ingest can turn a
-        //     row that was normal when the draft was saved into a sealed one, and
-        //     `put_draft` would never accept a sealed parent. The reply
-        //     composition goes with the seal.
-        if triaged.sensitivity == Sensitivity::Sealed {
-            tx.execute(
-                "DELETE FROM drafts WHERE account_id = ?1 AND reply_to_message_id = ?2",
-                params![triaged.message.account_id, id],
-            )?;
-        }
-
         // 3. Deadlines: non-sealed mail only (Stage-1 never runs on sealed
         //    content), so a sealed re-ingest passes None and only clears.
         let ingest_deadline = if triaged.sensitivity == Sensitivity::Sealed {
@@ -894,19 +954,6 @@ impl SqliteStore {
                 r,
                 triaged.message.received_at,
             )?;
-
-            // 5b. RECEIPT -> OPEN-BILL AUTO-CLOSE, in the SAME transaction:
-            //     resolve the bill this payment settles and audit why. A missed
-            //     match is fine; a false close would hide an unpaid bill.
-            auto_close_bill_for_receipt_conn(
-                &tx,
-                triaged.message.account_id,
-                id,
-                &triaged.message.from_addr,
-                triaged.message.from_name.as_deref(),
-                r,
-                triaged.message.received_at,
-            )?;
         }
 
         // 6. Calendar update: NON-SEALED mail only, so `calendar_updates` is
@@ -929,6 +976,13 @@ impl SqliteStore {
         //    guards sealed parents. Replaces prior rows so re-ingest is
         //    idempotent; over-cap parts store a NULL blob.
         insert_attachments_conn(&tx, triaged.message.account_id, id, &triaged.attachments)?;
+        super::agent_triage::enqueue_agent_triage_conn(
+            &tx,
+            triaged.message.account_id,
+            id,
+            "ingest",
+            triaged.notify_eligible_at.is_some(),
+        )?;
 
         tx.commit()?;
         Ok(id)
@@ -1024,14 +1078,16 @@ impl SqliteStore {
     }
 
     pub(super) fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>> {
-        // LOCAL-ONLY: the only method that returns sealed rows. TUI use only.
+        // Human Auth lookup: canonical actionable auth plus unmigrated legacy rows.
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT m.id, m.account_id, m.thread_id, m.from_addr, m.subject,
-                    m.received_at, t.sealed_kind
+                    m.received_at, CASE WHEN s.message_id IS NOT NULL THEN CASE json_extract(d.decision_json,'$.auth.kinds[0]') WHEN 'sign_in_link' THEN 'magic_link' ELSE json_extract(d.decision_json,'$.auth.kinds[0]') END ELSE t.sealed_kind END
              FROM messages m
-             JOIN triage t ON t.message_id = m.id
-             WHERE m.account_id = ?1 AND t.sensitivity = 'sealed'
+             LEFT JOIN triage t ON t.message_id = m.id AND t.account_id=m.account_id
+             LEFT JOIN agent_message_state s ON s.message_id=m.id AND s.account_id=m.account_id
+             LEFT JOIN agent_message_decisions d ON d.message_id=m.id AND d.account_id=m.account_id
+             WHERE m.account_id = ?1 AND ((s.access='restricted' AND json_array_length(d.decision_json,'$.auth.kinds')>0) OR (s.message_id IS NULL AND t.sensitivity='sealed'))
              ORDER BY m.received_at DESC",
         )?;
         let out = stmt
@@ -1051,15 +1107,17 @@ impl SqliteStore {
     }
 
     pub(super) fn sealed_body(&self, account_id: AccountId, message_id: i64) -> Result<SealedBody> {
-        // HUMAN-DOOR-ONLY. Returns NotFound for a missing OR non-sealed message.
+        // Human Auth lookup detail. Ordinary email reads remain unrestricted.
         let conn = self.lock()?;
         let row = conn
             .query_row(
                 "SELECT m.id, m.account_id, m.thread_id, m.from_addr, m.from_name,
-                        m.subject, m.received_at, t.sealed_kind, m.body, m.body_html
+                        m.subject, m.received_at, CASE WHEN s.message_id IS NOT NULL THEN CASE json_extract(d.decision_json,'$.auth.kinds[0]') WHEN 'sign_in_link' THEN 'magic_link' ELSE json_extract(d.decision_json,'$.auth.kinds[0]') END ELSE t.sealed_kind END, m.body, m.body_html
                  FROM messages m
-                 JOIN triage t ON t.message_id = m.id
-                 WHERE m.account_id = ?1 AND m.id = ?2 AND t.sensitivity = 'sealed'",
+                 LEFT JOIN triage t ON t.message_id = m.id AND t.account_id=m.account_id
+             LEFT JOIN agent_message_state s ON s.message_id=m.id AND s.account_id=m.account_id
+             LEFT JOIN agent_message_decisions d ON d.message_id=m.id AND d.account_id=m.account_id
+                 WHERE m.account_id = ?1 AND m.id = ?2 AND ((s.access='restricted' AND json_array_length(d.decision_json,'$.auth.kinds')>0) OR (s.message_id IS NULL AND t.sensitivity='sealed'))",
                 params![account_id, message_id],
                 |r| {
                     Ok(SealedBody {
@@ -1087,30 +1145,8 @@ impl SqliteStore {
         offset: u32,
     ) -> Result<Vec<SentMessage>> {
         let conn = self.lock()?;
-        // HUMAN-DOOR-ONLY, and the ONE listing that reads `is_sent = 1` — every
-        // other one filters it out. That inversion is why the sealed guard here
-        // FAILS CLOSED: an INNER JOIN on `triage` plus `sensitivity != 'sealed'`,
-        // so a sent row whose triage row is missing (an interrupted ingest, a
-        // hand-written row) is excluded rather than COALESCEd to visible. Sent
-        // mail always gets its triage row in the same transaction as the message,
-        // so a missing one is a broken row, not an untriaged one.
-        //
-        // The NOT EXISTS is the THREAD-level belt on top of that per-row guard:
-        // seal detection is content-based per message, so the user's own reply
-        // in a thread sealed by a sibling (or sealed by hand) commits as
-        // 'normal' — yet `thread_view` 404s the whole thread. Listing that row
-        // would leak "Re: <sealed subject>" and dead-end the click, so a thread
-        // with ANY sealed sighting is excluded wholesale, matching the
-        // thread-level semantics of `thread_guard_and_subject`.
-        //
-        // A self-addressed message (a note to self) never lists here: its INBOX
-        // sighting pins `is_sent` to 0 in the upsert, by design — it surfaces
-        // as inbox mail instead.
-        //
-        // `opens` counts read receipts through `send_trackers`, which is what
-        // scopes the tracker to this account; `message_opens` carries no account
-        // of its own. NULL `to_addrs` (pre-backfill history, or a message whose
-        // headers named nobody) reads as "" on the wire.
+        // Human-only outbox: pending and restricted mail remain readable.
+        // Recipients and read receipts are scoped to the owning account.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, COALESCE(m.to_addrs, ''), m.subject, m.snippet,
                     m.received_at,
@@ -1118,16 +1154,8 @@ impl SqliteStore {
                      JOIN send_trackers st ON st.token = o.token
                      WHERE st.account_id = m.account_id AND st.message_id = m.id) AS opens
              FROM messages m
-             JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?1
                AND m.is_sent = 1
-               AND t.sensitivity != 'sealed'
-               AND NOT EXISTS (
-                   SELECT 1 FROM messages m2
-                   JOIN triage t2 ON t2.message_id = m2.id
-                   WHERE m2.account_id = m.account_id
-                     AND m2.thread_id = m.thread_id
-                     AND t2.sensitivity = 'sealed')
              ORDER BY m.received_at DESC, m.id DESC
              LIMIT ?2 OFFSET ?3",
         )?;

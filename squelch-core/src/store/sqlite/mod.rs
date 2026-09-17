@@ -8,6 +8,9 @@
 //! below, as inherent methods that block delegates to. A trait impl cannot be
 //! split across files, which is why the delegations exist.
 
+pub(crate) mod agent_budget;
+mod agent_deliveries;
+mod agent_triage;
 mod attention;
 mod audit;
 mod contacts;
@@ -330,8 +333,7 @@ impl SqliteStore {
             .query_row(
                 "SELECT m.id, m.gmail_msg_id, m.thread_id, m.from_addr, m.from_name, m.subject
                  FROM messages m
-                 JOIN triage t ON t.message_id = m.id
-                 WHERE m.account_id = ?1 AND m.id = ?2 AND t.sensitivity != 'sealed'",
+                 WHERE m.account_id = ?1 AND m.id = ?2",
                 params![account_id, message_id],
                 |r| {
                     Ok((
@@ -981,8 +983,31 @@ impl Store for SqliteStore {
         self.events_after(account_id, after_id, limit)
     }
 
+    fn notification_delivery_allowed(&self, account_id: AccountId, event_id: i64) -> Result<bool> {
+        self.notification_delivery_allowed(account_id, event_id)
+    }
+
     fn event_by_id(&self, account_id: AccountId, id: i64) -> Result<Option<Event>> {
         self.event_by_id(account_id, id)
+    }
+
+    fn record_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+        assessment: &crate::store::NotificationAssessment,
+    ) -> Result<()> {
+        self.record_notification_assessment(account_id, message_id, lane, assessment)
+    }
+
+    fn latest_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+    ) -> Result<Option<crate::store::NotificationAssessment>> {
+        self.latest_notification_assessment(account_id, message_id, lane)
     }
 
     fn record_notify_decision(&self, decision: &NewNotifyDecision) -> Result<bool> {

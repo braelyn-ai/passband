@@ -4,6 +4,7 @@
 //! its `Connection` in a `Mutex`; async callers wrap calls in
 //! `tokio::task::spawn_blocking`.
 
+pub mod agent_triage;
 pub mod recency;
 pub mod search_query;
 pub mod sqlite;
@@ -404,6 +405,19 @@ pub struct NotifyDecisionRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Model reasoning for human diagnostics. Never exposed through the external agent door.
+/// Contains bounded, nonsecret summaries, not raw message text or credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationAssessment {
+    pub is_auth: bool,
+    pub importance: u8,
+    pub one_line: String,
+    pub reason: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub assessed_at: DateTime<Utc>,
+}
+
 /// One registered APNs device.
 ///
 /// PRIVACY: `token` is capability material — written by the human door, read by
@@ -706,7 +720,7 @@ pub struct Stage1Queued {
     pub sensitivity: Sensitivity,
     /// `triage.retriage_at`: when a human last asked for THIS row to be
     /// re-triaged, `None` when nobody ever has. Read through
-    /// [`crate::triage::retriage_forced`], which is what lets an explicit
+    /// the legacy re-triage window, which is what lets an explicit
     /// re-triage of old mail bypass the pass's stale skip.
     pub retriage_at: Option<DateTime<Utc>>,
     /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
@@ -1030,7 +1044,7 @@ pub struct SentMissingRecipients {
 /// SECURITY: every method that can feed the MCP surface (`ranked_updates`,
 /// `thread_view`, `deadlines`) MUST exclude `sensitivity = 'sealed'` in the SQL
 /// itself. `sealed_messages` is the sole local-only escape hatch (TUI).
-pub trait Store: Send + Sync {
+pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// Insert or update a message (and its FTS body + derived contacts).
     /// Returns the local message id.
     fn upsert_message(&self, msg: &NewMessage) -> Result<i64>;
@@ -1415,14 +1429,10 @@ pub trait Store: Send + Sync {
         days: u32,
     ) -> Result<u64>;
 
-    /// THE LOCAL HALF OF "NOT SPAM": clear `messages.is_spam` on one message and
-    /// hand the row back to triage as newly-arrived mail — LLM markers reset, a
-    /// `retriage_at` force stamp so its age cannot stale-skip it, and the
-    /// attention lifecycle back to `new`. Sealed rows are refused. `false` when
-    /// nothing changed (unknown id, sealed, or not spam to begin with).
-    ///
-    /// The Gmail half is the caller's and runs first; see the `not_spam`
-    /// handler for why that order and not the other one.
+    /// Restore owned spam to human inventory and atomically enqueue push-silent
+    /// agent triage. Resets attention to new. Restricted auth can also be rescued.
+    /// Returns false for unknown, foreign-account, or already non-spam messages.
+    /// The caller restores the message in Gmail before changing local state.
     fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
 
     /// Mark an extract-queued row PROCESSED without writing a specialist row —
@@ -1753,6 +1763,10 @@ pub trait Store: Send + Sync {
     /// polling; that send is best-effort, no receivers is normal.
     fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>>;
 
+    /// Current explicit user state still permits delivering this logical event.
+    /// Dispatchers recheck after queue waits/retries and advance suppressed events.
+    fn notification_delivery_allowed(&self, account_id: AccountId, event_id: i64) -> Result<bool>;
+
     /// Whether this message already has an `events` row: "has the user already
     /// been notified about this one".
     ///
@@ -1786,6 +1800,24 @@ pub trait Store: Send + Sync {
     // lane), APPEND-ONLY, carrying no email-derived text. It is the labeled
     // corpus that decides whether the threshold or the model moves; a row that
     // could be rewritten would be evidence of nothing.
+
+    /// Append a bounded model assessment before recording its delivery outcome.
+    /// The account must own the message; failures must leave the durable job retryable.
+    fn record_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+        assessment: &NotificationAssessment,
+    ) -> Result<()>;
+
+    /// Human diagnostics only; assessment text must never enter external agent responses.
+    fn latest_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+    ) -> Result<Option<NotificationAssessment>>;
 
     /// Record one lane's decision about one message. `false` when a row for that
     /// (message, lane) already existed and this call was IGNORED.
@@ -1961,8 +1993,10 @@ pub trait Store: Send + Sync {
     // AUTH-MAIL SHREDDER (retention). Human-door-only; see the `shred_log` block
     // in schema.sql for the policy.
 
-    /// Auth mail (`triage.sensitivity = 'sealed'`) received at or before `cutoff`
-    /// and not already in `shred_log`, oldest first, capped at `limit`. Rows
+    /// Currently assessed actionable auth (restricted codes, resets, sign-in or
+    /// verification links) received at or before `cutoff`, not yet in `shred_log`.
+    /// Legacy sensitivity and login/security alerts do not qualify. Oldest first,
+    /// capped at `limit`. Rows
     /// without a `gmail_msg_id` are skipped — the trash call has nothing to
     /// address.
     fn shred_candidates(

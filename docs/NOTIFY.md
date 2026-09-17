@@ -1,5 +1,11 @@
 # Notification latency and the notify lane
 
+> Historical design record. The agent-triage rewrite supersedes the old seed,
+> sealed fast path, score floors, and Stage-1/Stage-2 emission contracts below.
+> Current behavior is documented in [TRIAGE-OPERATIONS.md](TRIAGE-OPERATIONS.md):
+> independent model assessment, all-auth eligibility, later agent rescue, and
+> a shared durable arrival ledger.
+
 Design notes for issue #177, "make faster". The complaint that opened it: mail
 notifications arrive later than competitors', and a user who gets buzzed by
 Superhuman first opens Superhuman.

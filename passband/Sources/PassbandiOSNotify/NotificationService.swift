@@ -30,13 +30,9 @@ struct PushRoute {
     static let eventIdKey = "event_id"
 
     init?(userInfo: [AnyHashable: Any]) {
-        guard let raw = userInfo[Self.eventIdKey] as? String,
-            let colon = raw.lastIndex(of: ":"),
-            let accountId = UUID(uuidString: String(raw[raw.startIndex..<colon])),
-            let eventId = Int(raw[raw.index(after: colon)...])
-        else { return nil }
-        self.accountId = accountId
-        self.eventId = eventId
+        guard let route = EventBanner.unresolvedPush(userInfo[Self.eventIdKey] as? String) else { return nil }
+        self.accountId = route.accountId
+        self.eventId = route.eventId
     }
 }
 
@@ -159,10 +155,9 @@ final class NotificationService: UNNotificationServiceExtension {
 
         var base = settings.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while base.hasSuffix("/") { base.removeLast() }
-        guard var comps = URLComponents(string: base + "/client/updates") else { return nil }
+        guard var comps = URLComponents(string: base + "/client/v2/feed") else { return nil }
         comps.queryItems = [
-            URLQueryItem(name: "band", value: "standing"),
-            URLQueryItem(name: "peek", value: "true"),
+            URLQueryItem(name: "destination", value: "fye"),
             // THE SAME PAGE THE APP READS. This route defaults to fifty rows
             // when nobody says otherwise, and the poller asks for
             // NeedToday.bandLimit — so omitting it here counted a smaller set
@@ -183,9 +178,9 @@ final class NotificationService: UNNotificationServiceExtension {
         // opened.
         guard let (data, response) = try? await Self.countSession.data(for: request),
             (response as? HTTPURLResponse)?.statusCode == 200,
-            let page = try? JSONDecoder().decode(Page<AttentionUpdate>.self, from: data)
+            let page = try? JSONDecoder().decode(AgentFeed.self, from: data)
         else { return nil }
-        return NeedToday.count(page.items)
+        return page.total_count ?? page.items.count
     }
 
     /// Out of time. Whatever the fetch was doing, the original alert goes out
@@ -265,6 +260,8 @@ final class NotificationService: UNNotificationServiceExtension {
         content.userInfo = [
             EventBanner.accountKey: account,
             EventBanner.routeKey: EventBanner.authRoute,
+            EventBanner.messageKey: event.message_id,
+            EventBanner.threadKey: event.thread_id,
         ]
         // Always a chime, and the system's rather than the user's chosen one:
         // the app's sound preference lives in ITS UserDefaults, which this
@@ -293,6 +290,7 @@ final class NotificationService: UNNotificationServiceExtension {
         content.userInfo = [
             EventBanner.threadKey: event.thread_id,
             EventBanner.eventKey: event.id,
+            EventBanner.messageKey: event.message_id,
             EventBanner.accountKey: account,
         ]
         // The system default rather than the user's chosen chime: the app's

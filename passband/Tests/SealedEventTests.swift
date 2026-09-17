@@ -39,6 +39,16 @@ struct SealedEventTests {
         theAuthBannerStandsAloneWithNoAccountName()
         anUnnamedSenderStillSaysSomething()
         authBannersOfOneMailboxShareAGroup()
+        genericPushStillIdentifiesItsAccountAndEvent()
+        var taps = NotificationTapQueue<Int>()
+        let account = UUID()
+        taps.enqueue(91, accountId: account)
+        expect(taps.take(connected: false) == nil, "Cold-start tap waits for configured connection")
+        expect(taps.pending?.target == 91, "Connection failure does not lose the tap")
+        taps.enqueue(92, accountId: account)
+        let delivered = taps.take(connected: true)
+        expect(delivered?.target == 92 && delivered?.accountId == account, "Newest tap keeps its account through bootstrap")
+        expect(taps.take(connected: true) == nil, "Ready transition drains each tap once")
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -232,4 +242,14 @@ struct SealedEventTests {
             print("  FAIL: \(what)")
         }
     }
+    static func genericPushStillIdentifiesItsAccountAndEvent() {
+        let account = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        let route = EventBanner.unresolvedPush("\(account.uuidString):42")
+        expect(route?.accountId == account, "generic push keeps its account")
+        expect(route?.eventId == 42, "generic push can resolve its exact event")
+        expect(EventBanner.unresolvedPush("42") == nil, "untagged event cannot guess an account")
+        expect(EventBanner.unresolvedPush("\(account.uuidString):-1") == nil, "invalid event is rejected")
+        expect(EventBanner.unresolvedPush("not-an-account:42") == nil, "invalid account is rejected")
+    }
+
 }

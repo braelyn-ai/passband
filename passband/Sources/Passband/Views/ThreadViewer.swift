@@ -22,6 +22,8 @@ struct ThreadViewer: View {
 
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var acknowledgedMessages: Set<Int> = []
 
     /// Computed, not stored: a stored property here would drag the memberwise
     /// initializer down to `private` with it.
@@ -49,7 +51,7 @@ struct ThreadViewer: View {
     @State private var confirmMode: ConfirmMode?
     @State private var confirmBusy = false
     @State private var retriaging = false
-    @State private var debugInfo: TriageDebug?
+    @State private var debugInfo: JSONValue?
     /// True for `Clip.flashWindow` after the subject is clicked-to-copy.
     @State private var subjectCopied = false
     /// messageId -> recorded opens of the user's own tracked sends. Only sent,
@@ -284,6 +286,17 @@ struct ThreadViewer: View {
         .onChange(of: store.openThreadRefreshToken) { _, _ in
             Task { await refreshInPlace() }
         }
+        .onChange(of: store.focusedMessageView) { _, direct in
+            guard store.threadId == threadId, let direct, direct.thread_id == threadId else { return }
+            adopt(direct, opening: true)
+            error = nil
+            loading = false
+        }
+        .onChange(of: store.focusedMessageId) { _, target in
+            guard store.threadId == threadId, let target,
+                let selected = messages.firstIndex(where: { $0.id == target }) else { return }
+            index = selected
+            }
         // Warm the NEXT queued thread while this one is being read, so e/d's
         // done+advance opens it instantly.
         .onAppear {
@@ -603,6 +616,7 @@ struct ThreadViewer: View {
                                     $0.frame(in: .scrollView)
                                 } action: { frame in
                                     map.note(i, frame: frame)
+                                    if i == index { acknowledgeDisplayedMessage(id: m.id, frame: frame) }
                                     if i == newestIndex { newestHeight = frame.height }
                                 }
                                 .onDisappear { map.drop(i) }
@@ -665,7 +679,10 @@ struct ThreadViewer: View {
                         // the map, which is already tracking every card's frame,
                         // and only when the hand comes off: mid-gesture the
                         // answer changes every tick.
-                        if phase == .idle, parkedOnNewest { arrivals = 0 }
+                        if phase == .idle {
+                            if parkedOnNewest { arrivals = 0 }
+                            acknowledgeVisibleFocus()
+                        }
                     }
                 }
                 // A STEP animates, A JUMP DOES NOT. j/k moves to the neighbouring
@@ -674,6 +691,9 @@ struct ThreadViewer: View {
                 // away, and an animated scroll to a row a LAZY stack has never
                 // instantiated is the one SwiftUI reliably declines to perform:
                 // it has nothing to animate from, so it does nothing at all.
+                .onChange(of: scenePhase) { _, phase in
+                    if phase == .active { acknowledgeVisibleFocus() }
+                }
                 .onChange(of: index) { was, now in
                     // Reaching the end of the thread IS reading what arrived —
                     // whether that took the pill, a press of `j`, or the rail.
@@ -1403,7 +1423,9 @@ struct ThreadViewer: View {
     /// holds the PRE-send copy, so it is overwritten rather than read — otherwise
     /// reopening this thread would serve a version with the reply missing.
     private func reloadAfterSend() async {
+        let epoch = store.epoch
         guard let view = try? await APIClient.shared.getThread(threadId) else { return }
+        guard store.isCurrent(epoch), !Task.isCancelled else { return }
         ThreadPrefetch.shared.note(threadId, view)
         adopt(view)
         // The echo is a new message id, so the receipt map has nothing for it
@@ -1428,7 +1450,9 @@ struct ThreadViewer: View {
     /// the fresh copy anyway, so an empty viewer just lets it.
     private func refreshInPlace() async {
         guard thread != nil else { return }
+        let epoch = store.epoch
         guard let view = try? await APIClient.shared.getThread(threadId) else { return }
+        guard store.isCurrent(epoch), !Task.isCancelled else { return }
         // Anchor AFTER the await: a reader who moved while the fetch was in
         // flight is anchored where they are now, not where they were.
         let anchor = anchorId
@@ -1678,6 +1702,7 @@ struct ThreadViewer: View {
     // MARK: - data
 
     private func load() async {
+        let epoch = store.epoch
         // A fresh thread mounts fresh rows; where the LAST one's cards were
         // must not anchor this one, and its shape must not be what the minimap
         // draws for a thread this one knows nothing about yet.
@@ -1688,6 +1713,12 @@ struct ThreadViewer: View {
         // same thread re-fetches from the top — either way the pill is
         // pointing at nothing by the time this runs.
         arrivals = 0
+        if let direct = store.focusedMessageView, direct.thread_id == threadId {
+            adopt(direct, opening: true)
+            error = nil
+            loading = false
+            return
+        }
         // Fresh prefetch hit → render it and skip the round-trip entirely (the
         // cache is at most 60s old; e/d/refresh paths repopulate it).
         if let cached = ThreadPrefetch.shared.cached(threadId) {
@@ -1700,9 +1731,13 @@ struct ThreadViewer: View {
         error = nil
         do {
             let view = try await APIClient.shared.getThread(threadId)
+            // Account switches clear the shared cache. A request that started
+            // before that clear must never repopulate it under the new account.
+            guard store.isCurrent(epoch), !Task.isCancelled else { return }
             ThreadPrefetch.shared.note(threadId, view)  // instant reopen
             adopt(view, opening: true)
         } catch {
+            guard store.isCurrent(epoch), !Task.isCancelled else { return }
             self.error = errText(error, "thread load failed")
         }
         loading = false
@@ -1728,7 +1763,9 @@ struct ThreadViewer: View {
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
-        index = max(0, view.messages.count - 1)
+        index = store.focusedMessageId.flatMap { target in
+            view.messages.firstIndex { $0.id == target }
+        } ?? max(0, view.messages.count - 1)
         // What the ⌘K agent is told it is looking at. Lifted into the store
         // because the ask bar is a modal above this view and cannot see its
         // state, and written HERE because this is the one place a thread lands
@@ -1743,6 +1780,26 @@ struct ThreadViewer: View {
                 OpenThreadSummary(
                     threadId: threadId, subject: view.subject.displaySubject,
                     newestMessageId: $0.id)
+            }
+        }
+    }
+
+    private func acknowledgeVisibleFocus() {
+        guard let top = map.topmost, let message = messages[safe: top], let frame = map.frames[top] else { return }
+        acknowledgeDisplayedMessage(id: message.id, frame: frame)
+    }
+
+    private func acknowledgeDisplayedMessage(id: Int, frame: CGRect) {
+        guard scenePhase == .active, store.threadId == threadId,
+            MessageReadVisibility.isFocused(minY: frame.minY, maxY: frame.maxY,
+                viewportHeight: viewportHeight),
+            acknowledgedMessages.insert(id).inserted else { return }
+        let epoch = store.epoch
+        Task {
+            guard store.isCurrent(epoch) else { return }
+            do { try await APIClient.shared.markMessageOpened(id) }
+            catch {
+                if store.isCurrent(epoch) { acknowledgedMessages.remove(id) }
             }
         }
     }
@@ -2419,32 +2476,19 @@ private struct UnsubConfirm: View {
 /// DEV overlay: the full triage row as key/value mono rows. Own "modal"
 /// KeyContext so Esc closes it without leaking to the thread keys underneath.
 private struct TriageDebugOverlay: View {
-    let info: TriageDebug
+    let info: JSONValue
     let onClose: () -> Void
 
     private var rows: [(String, String)] {
-        [
-            ("message_id", String(info.message_id)),
-            ("subject", info.subject),
-            ("importance", String(info.importance)),
-            ("tier", info.tier),
-            ("category", info.category ?? "null"),
-            ("one_line", info.one_line),
-            ("reason", info.reason),
-            ("reason.importance", info.field_reasons?.importance ?? "null"),
-            ("reason.deadline", info.field_reasons?.deadline ?? "null"),
-            ("reason.tier", info.field_reasons?.tier ?? "null"),
-            ("deadline", info.deadline ?? "null"),
-            ("matched_rule_id", info.matched_rule_id.map(String.init) ?? "null"),
-            ("status", info.status),
-            ("surfaced_at", info.surfaced_at ?? "null"),
-            ("resolved_at", info.resolved_at ?? "null"),
-            ("stage1_model_used", info.stage1_model_used ?? "null"),
-            ("model_used (stage2)", info.model_used ?? "null"),
-            ("needs_stage2", String(info.needs_stage2)),
-            ("extractor_model_used", info.extractor_model_used ?? "null"),
-            ("created_at", info.created_at),
-        ]
+        guard case .object(let fields) = info else { return [] }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return fields.keys.sorted().map { key in
+            let value = fields[key] ?? .null
+            if case .string(let text) = value { return (key, text) }
+            let bytes = (try? encoder.encode(value)) ?? Data()
+            return (key, String(decoding: bytes, as: UTF8.self))
+        }
     }
 
     var body: some View {

@@ -11,6 +11,7 @@ license.workspace = true
 # still links it without dragging the mail core in.
 squelch-httpauth = { path = "../squelch-httpauth" }
 tokio = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

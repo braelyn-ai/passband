@@ -218,6 +218,28 @@ actor APIClient {
 
     // MARK: - reads
 
+    func getFeed(destination: String, limit: Int = 200) async throws -> AgentFeed {
+        let feed: AgentFeed = try await get("/client/v2/feed", query: [
+            "destination": destination, "limit": String(limit),
+        ])
+        guard feed.version == 2 else {
+            throw APIError(.unknown, 0, "Please update Passband to read this server's feeds.")
+        }
+        return feed
+    }
+
+    func getEvent(_ eventId: Int) async throws -> Event {
+        try await get("/client/events/\(eventId)")
+    }
+
+    func getMessage(_ messageId: Int) async throws -> HumanMessageEnvelope {
+        try await get("/client/v2/messages/\(messageId)")
+    }
+
+    func markMessageOpened(_ messageId: Int) async throws {
+        try await postNoContent("/client/v2/messages/\(messageId)/opened")
+    }
+
     /// `peek: true` reads the same rows WITHOUT stamping the seen-ledger — for a
     /// reader acting on the user's behalf (the embedded agent) that will surface
     /// only some of what it fetched. Every UI fetch leaves it false, because the
@@ -241,10 +263,10 @@ actor APIClient {
             ])
     }
 
-    func getThread(_ threadId: String) async throws -> ClientThreadView {
+    func getThread(_ threadId: String, forAgent: Bool = false) async throws -> ClientThreadView {
         let escaped =
             threadId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadId
-        return try await get("/client/thread/\(escaped)")
+        return try await get(forAgent ? "/client/agent/thread/\(escaped)" : "/client/thread/\(escaped)")
     }
 
     /// `sort` is the reader's standing preference (`Prefs.searchSort`), passed
@@ -265,10 +287,11 @@ actor APIClient {
         cursor: String? = nil,
         mode: SearchMode? = nil,
         sort: SearchSortChoice? = nil,
-        partial: Bool = false
+        partial: Bool = false,
+        forAgent: Bool = false
     ) async throws -> SearchPage {
         try await get(
-            "/client/search",
+            forAgent ? "/client/agent/search" : "/client/search",
             query: [
                 "q": q, "limit": limit.map(String.init), "cursor": cursor, "mode": mode?.rawValue,
                 "sort": sort?.rawValue, "partial": partial ? "1" : nil,
@@ -354,15 +377,29 @@ actor APIClient {
     func probe(baseURL: String, token: String) async throws {
         var base = baseURL
         while base.hasSuffix("/") { base.removeLast() }
-        guard let url = URL(string: base + "/client/stats") else {
+        guard let url = URL(string: base + "/client/v2/capabilities") else {
             throw APIError(.network, 0, "bad server url")
         }
         var req = URLRequest(url: url, timeoutInterval: Self.requestTimeout)
         req.httpMethod = Method.GET.rawValue
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, _) = try await perform(req)
-        _ = try decode(StoreStats.self, from: data)
+        do {
+            let (data, _) = try await perform(req)
+            guard let capabilities = try? decode(TriageCapabilities.self, from: data),
+                capabilities.isSupported else { throw Self.triageUpgradeRequired }
+        } catch let error as APIError where error.status == 404 || error.status == 410 {
+            throw Self.triageUpgradeRequired
+        }
+    }
+
+    private static var triageUpgradeRequired: APIError {
+        APIError(.unknown, 0, "Update squelchd to the agent-triage release before connecting this Passband version.")
+    }
+
+    func requireAgentTriage() async throws {
+        let current = try requireConfig()
+        try await probe(baseURL: current.baseURL, token: current.token)
     }
 
     func getUsage(days: Int? = nil) async throws -> UsageResponse {
@@ -389,21 +426,23 @@ actor APIClient {
     }
 
     func getReceipts(days: Int? = nil) async throws -> [Receipt] {
-        try await get("/client/receipts", query: ["days": days.map(String.init)])
+        try await getFeed(destination: "records", limit: 1000).receipts
     }
 
     func getCalendar(hours: Int? = nil) async throws -> [CalendarUpdate] {
-        try await get("/client/calendar", query: ["hours": hours.map(String.init)])
+        try await getFeed(destination: "records", limit: 1000).calendar
     }
 
-    func getBanking() async throws -> [BankingRecord] { try await get("/client/banking") }
+    func getBanking() async throws -> [BankingRecord] {
+        try await getFeed(destination: "records", limit: 1000).banking
+    }
 
     func getMarketing(days: Int? = nil) async throws -> [MarketingOffer] {
-        try await get("/client/marketing", query: ["days": days.map(String.init)])
+        try await getFeed(destination: "reading", limit: 1000).marketing
     }
 
-    func getTriageDebug(_ messageId: Int) async throws -> TriageDebug {
-        try await get("/client/triage-debug/\(messageId)")
+    func getTriageDebug(_ messageId: Int, forAgent: Bool = false) async throws -> JSONValue {
+        try await get(forAgent ? "/client/agent/triage/\(messageId)" : "/client/v2/triage/\(messageId)")
     }
 
     // MARK: - attachments
@@ -809,25 +848,24 @@ actor APIClient {
 
     // MARK: - triage feedback
 
-    struct CorrectTriageBody: Codable, Sendable {
-        var message_id: Int
-        var dimension: String
-        var to_value: String
-        var note: String?
+    func getAgentFeed(destination: String = "fye", limit: Int = 50) async throws -> AgentFeed {
+        try await get("/client/agent/feed", query: ["destination": destination, "limit": String(limit)])
     }
 
-    /// Record that triage got one wrong and apply the fix (one server-side
-    /// transaction: the triage row moves AND a training row is stored). The
-    /// response is deliberately NOT decoded — a decode failure would toast an
-    /// error for a write that succeeded.
-    func correctTriage(messageId: Int, dimension: TriageAxis, toValue: String, note: String? = nil)
-        async throws
-    {
-        try await postNoContent(
-            "/client/triage-feedback",
-            body: CorrectTriageBody(
-                message_id: messageId, dimension: dimension.rawValue, to_value: toValue, note: note)
-        )
+    func getAgentRecords(kind: String, days: Int? = nil, hours: Int? = nil,
+        includeDelivered: Bool = false) async throws -> JSONValue {
+        try await get("/client/agent/records", query: ["kind": kind,
+            "days": days.map(String.init), "hours": hours.map(String.init),
+            "include_delivered": includeDelivered ? "true" : "false"])
+    }
+
+    func getAgentTriage(_ messageId: Int) async throws -> AgentTriageInspection {
+        try await get("/client/v2/triage/\(messageId)")
+    }
+
+    func correctTriage(messageId: Int, target: TriageTarget) async throws {
+        try await postNoContent("/client/v2/messages/\(messageId)/corrections",
+            body: TriageCorrectionRequest(target))
     }
 
     func getTriageFeedback(limit: Int? = nil) async throws -> [TriageFeedback] {

@@ -138,24 +138,6 @@ fn map_slug_conflict(e: rusqlite::Error) -> CoreError {
     }
 }
 
-/// The SEALED-MAIL guard every sent-mail read carries, as a SQL fragment.
-///
-/// Lifted verbatim in shape from `messages::sent_listing`, and fail-closed for
-/// the same two reasons: the INNER JOIN on `triage` excludes a sent row whose
-/// triage row is missing (a broken row, not an untriaged one — sent mail always
-/// gets its triage row in the same transaction), and the `NOT EXISTS` excludes
-/// any message in a thread with ANY sealed sighting, because seal detection is
-/// per-message and the user's own reply in a sealed thread commits as 'normal'.
-///
-/// A group history is a sent-mail listing like any other, so it inherits both.
-const SEALED_GUARD: &str = "AND t.sensitivity != 'sealed'
-     AND NOT EXISTS (
-         SELECT 1 FROM messages m2
-         JOIN triage t2 ON t2.message_id = m2.id
-         WHERE m2.account_id = m.account_id
-           AND m2.thread_id = m.thread_id
-           AND t2.sensitivity = 'sealed')";
-
 /// Read receipts recorded against one message, as a SQL scalar subquery. The
 /// join through `send_trackers` is what scopes the count to this account —
 /// `message_opens` carries no account of its own.
@@ -734,14 +716,12 @@ impl SqliteStore {
                     COUNT(DISTINCT mr.addr) AS reached,
                     {OPENS_SUBQUERY} AS opens
              FROM messages m
-             JOIN triage t ON t.message_id = m.id
              JOIN message_recipients mr
                ON mr.account_id = m.account_id AND mr.message_id = m.id
              JOIN group_members gm
                ON gm.account_id = m.account_id AND gm.group_id = ?2 AND gm.addr = mr.addr
              WHERE m.account_id = ?1
                AND m.is_sent = 1
-               {SEALED_GUARD}
                AND NOT EXISTS (
                    SELECT 1 FROM group_send_recipients gsr
                    JOIN group_sends gs ON gs.id = gsr.group_send_id

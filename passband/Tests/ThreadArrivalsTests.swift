@@ -23,6 +23,10 @@ struct ThreadArrivalsTests {
         nothingAlreadyOnScreen()
         aSwitchForgets()
         aReopenRemembers()
+        expect(!MessageReadVisibility.isFocused(minY: 900, maxY: 1100, viewportHeight: 600), "An appended offscreen message is not opened")
+        expect(!MessageReadVisibility.isFocused(minY: -900, maxY: -20, viewportHeight: 600), "History above the viewport is not opened")
+        expect(MessageReadVisibility.isFocused(minY: -300, maxY: 800, viewportHeight: 600), "A tall message under the reader focus is opened")
+        expect(!MessageReadVisibility.isFocused(minY: 0, maxY: 800, viewportHeight: 0), "Unlaid-out content is not opened")
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")

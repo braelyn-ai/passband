@@ -35,9 +35,12 @@ pub fn streamable_http_service(
     store: Arc<SqliteStore>,
     account_email: &str,
     shipment_policy: squelch_core::config::ShipmentListPolicy,
+    ranking: squelch_core::triage::agent_config::RankingConfig,
     cancellation: CancellationToken,
 ) -> anyhow::Result<SquelchHttpService> {
-    let template = SquelchServer::new(store, account_email)?.with_shipment_policy(shipment_policy);
+    let template = SquelchServer::new(store, account_email)?
+        .with_shipment_policy(shipment_policy)
+        .with_ranking_config(ranking);
     // DNS-rebinding guard: rmcp defaults to loopback-only Host headers, which
     // 403s requests proxied by `tailscale serve` (Host: *.ts.net). Additive —
     // loopback is never dropped.

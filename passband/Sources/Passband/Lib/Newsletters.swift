@@ -1,9 +1,5 @@
-// The Sitrep's newsletters zone — recurring noise-tier senders, and the
-// rule-onboarding CTA when no rule governs them yet.
-//
-// Qualification prefers a real `marketing` classification (GET
-// /client/marketing). The reason-string / recurring-robot fallback is a
-// migration bridge: it applies ONLY while nothing has been categorized yet.
+// Reading cards group the messages selected by the triage agent.
+// Sender preferences are shown as context, never used to filter this feed.
 
 import Foundation
 
@@ -31,29 +27,9 @@ struct Newsletter: Identifiable, Hashable, Sendable {
 }
 
 enum Newsletters {
-    /// Exact rung-5 reason literals we key off (substring, case-insensitive).
-    private static let newsletterReason = "unsubscribe footer"
-    private static let receiptReason = "order confirmation / receipt"
-
-    private static func isNewsletterReason(_ reason: String) -> Bool {
-        let r = reason.lowercased()
-        if r.contains(newsletterReason) { return true }
-        return r.firstMatch(
-            of: /(?i)\b(unsubscribe|newsletter|bulk\/list|mailing list|marketing|promotional|digest)\b/
-        ) != nil
-    }
-
-    private static func isReceiptReason(_ reason: String) -> Bool {
-        let r = reason.lowercased()
-        if r.contains(receiptReason) { return true }
-        return r.firstMatch(
-            of: /(?i)\b(order confirmation|receipt|your order|shipment|shipped|tracking)\b/) != nil
-    }
-
-    /// Date proxy for a noise update (no received_at on the wire model).
-    private static func dateOf(_ u: AttentionUpdate) -> Double {
-        guard let d = Fmt.date(u.surfaced_at ?? u.resolved_at) else { return 0 }
-        return d.timeIntervalSince1970
+    /// The adapter carries the server's real received timestamp here.
+    private static func dateOf(_ update: AttentionUpdate) -> Double {
+        Fmt.date(update.surfaced_at)?.timeIntervalSince1970 ?? 0
     }
 
     /// Glob match for a rule's match_pattern ("*@acme.com") against a bare
@@ -90,92 +66,26 @@ enum Newsletters {
         }
     }
 
-    private static let weekSeconds: Double = 7 * 86400
-
-    /// Derive newsletter cards from a batch of noise-tier updates.
+    /// Group messages already selected for Reading by the agent. Grouping is
+    /// presentation only: no sender shape, category, score or repetition test.
     static func derive(
-        updates: [AttentionUpdate],
-        rules: [SenderRule],
-        marketingIds: Set<Int> = [],
-        since: Double? = nil,
-        limit: Int = 24,
-        now: Date = Date()
+        updates: [AttentionUpdate], rules: [SenderRule], limit: Int = 24
     ) -> [Newsletter] {
-        let cutoff = since ?? (now.timeIntervalSince1970 - weekSeconds)
-
-        struct Bucket {
-            var sender: String
-            var total = 0
-            var newsletterHits = 0
-            var receiptHits = 0
-            /// Messages of this sender the pipeline categorized `marketing`.
-            var marketingHits = 0
-            var robot: Bool
-            var latest: Double = 0
-            var summary = ""
-            var latestThreadId = ""
-            var items: [AttentionUpdate] = []
-        }
-        var byAddr: [String: Bucket] = [:]
-        var order: [String] = []
-
-        for u in updates {
-            // Excludes receipts: the server auto-resolves receipt-classified
-            // mail to status='done' at ingest, and a settled record is not
-            // recurring noise to onboard a rule for.
-            if u.status == .done { continue }
-            if dateOf(u) < cutoff { continue }
-            let address = SenderID.address(u.sender)
-            guard address.contains("@") else { continue }
-
-            if byAddr[address] == nil {
-                byAddr[address] = Bucket(
-                    sender: u.senderString,
-                    robot: SenderID.isRobot(u.sender) || SenderID.isBrand(u.sender))
-                order.append(address)
+        let groups = Dictionary(grouping: updates) { SenderID.address($0.sender) }
+        return groups.compactMap { address, messages -> Newsletter? in
+            let ordered = messages.sorted {
+                let lhs = dateOf($0), rhs = dateOf($1)
+                return lhs == rhs ? $0.id > $1.id : lhs > rhs
             }
-            byAddr[address]!.total += 1
-            byAddr[address]!.items.append(u)
-            if marketingIds.contains(u.id) { byAddr[address]!.marketingHits += 1 }
-            if isNewsletterReason(u.reason) { byAddr[address]!.newsletterHits += 1 }
-            if isReceiptReason(u.reason) { byAddr[address]!.receiptHits += 1 }
-            let d = dateOf(u)
-            if d >= byAddr[address]!.latest {
-                byAddr[address]!.latest = d
-                if !u.one_line.isEmpty { byAddr[address]!.summary = u.one_line }
-                byAddr[address]!.latestThreadId = u.thread_id
-            }
+            guard let latest = ordered.first else { return nil }
+            return Newsletter(
+                address: address, sender: latest.senderString, count: ordered.count,
+                summary: latest.one_line, latest: dateOf(latest),
+                latestThreadId: latest.thread_id, items: ordered,
+                rule: rule(for: address, in: rules))
         }
-
-        var out: [Newsletter] = []
-        for address in order {
-            guard let b = byAddr[address] else { continue }
-            // Exclude senders whose window is entirely receipts (order updates,
-            // not a newsletter) with no newsletter signal at all.
-            let allReceipts = b.receiptHits > 0 && b.newsletterHits == 0 && b.marketingHits == 0
-            if allReceipts { continue }
-
-            let qualifies =
-                marketingIds.isEmpty
-                ? (b.newsletterHits > 0 || (b.robot && b.total >= 2))
-                : b.marketingHits > 0
-            guard qualifies else { continue }
-
-            out.append(
-                Newsletter(
-                    address: address,
-                    sender: b.sender,
-                    count: b.total,
-                    summary: b.summary,
-                    latest: b.latest,
-                    latestThreadId: b.latestThreadId,
-                    items: b.items.sorted { dateOf($0) > dateOf($1) },
-                    rule: rule(for: address, in: rules)))
-        }
-
-        // Newest activity first; ties break on higher volume.
-        out.sort { a, b in a.latest != b.latest ? a.latest > b.latest : a.count > b.count }
-        return Array(out.prefix(limit))
+        .sorted { $0.latest == $1.latest ? $0.address < $1.address : $0.latest > $1.latest }
+        .prefix(limit).map { $0 }
     }
 
     /// The `*@domain` pattern a newsletter CTA prefills into the rule editor.

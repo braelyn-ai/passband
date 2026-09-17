@@ -329,7 +329,7 @@ struct ContentBlock {
 /// ephemeral` on the system block, so Anthropic reports the prompt split three
 /// ways: `input_tokens` is the UNCACHED remainder only, with cache writes and
 /// reads in their own fields — dropping them under-reports the ledger.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, Deserialize)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u64,

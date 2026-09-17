@@ -1,8 +1,5 @@
-// TRIAGE FIX PALETTE — `v` on a focused email: type, hit Enter, the mail moves
-// and the correction is recorded as training data. That second half is the
-// point. AMBIGUITY IS SHOWN, NOT GUESSED — "bill" matches both Invoice and
-// Autopay bill, so the list stays up and the highlighted row is always what
-// Enter picks; resolving it silently would poison a ground-truth dataset.
+// Explicit corrections for independent placement, kind, and agent access.
+// The owner always keeps human access, including after an access restriction.
 
 import SwiftUI
 
@@ -14,6 +11,7 @@ struct TriageFixPalette: View {
     @State private var query = ""
     @State private var selection = 0
     @State private var busy = false
+    @State private var current: AgentMessageDecision?
     @Namespace private var paletteGlass
     @FocusState private var focused: Bool
 
@@ -24,6 +22,7 @@ struct TriageFixPalette: View {
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
             .onAppear { focused = true }
+            .task { current = try? await APIClient.shared.getAgentTriage(target.messageId).decision }
             .onChange(of: hits.count) { _, count in
                 selection = max(0, min(selection, max(0, count - 1)))
             }
@@ -86,38 +85,21 @@ struct TriageFixPalette: View {
         .padding(.bottom, 8)
     }
 
-    /// What it is NOW, so the correction reads as a before/after. A dimension the
-    /// caller does not know is OMITTED, never shown as "unset" — that would claim
-    /// a value we simply never fetched.
+    /// Display only the current authoritative decision, never legacy tiers.
     @ViewBuilder
     private var wasRow: some View {
-        if target.tier != nil || target.category != nil {
-            HStack(spacing: 12) {
-                if let tier = target.tier {
-                    HStack(spacing: 4) {
-                        Text("tier").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                        Text(TriageTargets.label(axis: .tier, value: tier))
-                            .font(Typo.micro).bold()
-                            .foregroundStyle(Palette.inkDim)
-                    }
-                }
-                if let category = target.category {
-                    HStack(spacing: 4) {
-                        Text("category").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                        Text(TriageTargets.label(axis: .category, value: category))
-                            .font(Typo.micro).bold()
-                            .foregroundStyle(Palette.inkDim)
-                    }
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 8)
+        if let current {
+            Text((current.kinds + current.destinations).joined(separator: " · ")
+                .replacingOccurrences(of: "_", with: " "))
+                .font(Typo.micro)
+                .foregroundStyle(Palette.inkDim)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
         }
     }
 
     private var input: some View {
-        TextField("where should this have gone? (important, bill, noise…)", text: $query)
+        TextField("Change placement, kind, or agent access…", text: $query)
             .textFieldStyle(.plain)
             .font(.system(size: 15))
             .foregroundStyle(Palette.ink)
@@ -210,43 +192,25 @@ struct TriageFixPalette: View {
         ]
     }
 
-    /// Optimistic removal for exactly the moves the server's predicates make
-    /// (TriageTarget.exit), then a forced re-read of the bands AND the zones: a
-    /// zone row is a different shape than a band row, so an arrival cannot be
-    /// synthesized here. A correction that FAILS moves nothing and keeps the
-    /// palette up to try again.
+    /// Corrections preserve unrelated dimensions; refreshed server projections
+    /// decide which visible rows change after the write succeeds.
     private func apply(_ hit: TriageTarget) async {
         guard !busy else { return }
         busy = true
         do {
             try await APIClient.shared.correctTriage(
-                messageId: target.messageId, dimension: hit.axis, toValue: hit.value)
+                messageId: target.messageId, target: hit)
         } catch {
             store.pushToast(errText(error, "could not record the correction"), .error)
             busy = false
             return
         }
-        // The accuracy metric: which closed-vocabulary value moved where. The
-        // "was" value for the corrected axis, when the caller fetched it —
-        // "unset" otherwise, so the confusion pair stays inside the vocabulary.
-        let from: String =
-            switch hit.axis {
-            case .tier: (target.tier ?? nil) ?? "unset"
-            case .category: (target.category ?? nil) ?? "unset"
-            case .sensitivity: "unset"
-            }
-        Analytics.capture(
-            "triage_corrected", ["axis": hit.axis.rawValue, "from": from, "to": hit.value])
-        switch hit.exit {
-        case .stays: break
-        case .standing: store.removeFromStanding(target.messageId)
-        case .allBands: _ = store.removeFromBands(target.messageId)
-        }
-        // Never promise a move the pipeline does not make: a category is not a
-        // band, so "moved to Marketing" is a claim the list visibly contradicts.
-        store.pushToast(
-            hit.lands.map { "\(hit.label) → \($0) · recorded" } ?? "\(hit.label) · recorded",
-            .success)
+        Analytics.capture("triage_corrected", ["axis": hit.axis.rawValue, "to": hit.value])
+        // A restriction changes external access only. The owner keeps the
+        // message and its placements. Refresh authoritative projections instead
+        // of inferring a move from its kind or access assessment.
+        ThreadPrefetch.shared.wipe()
+        store.pushToast("\(hit.label) · recorded", .success)
         onClose()
         // Runs on past the dismissal on purpose: the calling Task belongs to the
         // key binding, not to this view, so closing does not cancel it.
@@ -262,9 +226,9 @@ private struct TargetRow: View {
 
     private var axisTone: Color {
         switch target.axis {
-        case .tier: Palette.warn
-        case .category: Palette.accent
-        case .sensitivity: Palette.lock
+        case .showInFye: Palette.warn
+        case .kinds, .destinations: Palette.accent
+        case .externalAccess: Palette.lock
         }
     }
 
@@ -287,15 +251,7 @@ private struct TargetRow: View {
                     .foregroundStyle(Palette.inkFaint)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                // WHERE IT LANDS, for values whose destination is a server
-                // predicate: "For your eyes" is a band over tiers, not a pickable
-                // label, so the mapping is the only way to aim at it on purpose.
-                if let lands = target.lands {
-                    Text("→ \(lands)")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.accent.opacity(0.85))
-                        .fixedSize()
-                }
+
             }
         }
     }

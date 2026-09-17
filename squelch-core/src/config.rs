@@ -234,10 +234,9 @@ impl Default for SyncConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
-    /// Importance at or above which a message earns an event on score alone
-    /// (past_due/deadline tiers bypass it entirely). Default 50, deliberately the
-    /// same number as the TUI's starting squelch line, so "notified" and "above
-    /// the line" mean the same thing. Env: `SQUELCH_NOTIFY_MIN_IMPORTANCE`.
+    /// Fast-model importance at or above which a message qualifies for a push.
+    /// All model-assessed auth qualifies regardless of importance. Default 50.
+    /// Env: `SQUELCH_NOTIFY_MIN_IMPORTANCE`.
     pub min_importance: u8,
     /// THE FIRST-SIGHT TEST: mail whose `Date:` header is older than this when
     /// we FIRST see it never becomes notifiable, whatever its verdict. Mail
@@ -265,34 +264,13 @@ pub struct NotifyConfig {
     pub rescue_window_secs: u64,
 
     // ---- the fast lane (docs/NOTIFY.md §11.5) ------------------------------
-    /// THE KILL SWITCH for the fast lane's MODEL path only. Off, the lane still
-    /// records what it can decide without asking anyone — a sealed ping and a
-    /// squelched sender — and for everything else it records `unavailable` and
-    /// steps aside: the deliberate lane keeps emitting as it does today, so
-    /// turning this off costs latency, never a notification.
-    ///
-    /// IT DOES NOT TOUCH THE SEED PATH. A daemon with no LLM configured has
-    /// only the heuristic seed, and the deliberate lane never runs there
-    /// (`stage1_pass`/`stage2_pass` need a `pass_setup()`), so the seed decides
-    /// whatever this switch says; that is docs/NOTIFY.md §11.1's second call,
-    /// and it is why the switch is read in
-    /// [`crate::sync::notify_lane::NotifyLane::run_model`] AFTER the no-model
-    /// arm rather than in the candidate gate. With a model configured the seed
-    /// must never decide, switch or no switch: a regex verdict nothing can
-    /// retract is exactly what the model path replaced.
-    /// Default true. Env: `SQUELCH_NOTIFY_FAST_ENABLED`.
+    /// Enables the independent small-model notification assessment. Disabling
+    /// it leaves notification decisions to the full agent; no heuristic fallback
+    /// classifies auth or sender rules. Env: `SQUELCH_NOTIFY_FAST_ENABLED`.
     pub fast_enabled: bool,
-    /// Whether a SEALED message may ring at all (docs/NOTIFY.md §11.6). Off
-    /// means the sealed path records nothing and emits nothing.
-    ///
-    /// DEFAULT TRUE SINCE DAEMON 0.0.6, the release paired with Mac 0.0.7 and
-    /// iPhone 0.0.4, which route a sealed event's tap to the auth flow. It
-    /// shipped false for exactly one release, as an ordering guard rather than
-    /// a design hedge: an app that predates `Event.sealed_kind` renders a
-    /// sealed event as an ordinary thread banner whose tap fetches a thread the
-    /// seal makes the daemon 404. A fleet whose clients have not caught up
-    /// turns it back off from the environment. Env:
-    /// `SQUELCH_NOTIFY_SEALED_ENABLED`.
+    /// Legacy configuration compatibility only. Agent triage pushes all
+    /// model-assessed auth and does not use the retired sealed-notification gate.
+    /// Env: `SQUELCH_NOTIFY_SEALED_ENABLED`.
     pub sealed_enabled: bool,
     /// The model the fast lane asks. A SMALL one on purpose: the question it
     /// answers ("does this deserve to interrupt the phone right now") is asked
@@ -380,11 +358,9 @@ pub struct RevisitPassConfig {
     /// Re-evaluations attempted per sync cycle. Env:
     /// `SQUELCH_REVISIT_BATCH_PER_CYCLE`.
     pub batch_per_cycle: usize,
-    /// Per-account-per-day cap on re-evaluation calls, counted in the same
-    /// `wake_budget` ledger as the stages but on its OWN key — revisit spend is
-    /// additional to [`Stage1Config::global_daily_cap`], not inside it, so this
-    /// number is its own dollar ceiling at the Stage-1 per-call price.
-    /// Env: `SQUELCH_REVISIT_DAILY_CAP`.
+    /// Per-account-per-day cap on bounded revisit investigations, enforced in
+    /// addition to shared account, thread and sender limits. It takes no
+    /// app_settings override. Env: `SQUELCH_REVISIT_DAILY_CAP`.
     pub daily_cap: u32,
     /// Revisits stored per message per pass. Env: `SQUELCH_REVISIT_MAX_PER_MESSAGE`.
     pub max_per_message: usize,
@@ -397,12 +373,14 @@ pub struct RevisitPassConfig {
     /// Furthest out a revisit may be scheduled (days); beyond this it is dropped
     /// as a hallucinated date. Env: `SQUELCH_REVISIT_MAX_HORIZON_DAYS`.
     pub max_horizon_days: i64,
+    /// Legacy deterministic scheduler only; unused by agent triage.
     /// How long after a deadline to re-evaluate automatically (hours). Env:
     /// `SQUELCH_REVISIT_DEADLINE_GRACE_HOURS`.
     pub deadline_grace_hours: i64,
     /// Revisits closer together than this are one revisit (hours). Env:
     /// `SQUELCH_REVISIT_DEDUPE_HOURS`.
     pub dedupe_window_hours: i64,
+    /// Legacy deterministic scheduler only; unused by agent triage.
     /// Days a row may sit in the standing band, untouched and with nothing
     /// scheduled, before the staleness sweep re-evaluates it anyway. 0 disables
     /// the sweep. Env: `SQUELCH_REVISIT_FYE_STALE_DAYS`.
@@ -1599,6 +1577,8 @@ pub struct Config {
     pub squelch_level: u8,
     /// Stage-1 rules-engine tuning.
     pub stage1: Stage1Config,
+    /// Agent-owned triage and server ranking tuning.
+    pub triage: crate::triage::agent_config::AgentTriageConfig,
     /// Stage-2 LLM triage tuning (Anthropic API, budgets).
     pub stage2: Stage2Config,
     /// Sync tunables (backfill window, poll interval).
@@ -1639,6 +1619,7 @@ impl Default for Config {
             default_min_importance: 0,
             squelch_level: 0,
             stage1: Stage1Config::default(),
+            triage: crate::triage::agent_config::AgentTriageConfig::default(),
             stage2: Stage2Config::default(),
             sync: SyncConfig::default(),
             embed: EmbedConfig::default(),
@@ -1724,6 +1705,39 @@ impl Config {
             self.db_path = PathBuf::from(p);
         }
         env_override("SQUELCH_MIN_IMPORTANCE", &mut self.default_min_importance);
+        env_override_opt("SQUELCH_TRIAGE_MODEL", &mut self.triage.agent.model);
+        env_override(
+            "SQUELCH_TRIAGE_DAILY_RUN_CAP",
+            &mut self.triage.agent.daily_run_cap,
+        );
+        env_override(
+            "SQUELCH_TRIAGE_MAX_ATTEMPTS",
+            &mut self.triage.agent.max_attempts,
+        );
+        env_override(
+            "SQUELCH_TRIAGE_OUTAGE_RETRY_SECS",
+            &mut self.triage.agent.outage_retry_secs,
+        );
+        env_override_opt(
+            "SQUELCH_TRIAGE_REVIEW_MODEL",
+            &mut self.triage.agent.review_model,
+        );
+        env_override(
+            "SQUELCH_TRIAGE_MAX_TURNS",
+            &mut self.triage.agent.max_model_turns,
+        );
+        env_override(
+            "SQUELCH_TRIAGE_MAX_TOOL_CALLS",
+            &mut self.triage.agent.max_tool_calls,
+        );
+        env_override(
+            "SQUELCH_TRIAGE_TIMEOUT_SECS",
+            &mut self.triage.agent.timeout_secs,
+        );
+        env_override(
+            "SQUELCH_TRIAGE_CONCURRENCY",
+            &mut self.triage.agent.concurrency,
+        );
         env_override_opt("SQUELCH_CLIENT_ID", &mut self.client_id);
         env_override_opt("SQUELCH_CLIENT_SECRET", &mut self.client_secret);
         if let Some(v) = env_with_legacy(ENV_ACCOUNT_EMAIL, ENV_ACCOUNT_EMAIL_LEGACY) {
@@ -2223,6 +2237,37 @@ mod tests {
 
     /// Tests that touch process-wide env must not run concurrently.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn agent_budget_environment_overrides_are_active() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let names = [
+            "SQUELCH_TRIAGE_DAILY_RUN_CAP",
+            "SQUELCH_TRIAGE_MAX_ATTEMPTS",
+            "SQUELCH_TRIAGE_OUTAGE_RETRY_SECS",
+        ];
+        let previous = names.map(std::env::var_os);
+        // SAFETY: every environment-mutating config test holds ENV_LOCK.
+        unsafe {
+            std::env::set_var(names[0], "17");
+            std::env::set_var(names[1], "4");
+            std::env::set_var(names[2], "600");
+        }
+        let mut config = Config::default();
+        config.apply_env_overrides();
+        unsafe {
+            for (name, value) in names.into_iter().zip(previous) {
+                if let Some(value) = value {
+                    std::env::set_var(name, value);
+                } else {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+        assert_eq!(config.triage.agent.daily_run_cap, 17);
+        assert_eq!(config.triage.agent.max_attempts, 4);
+        assert_eq!(config.triage.agent.outage_retry_secs, 600);
+    }
 
     #[test]
     fn sync_defaults_are_sane() {

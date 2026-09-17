@@ -529,7 +529,12 @@ pub(super) fn seed_triage_row(
 
 /// A worthy `NewEvent` for `message_id`, distinct per id so ordering and
 /// snapshotting are visible in assertions.
-pub(super) fn new_event(acct: AccountId, message_id: i64) -> NewEvent {
+pub(super) fn new_event(store: &SqliteStore, acct: AccountId, message_id: i64) -> NewEvent {
+    store.lock().unwrap().execute(
+        "INSERT OR IGNORE INTO messages(id,account_id,gmail_msg_id,thread_id,from_addr,subject,received_at,snippet)
+         VALUES(?1,?2,?3,?4,'alice@example.com','Notification fixture',?5,'')",
+        params![message_id, acct, format!("event-{message_id}"), format!("t{message_id}"), Utc::now().to_rfc3339()],
+    ).unwrap();
     NewEvent {
         account_id: acct,
         message_id,

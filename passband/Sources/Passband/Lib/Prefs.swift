@@ -124,7 +124,6 @@ final class Prefs {
     private enum Key {
         static let loadRemoteImages = "passband.pref.loadRemoteImages"
         static let settingsSection = "passband.pref.settingsSection"
-        static let rankWeight = "passband.pref.rankWeight"
         static let developerMode = "passband.pref.developerMode"
         static let tourCompleted = "passband.pref.tourCompleted"
         static let lastSeenReleaseNotes = "passband.pref.lastSeenReleaseNotes"
@@ -146,7 +145,6 @@ final class Prefs {
         defaults.register(defaults: [
             Key.loadRemoteImages: true,
             Key.settingsSection: SettingsSection.general.rawValue,
-            Key.rankWeight: defaultRankWeight,
             Key.developerMode: false,
             Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
@@ -160,7 +158,6 @@ final class Prefs {
         _settingsSection =
             SettingsSection(rawValue: defaults.string(forKey: Key.settingsSection) ?? "")
             ?? .general
-        _rankWeight = defaults.double(forKey: Key.rankWeight)
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _lastSeenReleaseNotes = defaults.string(forKey: Key.lastSeenReleaseNotes)
@@ -222,17 +219,6 @@ final class Prefs {
         set {
             _settingsSection = newValue
             defaults.set(newValue.rawValue, forKey: Key.settingsSection)
-        }
-    }
-
-    /// Blend weight (0..1) for the Sitrep "For your eyes" ranking: the urgency
-    /// (time) share of the score; the remainder is severity.
-    private var _rankWeight: Double
-    var rankWeight: Double {
-        get { _rankWeight }
-        set {
-            _rankWeight = newValue
-            defaults.set(newValue, forKey: Key.rankWeight)
         }
     }
 

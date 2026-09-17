@@ -128,9 +128,9 @@ struct TourOverlay: View {
                 locator: "They sit in the records rail, down the right of the sitrep.")
         case .newsletters:
             coach(
-                .newsletters, title: "Newsletters, to one side",
-                body: "Newsletters you might actually want, held to the side.",
-                locator: "The newsletters zone sits under For your eyes.")
+                .newsletters, title: "Reading, to one side",
+                body: "Newsletters, announcements, and offers to read when you want.",
+                locator: "Reading sits under For your eyes.")
         case .philosophy:
             modal { philosophyCard }
         case .demoRule, .demoDone:

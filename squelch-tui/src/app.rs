@@ -8,7 +8,7 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 
 use squelch_core::store::{SealedMessage, SqliteStore, Store};
-use squelch_core::types::{AccountId, Disposition, SenderRule, ThreadView, Tier, Update};
+use squelch_core::types::{AccountId, ClientThreadView, Disposition, SenderRule, Tier, Update};
 
 /// How far back to look when querying ranked updates. Local debug default.
 const LOOKBACK_DAYS: i64 = 30;
@@ -19,7 +19,7 @@ pub enum Mode {
     List,
     /// Thread detail drill-in; `None` view when the fetch was unavailable.
     Detail {
-        view: Option<ThreadView>,
+        view: Option<ClientThreadView>,
         scroll: u16,
     },
     /// Sender rule editor for a selected message.
@@ -341,13 +341,15 @@ impl App {
         self.move_selection(0);
     }
 
-    /// Open the thread detail pane for the selected update. Any error —
-    /// including the NotFound a sealed thread returns — degrades to an empty pane.
+    /// Open the selected thread through the human reader, including pending/auth mail.
     pub fn open_detail(&mut self) {
         let Some(u) = self.selected_update() else {
             return;
         };
-        let view = self.store.thread_view(self.account, &u.thread_id).ok();
+        let view = self
+            .store
+            .thread_view_with_html(self.account, &u.thread_id)
+            .ok();
         self.mode = Mode::Detail { view, scroll: 0 };
     }
 
@@ -471,6 +473,23 @@ mod tests {
             from_name: None,
             subject: None,
             preview: None,
+        }
+    }
+
+    #[test]
+    fn local_human_can_open_mail_pending_external_assessment() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("human@example.com").unwrap();
+        crate::seed_fake_data(&store, account).unwrap();
+        let mut app = App::new(store.clone(), account, 0).unwrap();
+        let selected = app.selected_update().unwrap();
+        assert!(store.thread_view(account, &selected.thread_id).is_err());
+        app.open_detail();
+        match app.mode {
+            Mode::Detail {
+                view: Some(view), ..
+            } => assert!(!view.messages.is_empty()),
+            _ => panic!("human detail must stay readable before agent assessment"),
         }
     }
 

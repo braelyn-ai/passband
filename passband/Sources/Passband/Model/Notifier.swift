@@ -1,7 +1,5 @@
-// macOS notification delivery for the event feed: one banner per event, a tap
-// opens that thread. Plus the ONE other thing worth interrupting a human for —
-// auth mail landing in an account that is not on screen (`postAuth`, driven by
-// BackgroundAuthWatch), whose tap opens the Auth view instead of a thread.
+// macOS notification delivery follows the server event feed. Tapping a
+// notification opens its exact message, including auth and pending triage.
 //
 // The Event row is a denormalized snapshot, so a banner renders from the frame
 // alone with no round trip. `EventBanner.copy(for:)` is that mapping, kept pure
@@ -127,6 +125,7 @@ final class Notifier {
         content.userInfo = [
             EventBanner.threadKey: event.thread_id,
             EventBanner.eventKey: event.id,
+            EventBanner.messageKey: event.message_id,
             EventBanner.accountKey: account,
         ]
         if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
@@ -174,44 +173,6 @@ final class Notifier {
             Task { @MainActor in NotificationIcon.discard(tiles) }
         }
         NotificationIcon.warm(sender)
-    }
-
-    /// Post one BACKGROUND auth banner: a mailbox that is not on screen has
-    /// just been sent a login code (or a reset, or a sign-in alert), and the
-    /// only thing this notification exists to say is which mailbox to go to.
-    /// The live account never comes through here — its auth mail gets the ring,
-    /// the audited auto-reveal and the code modal instead.
-    ///
-    /// The copy is `EventBanner.authCopy`, shared with the iOS extension, which
-    /// posts the same banner for the same mail off a push. What it deliberately
-    /// leaves out is argued there.
-    func postAuth(_ meta: SealedMeta, accountId: UUID, accountName: String) {
-        let account = accountId.uuidString
-        let copy = EventBanner.authCopy(
-            kind: meta.kind, sender: meta.sender, accountName: accountName)
-        let content = UNMutableNotificationContent()
-        content.title = copy.title
-        content.body = copy.body
-        // Account-prefixed because two daemons' auth mail is not one
-        // conversation, exactly as an event's group is.
-        content.threadIdentifier = "\(account).\(copy.threadIdentifier)"
-        content.userInfo = [
-            EventBanner.accountKey: account,
-            EventBanner.routeKey: EventBanner.authRoute,
-        ]
-        if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
-
-        // Message ids are per-daemon SQLite ints, so the account prefix is
-        // load-bearing here for the same reason it is on an event's identifier:
-        // unprefixed, account B's message 41 would silently REPLACE account A's
-        // banner for message 41. Within one account, re-posting the same id
-        // replaces its own banner rather than stacking a second copy.
-        //
-        // The tile is the SERVICE's logo, which is the one thing this banner is
-        // allowed to be specific about: it says who wants the code, while the
-        // code itself and the subject that so often contains it stay behind the
-        // audited reveal.
-        send(content, identifier: "passband.auth.\(account).\(meta.id)", sender: meta.sender)
     }
 
     /// Post a banner shaped exactly like the real thing, on demand. Settings
@@ -282,12 +243,24 @@ final class Notifier {
     /// Where a tap lands once the right mailbox is on screen.
     private enum TapTarget {
         case thread(String?)
+        case message(Int)
+        case event(Int)
         case auth
     }
 
     /// A tap: front the app, restore the window if it was closed, open the
     /// thread — in the account the banner was posted from, switching to it
     /// first when that is not the account currently on screen.
+    func handleEventTap(eventId: Int, accountId: UUID) {
+        Analytics.capture("notification_opened", ["has_thread": true])
+        deliver(.event(eventId), accountId: accountId)
+    }
+
+    func handleMessageTap(messageId: Int, accountId: UUID?) {
+        Analytics.capture("notification_opened", ["has_thread": true])
+        deliver(.message(messageId), accountId: accountId)
+    }
+
     func handleTap(threadId: String?, accountId: UUID?) {
         Analytics.capture("notification_opened", ["has_thread": !(threadId ?? "").isEmpty])
         deliver(.thread(threadId), accountId: accountId)
@@ -305,70 +278,42 @@ final class Notifier {
         deliver(.auth, accountId: accountId)
     }
 
-    /// The shared body of both taps. ONE definition, because the account rules
-    /// — a payload with no account, an account since removed, the Connect gate,
-    /// a switch that declines — are the same rules whatever the banner was
-    /// about, and two copies of them would eventually stop agreeing.
-    ///
-    /// Synchronous because the delegate's entry point is, so the cross-account
-    /// path hands itself to a Task: opening MUST come after the switch, which
-    /// tears the whole world down (including any open thread) on its way
-    /// through.
+    private var tapQueue = NotificationTapQueue<TapTarget>()
+    private var deliveringTap = false
+
     private func deliver(_ target: TapTarget, accountId: UUID?) {
-        // No account on the payload: a banner posted by a build from before
-        // notifications carried one, still sitting in Notification Center. The
-        // live account is the only guess available — and the guess then walks
-        // the SAME guards as a named account below. "No account" must not be a
-        // wider door than naming one: the old shape opened such a tap straight
-        // through, firing an authenticated request from behind the Connect
-        // gate with whatever credentials the client still held.
-        let resolved = accountId ?? AccountManager.shared.activeId
-        // An account that has since been REMOVED — or nothing named and no
-        // live account to guess. Its ids address a daemon this install no
-        // longer has credentials for, and opening one against whoever is live
-        // would show a stranger's mail — so the tap fronts the app and stops
-        // there, which is the honest whole of what can still be done about it.
-        guard let resolved,
-            AccountManager.shared.accounts.contains(where: { $0.id == resolved })
-        else {
-            front()
+        tapQueue.enqueue(target, accountId: accountId)
+        front()
+        drainPendingTap()
+    }
+
+    /// Called only after the shared client has working credentials and the
+    /// daemon's v2 contract has been verified. Failed connections retain taps.
+    func drainPendingTap() {
+        let store = AppStore.shared
+        guard !deliveringTap, !store.switching,
+            let tap = tapQueue.take(connected: store.connStatus == .connected)
+        else { return }
+        guard let account = tap.accountId ?? AccountManager.shared.activeId,
+            AccountManager.shared.accounts.contains(where: { $0.id == account })
+        else { return }
+        if account == AccountManager.shared.activeId {
+            open(tap.target)
             return
         }
-        // The live account's own banner opens in place; no switch to run.
-        // Mid-boot counts: a tap that LAUNCHED the app arrives while status is
-        // still `.loading`, and `open` only parks view state the shell shows
-        // once the world is up. Only the gate states refuse — there is no
-        // world to park into, and the client's config (if any survives) is not
-        // this tap's to spend.
-        if resolved == AccountManager.shared.activeId {
-            front()
-            switch AppStore.shared.connStatus {
-            case .disconnected, .error: break
-            case .loading, .connecting, .connected: open(target)
-            }
-            return
-        }
-        // A DIFFERENT account's banner needs a switch, and a switch assumes a
-        // fully-live world to replace — it never touches `connStatus`, so from
-        // the gate (or mid-boot) it would point the client at a daemon while
-        // the screen is still sorting out which one is live, and nothing would
-        // show for it. Fronting the app puts the banner's own tap where it can
-        // still be acted on.
-        guard AppStore.shared.connStatus == .connected else {
-            front()
-            return
-        }
+        deliveringTap = true
         Task {
-            await AccountManager.shared.switchTo(resolved)
-            front()
-            // The switch is allowed to decline (one already running) and
-            // allowed to fail (the credentials behind the record are gone, and
-            // it lands on the Connect gate). Either way a DIFFERENT mailbox is
-            // on screen, and thread ids are per-daemon: opening one here would
-            // show whatever that id happens to name in the wrong account. The
-            // Auth view is no safer — it renders the live account's codes.
-            guard AccountManager.shared.activeId == resolved else { return }
-            open(target)
+            defer {
+                deliveringTap = false
+                drainPendingTap()
+            }
+            await AccountManager.shared.switchTo(account)
+            guard AccountManager.shared.activeId == account, store.connStatus == .connected else {
+                // Retry after reconnect; a newer tap always wins.
+                if tapQueue.pending == nil { tapQueue.enqueue(tap.target, accountId: account) }
+                return
+            }
+            open(tap.target)
         }
     }
 
@@ -388,6 +333,21 @@ final class Notifier {
         case .thread(let threadId):
             guard let threadId, !threadId.isEmpty else { return }
             AppStore.shared.openThread(threadId)
+        case .message(let messageId):
+            AppStore.shared.openMessage(messageId)
+        case .event(let eventId):
+            let store = AppStore.shared
+            let epoch = store.epoch
+            Task {
+                do {
+                    let event = try await APIClient.shared.getEvent(eventId)
+                    guard store.isCurrent(epoch) else { return }
+                    store.openMessage(event.message_id)
+                } catch {
+                    guard store.isCurrent(epoch) else { return }
+                    store.pushToast("Could not open this notification. Please try again.", .error)
+                }
+            }
         case .auth:
             // The routed page on the Mac. The phone's tab bar owns its own
             // navigation and has no Auth tab yet, so there this sets a view
@@ -427,6 +387,8 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     ) async {
         let userInfo = response.notification.request.content.userInfo
         let threadId = userInfo[EventBanner.threadKey] as? String
+        let messageId = (userInfo[EventBanner.messageKey] as? Int)
+            ?? (userInfo[EventBanner.messageKey] as? String).flatMap(Int.init)
         // Stored as a string and parsed here rather than crossing as one: a
         // payload that survived a relaunch (or came from an older build) can
         // hold anything, and an unparseable id must read as "no account", not
@@ -435,7 +397,16 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // An auth banner carries no thread to open — routing it as an ordinary
         // one would front the app and then do nothing.
         let route = userInfo[EventBanner.routeKey] as? String
+        let unresolved = EventBanner.unresolvedPush(userInfo["event_id"] as? String)
         await MainActor.run {
+            if let messageId, route != EventBanner.testRoute {
+                Notifier.shared.handleMessageTap(messageId: messageId, accountId: accountId)
+                return
+            }
+            if let unresolved, route != EventBanner.testRoute {
+                Notifier.shared.handleEventTap(eventId: unresolved.eventId, accountId: unresolved.accountId)
+                return
+            }
             switch route {
             case EventBanner.authRoute:
                 Notifier.shared.handleAuthTap(accountId: accountId)

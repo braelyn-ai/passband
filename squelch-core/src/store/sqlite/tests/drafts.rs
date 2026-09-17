@@ -308,10 +308,8 @@ fn list_drafts_orders_by_updated_at_desc_and_scopes_by_account() {
 }
 
 #[test]
-fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
-    // The BELT, not the scrub: the draft row is inserted straight and the parent
-    // is sealed by hand, so neither seal path runs. A draft keyed to sealed mail
-    // must still never come back out of the list.
+fn list_drafts_preserves_human_composition_when_external_access_is_restricted() {
+    // Restricting external readers does not hide the human's own composition.
     let (store, acct) = store();
     let parent = triaged(acct, "g1", "t1").seed(&store);
     store
@@ -352,7 +350,7 @@ fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
         .unwrap();
 
     let left = store.list_drafts(acct).unwrap();
-    assert_eq!(left.len(), 1, "the sealed parent's draft is filtered out");
+    assert_eq!(left.len(), 2, "both human drafts remain available");
     assert!(
         left[0].reply_to_message_id.is_none(),
         "the NULL key compares against nothing and is never filtered"
@@ -360,9 +358,8 @@ fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
 }
 
 #[test]
-fn reingest_that_seals_the_parent_deletes_its_draft() {
-    // The other seal path: a re-ingest can turn a row that was normal when the
-    // draft was saved into a sealed one, and it scrubs in the same transaction.
+fn reingest_never_deletes_a_human_draft() {
+    // Re-ingestion cannot delete explicit user work, whatever the access assessment.
     let (store, acct) = store();
     let normal = triaged(acct, "g1", "t1");
     let parent = normal.ingest(&store);
@@ -382,9 +379,10 @@ fn reingest_that_seals_the_parent_deletes_its_draft() {
 
     let again = normal.clone().sealed(SealedKind::Otp).ingest(&store);
     assert_eq!(again, parent, "same Gmail id, same local row");
-    assert!(
-        store.list_drafts(acct).unwrap().is_empty(),
-        "the re-ingest's seal took the draft with it"
+    assert_eq!(
+        store.list_drafts(acct).unwrap().len(),
+        1,
+        "re-ingest preserves the draft"
     );
 }
 

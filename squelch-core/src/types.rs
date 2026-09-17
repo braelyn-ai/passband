@@ -218,6 +218,9 @@ str_enum! {
 /// PRE-stamp value: `None` means "new since anyone last looked".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttentionUpdate {
+    /// An explicit calendar date with no invented instant or timezone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_date: Option<String>,
     #[serde(flatten)]
     pub update: Update,
     pub status: AttentionStatus,
@@ -946,7 +949,7 @@ pub struct ShredStats {
 }
 
 /// How far a dev re-triage has got. The "run" is every row carrying a LIVE
-/// `retriage_at` stamp — the same [`crate::triage::retriage_forced`] window the
+/// `retriage_at` stamp — the same the legacy re-triage window window the
 /// passes themselves read, so this counts exactly the rows the force still
 /// covers. Two kicks inside the window are ONE run here, which is the honest
 /// answer: they are one pile of work to the queues.

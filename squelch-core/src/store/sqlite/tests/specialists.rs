@@ -1,12 +1,11 @@
-//! Shipment, receipt, banking, calendar and bill auto-close tests.
+//! Specialist facts preserve explicit human lifecycle and record visibility.
 
 use super::super::*;
 use super::support::*;
 use crate::types::Sensitivity;
-use chrono::TimeZone;
 
 #[test]
-fn banking_apply_writes_row_stamps_marker_and_auto_resolves() {
+fn banking_apply_writes_facts_without_completing_attention() {
     let (store, acct) = store();
     let id = triaged_row(acct, "g-stmt", "t1", None, false, Sensitivity::Normal)
         .category("banking_statement")
@@ -35,10 +34,10 @@ fn banking_apply_writes_row_stamps_marker_and_auto_resolves() {
     assert_eq!(b[0].amount, Some(1234.56));
     assert_eq!(b[0].account_hint.as_deref(), Some("…1234"));
 
-    // The triage row was stamped (leaves the queue) AND auto-resolved.
+    // The extractor marker changes; explicit attention state does not.
     let (status, resolved_at, marker) = triage_extract_status(&store, id);
-    assert_eq!(status, "done", "banking statement auto-resolves");
-    assert!(resolved_at.is_some(), "resolved_at stamped");
+    assert_eq!(status, "new", "extraction does not complete attention");
+    assert!(resolved_at.is_none());
     assert_eq!(marker.as_deref(), Some("claude-haiku-4-5"));
     assert!(
         store
@@ -70,60 +69,22 @@ fn invoice_row_is_not_auto_resolved_and_stays_standing() {
 }
 
 #[test]
-fn receipt_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
+fn receipt_ingest_stores_facts_and_preserves_explicit_attention() {
     let (store, acct) = store();
-    let since = Utc::now() - chrono::Duration::days(30);
-
-    let id = receipt_triaged(acct, "g-r1", "t-r1", Some(3.49)).ingest(&store);
-
-    // 1. The receipt row exists with its amount + clean sender.
+    let id = receipt_triaged(acct, "receipt", "thread", Some(3.49)).ingest(&store);
     let receipts = store.list_receipts(acct, 30).unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].amount, Some(3.49));
-    assert_eq!(receipts[0].currency.as_deref(), Some("USD"));
-    assert_eq!(receipts[0].from_addr, "no-reply@baywheels.com");
-    assert_eq!(receipts[0].from_name.as_deref(), Some("Bay Wheels"));
-
-    // 2. AUTO-RESOLVE: the triage row is status='done' with resolved_at set.
-    let done = store
-        .attention_updates(
-            acct,
-            since,
-            None,
-            Some(AttentionStatus::Done),
-            None,
-            false,
-            SpamScope::Exclude,
-        )
+    assert_eq!(triage_status(&store, acct, id), ("new".into(), None));
+    store
+        .set_attention_status(acct, id, AttentionStatus::Done)
         .unwrap();
-    assert_eq!(done.len(), 1, "receipt is auto-resolved to done");
-    assert_eq!(done[0].update.id, id);
-    assert!(done[0].resolved_at.is_some());
-
-    // 3. It is ABSENT from the New band (never inbox clutter) even though it
-    //    was never surfaced (surfaced_at IS NULL).
-    let fresh = store
-        .attention_updates(
-            acct,
-            since,
-            None,
-            None,
-            Some(SitrepBand::New),
-            false,
-            SpamScope::Exclude,
-        )
-        .unwrap();
-    assert!(
-        fresh.is_empty(),
-        "auto-done receipt must not be in the New band"
+    receipt_triaged(acct, "receipt", "thread", Some(3.49)).ingest(&store);
+    assert_eq!(
+        triage_status(&store, acct, id).0,
+        "done",
+        "re-ingest preserves explicit Done"
     );
-
-    // 4. Bands counts agree: new == 0, standing == 0.
-    let stats = store
-        .stats(acct, Utc::now() - chrono::Duration::days(30))
-        .unwrap();
-    assert_eq!(stats.bands.new, 0, "receipt excluded from new count");
-    assert_eq!(stats.bands.standing, 0);
 }
 
 #[test]
@@ -139,72 +100,19 @@ fn receipt_with_no_amount_still_lists() {
 }
 
 #[test]
-fn calendar_ingest_auto_resolves_and_lists_and_stays_out_of_bands() {
+fn calendar_ingest_does_not_complete_attention() {
     let (store, acct) = store();
-    let since = Utc::now() - chrono::Duration::days(30);
-
     let id = calendar_triaged(
         acct,
-        "g-cal1",
+        "calendar",
         crate::triage::CalendarKind::Invite,
         Utc::now(),
     )
     .ingest(&store);
-
-    // 1. The calendar row exists with its extracted fields.
-    let items = store.list_calendar_updates(acct, 24).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].message_id, id);
-    // The joined thread is what the rail clicks through to; without it the
-    // row can only jump to the mail page.
-    assert_eq!(items[0].thread_id, "t-g-cal1");
-    assert_eq!(items[0].kind, "invite");
-    assert_eq!(items[0].event_title.as_deref(), Some("Design review"));
-    assert_eq!(
-        items[0].starts_at,
-        Some(Utc.with_ymd_and_hms(2026, 7, 22, 10, 0, 0).unwrap())
-    );
-    assert_eq!(items[0].organizer.as_deref(), Some("Sam Doe"));
-
-    // 2. AUTO-RESOLVE: the triage row is status='done' with resolved_at set
-    //    (same mechanism as receipts — squelch-internal only; nothing is
-    //    written back to Gmail).
-    let done = store
-        .attention_updates(
-            acct,
-            since,
-            None,
-            Some(AttentionStatus::Done),
-            None,
-            false,
-            SpamScope::Exclude,
-        )
-        .unwrap();
-    assert_eq!(done.len(), 1, "calendar update is auto-resolved to done");
-    assert_eq!(done[0].update.id, id);
-    assert!(done[0].resolved_at.is_some());
-
-    // 3. ABSENT from the New band (never inbox clutter).
-    let fresh = store
-        .attention_updates(
-            acct,
-            since,
-            None,
-            None,
-            Some(SitrepBand::New),
-            false,
-            SpamScope::Exclude,
-        )
-        .unwrap();
-    assert!(
-        fresh.is_empty(),
-        "auto-done calendar update must not be in New"
-    );
-    let stats = store
-        .stats(acct, Utc::now() - chrono::Duration::days(30))
-        .unwrap();
-    assert_eq!(stats.bands.new, 0);
-    assert_eq!(stats.bands.standing, 0);
+    let records = store.list_calendar_updates(acct, 24).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].event_title.as_deref(), Some("Design review"));
+    assert_eq!(triage_status(&store, acct, id), ("new".into(), None));
 }
 
 #[test]
@@ -259,7 +167,7 @@ fn calendar_upsert_is_idempotent_per_message() {
 }
 
 #[test]
-fn receipt_matching_merchant_and_amount_closes_open_bill() {
+fn receipt_matching_merchant_and_amount_does_not_close_bill() {
     let (store, acct) = store();
     let now = Utc::now();
 
@@ -287,28 +195,13 @@ fn receipt_matching_merchant_and_amount_closes_open_bill() {
     )
     .ingest(&store);
 
-    // The bill's triage row is resolved through the standard transition
-    // (done + resolved_at), so it leaves the standing/obligations band.
     let (status, resolved_at) = triage_status(&store, acct, bill_id);
-    assert_eq!(status, "done", "matched bill auto-closes");
-    assert!(resolved_at.is_some(), "done stamps resolved_at");
     assert_eq!(
-        store
-            .stats(acct, Utc::now() - chrono::Duration::days(30))
-            .unwrap()
-            .bands
-            .standing,
-        0
+        status, "new",
+        "matching merchant and amount are evidence, not resolution"
     );
-
-    // The WHY is on the audit trail, targeting the bill's message id.
-    let audits = auto_close_audits(&store, acct);
-    assert_eq!(audits.len(), 1);
-    assert_eq!(audits[0].actor, "ingest");
-    assert_eq!(
-        audits[0].target.as_deref(),
-        Some(bill_id.to_string().as_str())
-    );
+    assert!(resolved_at.is_none());
+    assert!(auto_close_audits(&store, acct).is_empty());
 }
 
 #[test]
@@ -368,7 +261,7 @@ fn receipt_without_amount_never_closes_an_amounted_bill() {
 }
 
 #[test]
-fn merchant_name_normalization_matches_across_domains() {
+fn merchant_name_similarity_does_not_close_bill() {
     // Different domains entirely; identity carried by the normalized
     // display name ("PG&E" == "PGE" after case/punctuation folding).
     let (store, acct) = store();
@@ -395,7 +288,10 @@ fn merchant_name_normalization_matches_across_domains() {
     .ingest(&store);
 
     let (status, _) = triage_status(&store, acct, bill_id);
-    assert_eq!(status, "done", "normalized names establish the merchant");
+    assert_eq!(
+        status, "new",
+        "similar merchant names cannot resolve obligations"
+    );
 }
 
 #[test]
@@ -467,14 +363,14 @@ fn receipt_with_no_matching_bill_does_nothing() {
     let (status, _) = triage_status(&store, acct, bill_id);
     assert_eq!(status, "new", "unrelated bill stays open");
     assert!(auto_close_audits(&store, acct).is_empty());
-    // The receipt itself is still auto-resolved + listed as usual.
+    // The receipt is listed without implicitly completing its attention.
     let (rstatus, _) = triage_status(&store, acct, receipt_id);
-    assert_eq!(rstatus, "done");
+    assert_eq!(rstatus, "new");
     assert_eq!(store.list_receipts(acct, 30).unwrap().len(), 1);
 }
 
 #[test]
-fn amountless_bill_closes_on_merchant_match_within_tight_window() {
+fn amountless_bill_remains_open_after_matching_receipt() {
     // The bill parsed no amount: merchant identity + the tight recency
     // window carry the match alone.
     let (store, acct) = store();
@@ -501,8 +397,8 @@ fn amountless_bill_closes_on_merchant_match_within_tight_window() {
     .ingest(&store);
 
     let (status, _) = triage_status(&store, acct, bill_id);
-    assert_eq!(status, "done");
-    assert_eq!(auto_close_audits(&store, acct).len(), 1);
+    assert_eq!(status, "new");
+    assert!(auto_close_audits(&store, acct).is_empty());
 }
 
 #[test]
@@ -539,7 +435,7 @@ fn stale_bill_outside_recency_window_is_not_closed() {
 }
 
 #[test]
-fn one_receipt_closes_only_the_earliest_due_of_identical_bills() {
+fn receipt_does_not_choose_between_identical_bills() {
     // Two open months of the same $15.49 subscription: one payment settles
     // ONE month — the earliest due. Closing both would hide the unpaid one.
     let (store, acct) = store();
@@ -577,9 +473,12 @@ fn one_receipt_closes_only_the_earliest_due_of_identical_bills() {
 
     let (june_status, _) = triage_status(&store, acct, june);
     let (july_status, _) = triage_status(&store, acct, july);
-    assert_eq!(june_status, "done", "earliest-due month is the one paid");
+    assert_eq!(
+        june_status, "new",
+        "dates cannot select which obligation was paid"
+    );
     assert_eq!(july_status, "new", "the newer month must stay open");
-    assert_eq!(auto_close_audits(&store, acct).len(), 1);
+    assert!(auto_close_audits(&store, acct).is_empty());
 }
 
 #[test]
@@ -1165,12 +1064,13 @@ fn a_new_email_revives_a_retired_shipment() {
             .is_empty(),
         "retired out of the poll queue"
     );
-    assert!(
+    assert_eq!(
         store
             .list_shipments(acct, false, suppress_at(5))
             .unwrap()
-            .is_empty(),
-        "and out of the lists"
+            .len(),
+        1,
+        "poll retirement does not hide the record"
     );
 
     // The parcel was real all along, and here is the mail that says so.
@@ -1381,7 +1281,7 @@ fn fail_polls(store: &SqliteStore, acct: AccountId, shipment_id: i64, n: u32) {
 }
 
 #[test]
-fn a_capped_ambiguous_row_is_suppressed_but_a_prefixed_one_is_not() {
+fn carrier_failures_do_not_hide_either_tracking_shape() {
     use crate::triage::ShipmentStatus;
     let (store, acct) = store();
     let mid = store
@@ -1410,7 +1310,10 @@ fn a_capped_ambiguous_row_is_suppressed_but_a_prefixed_one_is_not() {
 
     let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
     let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
-    assert_eq!(ids, vec![real], "only the ambiguous shape is suppressed");
+    assert!(
+        ids.contains(&real) && ids.contains(&phantom),
+        "tracking shape is not a visibility rule"
+    );
     assert_eq!(
         listed[0].poll_failures, 5,
         "the counter is on the wire type"
@@ -1451,7 +1354,7 @@ fn an_ambiguous_row_below_the_cap_still_lists() {
 }
 
 #[test]
-fn a_successful_poll_unsuppresses_an_ambiguous_row() {
+fn carrier_success_updates_facts_without_changing_visibility() {
     use crate::triage::{CarrierTrack, ShipmentStatus};
     let (store, acct) = store();
     let mid = store
@@ -1467,11 +1370,11 @@ fn a_successful_poll_unsuppresses_an_ambiguous_row() {
         .unwrap();
     fail_polls(&store, acct, sid, 5);
     assert!(
-        store
+        !store
             .list_shipments(acct, false, suppress_at(5))
             .unwrap()
             .is_empty(),
-        "capped out"
+        "failed carrier polling does not hide records"
     );
 
     // The carrier acknowledging the number is proof it was real all along, and
@@ -1515,14 +1418,14 @@ fn aged_shipment(store: &SqliteStore, acct: AccountId, number: &str, age_days: i
 /// is literally "nothing has happened to this package in N days" — which is what
 /// the timeout is for. 0 turns the whole filter off.
 #[test]
-fn a_shipment_goes_stale_after_the_window_and_zero_disables_it() {
+fn shipment_age_does_not_change_record_visibility() {
     let (store, acct) = store();
     let old = aged_shipment(&store, acct, "1Z999AA10123456784", 8);
     let recent = aged_shipment(&store, acct, "1Z999AA10123456785", 6);
 
     let listed = store.list_shipments(acct, false, stale_after(7)).unwrap();
     let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
-    assert_eq!(ids, vec![recent], "8 days out is hidden, 6 days out is not");
+    assert_eq!(ids, vec![recent, old], "age is not a visibility rule");
 
     assert_eq!(
         store
@@ -1745,140 +1648,6 @@ fn clearing_is_idempotent_restamps_and_reports_an_unknown_id() {
             .unwrap()
             .is_empty(),
         "the re-clear restamped and hid the revived row again"
-    );
-}
-
-// ---- one-shot re-detect cleanup ----------------------------------------
-
-/// A shipment row on `(carrier, number)` whose feeder is `msg` — the shape the
-/// re-detect pass re-judges.
-fn shipment_over_mail(
-    store: &SqliteStore,
-    acct: AccountId,
-    msg: &NewMessage,
-    carrier: &str,
-    number: &str,
-) -> i64 {
-    let mid = store.upsert_message(msg).unwrap();
-    store
-        .upsert_shipment(
-            acct,
-            mid,
-            &shipped(carrier, number, crate::triage::ShipmentStatus::Shipped),
-            Utc::now(),
-        )
-        .unwrap()
-}
-
-#[test]
-fn redetect_deletes_the_ebay_phantom_and_keeps_the_real_row() {
-    let (store, acct) = store();
-    // The live bug: an eBay item id minted as a "fedex" shipment.
-    let phantom = shipment_over_mail(
-        &store,
-        acct,
-        &triaged(acct, "g-ebay", "t-ebay")
-            .from("ebay@ebay.com")
-            .subject("Your package is now with its carrier!")
-            .body(
-                "Your package is now with its carrier! Shipping via USPS. \
-                 See https://www.ebay.com/itm/123456789012, item 234567890123.",
-            )
-            .msg(),
-        "fedex",
-        "123456789012",
-    );
-    // A real UPS notice, which the tightened detector still yields.
-    let real = shipment_over_mail(
-        &store,
-        acct,
-        &triaged(acct, "g-ups", "t-ups")
-            .from("mcinfo@ups.com")
-            .subject("Your UPS package has shipped")
-            .body("Tracking number: 1Z999AA10123456784. Track your package.")
-            .msg(),
-        "ups",
-        "1Z999AA10123456784",
-    );
-
-    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 1);
-    let ids: Vec<i64> = store
-        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-        .unwrap()
-        .iter()
-        .map(|s| s.id)
-        .collect();
-    assert_eq!(ids, vec![real], "only the phantom goes");
-    assert!(!ids.contains(&phantom));
-
-    // IDEMPOTENT: a second pass over the repaired store deletes nothing.
-    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
-    assert_eq!(
-        store
-            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-#[test]
-fn redetect_deletes_a_row_whose_feeder_now_yields_a_different_number() {
-    let (store, acct) = store();
-    // The mail yields the IMpb; the stored row is one of its item ids, which the
-    // old first-match-only scan had picked instead.
-    shipment_over_mail(
-        &store,
-        acct,
-        &triaged(acct, "g-ebay", "t-ebay")
-            .from("ebay@ebay.com")
-            .subject("Your package is now with its carrier!")
-            .body("Item 234567890123 shipped via USPS. Tracking number 9400111899223817428490.")
-            .msg(),
-        "fedex",
-        "234567890123",
-    );
-    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 1);
-    assert!(
-        store
-            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-            .unwrap()
-            .is_empty(),
-        "a row the feeder no longer yields is deleted"
-    );
-}
-
-#[test]
-fn redetect_leaves_pointerless_rows_alone() {
-    use crate::triage::ShipmentStatus;
-    let (store, acct) = store();
-    let mid = store
-        .upsert_message(&triaged(acct, "g1", "t1").msg())
-        .unwrap();
-    // An ambiguous number that would NOT re-detect from any mail — but with no
-    // feeder message there is no evidence to judge it on, so it stays.
-    store
-        .upsert_shipment(
-            acct,
-            mid,
-            &shipped("fedex", "123456789012", ShipmentStatus::Shipped),
-            Utc::now(),
-        )
-        .unwrap();
-    store
-        .lock()
-        .unwrap()
-        .execute("UPDATE shipments SET last_message_id = NULL", [])
-        .unwrap();
-
-    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
-    assert_eq!(
-        store
-            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-            .unwrap()
-            .len(),
-        1,
-        "no feeder message, no judgement"
     );
 }
 
@@ -2840,152 +2609,6 @@ fn an_ambiguous_order_ref_match_donates_to_neither_row() {
     );
 }
 
-// ---- the re-detect one-shot: evidence and atomicity ---------------------
-
-/// The re-detect done-flag as the store records it.
-fn redetect_flag(store: &SqliteStore, acct: AccountId) -> Option<String> {
-    store
-        .get_app_setting(acct, "shipments_redetect_v1")
-        .unwrap()
-}
-
-/// A mail whose text yields NO tracking number at all, so any row hung off it
-/// fails the re-detect keep test.
-fn undetectable_mail(acct: AccountId, gmail: &str) -> TriagedBuilder {
-    triaged(acct, gmail, &format!("t-{gmail}"))
-        .from("ebay@ebay.com")
-        .subject("Your package is now with its carrier!")
-        .body("Your package is now with its carrier! See https://www.ebay.com/itm/123456789012.")
-}
-
-#[test]
-fn the_redetect_one_shot_spares_extractor_and_carrier_evidence() {
-    // The keep test is the REGEX detector, and extractor-written rows are
-    // exactly what it cannot reproduce. So the one-shot judges only rows with no
-    // evidence of their own: a carrier answer (or even a poll attempt) and an
-    // order reference both put a row out of reach.
-    use crate::triage::{CarrierTrack, ShipmentStatus};
-    let (store, acct) = store();
-
-    let plain = shipment_over_mail(
-        &store,
-        acct,
-        &undetectable_mail(acct, "g-plain").msg(),
-        "fedex",
-        "123456789012",
-    );
-    let polled = shipment_over_mail(
-        &store,
-        acct,
-        &undetectable_mail(acct, "g-polled").msg(),
-        "fedex",
-        "223456789012",
-    );
-    let ordered = shipment_over_mail(
-        &store,
-        acct,
-        &undetectable_mail(acct, "g-ordered").msg(),
-        "fedex",
-        "323456789012",
-    );
-    store
-        .apply_carrier_track(
-            acct,
-            polled,
-            &CarrierTrack {
-                status: Some(ShipmentStatus::Shipped),
-                carrier_status_raw: "In Transit".into(),
-                eta: None,
-                delivered_at: None,
-            },
-            Utc::now(),
-        )
-        .unwrap();
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE shipments SET order_ref='1042', order_merchant='shopa.com' WHERE id=?1",
-            params![ordered],
-        )
-        .unwrap();
-
-    assert_eq!(
-        store.shipments_redetect_cleanup(acct).unwrap(),
-        1,
-        "only the evidence-free phantom is reaped"
-    );
-    let surviving: Vec<i64> = store
-        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-        .unwrap()
-        .iter()
-        .map(|s| s.id)
-        .collect();
-    assert!(!surviving.contains(&plain));
-    assert!(surviving.contains(&polled), "carrier evidence is spared");
-    assert!(surviving.contains(&ordered), "extractor evidence is spared");
-}
-
-#[test]
-fn the_redetect_flag_and_its_deletions_commit_together() {
-    // The pass CANNOT complete without being recorded: flag and deletions are
-    // one transaction, and the store owns both. With the flag written by the
-    // caller afterwards, a crash or an unwritable settings row meant a re-run —
-    // and by then the extractor has written rows the regex cannot reproduce, so
-    // the second pass would eat them.
-    let (store, acct) = store();
-    assert_eq!(redetect_flag(&store, acct), None);
-
-    shipment_over_mail(
-        &store,
-        acct,
-        &undetectable_mail(acct, "g-phantom").msg(),
-        "fedex",
-        "123456789012",
-    );
-    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 1);
-    assert_eq!(
-        redetect_flag(&store, acct).as_deref(),
-        Some("done"),
-        "the pass records itself in the same transaction as its deletions"
-    );
-
-    // An extractor-written row lands afterwards: one the regex will never yield.
-    // The recorded completion is what stands between it and the reaper.
-    let extracted = shipment_over_mail(
-        &store,
-        acct,
-        &undetectable_mail(acct, "g-extracted").msg(),
-        "fedex",
-        "223456789012",
-    );
-    assert_eq!(
-        store.shipments_redetect_cleanup(acct).unwrap(),
-        0,
-        "the one-shot is over"
-    );
-    assert!(
-        store
-            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-            .unwrap()
-            .iter()
-            .any(|s| s.id == extracted),
-        "a recorded pass never runs again"
-    );
-}
-
-#[test]
-fn the_redetect_one_shot_records_itself_even_when_it_deletes_nothing() {
-    // A pass with nothing to reap still HAPPENED. Leaving the flag unwritten
-    // would arm the reaper for the next start, over a store the extractor has
-    // been writing to since.
-    let (store, acct) = store();
-    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
-    assert_eq!(redetect_flag(&store, acct).as_deref(), Some("done"));
-}
-
-// ---- one-shot receipt re-parse ----------------------------------------
-
 /// Amazon's own unrounded total, verbatim, plus the "your order" boilerplate
 /// that classifies the mail. `$67.29` is the right answer.
 const AMAZON_FLOAT_BODY: &str = "* Gap Filler Syringe\n  Quantity: 1\n  7.97 USD\n\n\
@@ -2994,155 +2617,8 @@ const AMAZON_FLOAT_BODY: &str = "* Gap Filler Syringe\n  Quantity: 1\n  7.97 USD
      If your order contains one or more items from a third party.";
 
 #[test]
-fn reparse_corrects_a_float_tail_total_and_leaves_good_rows_alone() {
-    let (store, acct) = store();
-
-    // The row as the OLD parser wrote it: the fractional tail of the total,
-    // stored as the total. This is what a receipts card was rendering as
-    // $28,999,999,999,999.
-    let bad = triaged(acct, "g-amz", "t-amz")
-        .from("shipment-tracking@amazon.com")
-        .from_name(Some("Amazon.com"))
-        .subject("Shipped: 2 items")
-        .body(AMAZON_FLOAT_BODY)
-        .receipt(crate::triage::ReceiptInfo {
-            amount: Some(28_999_999_999_999.0),
-            currency: Some("USD".into()),
-        })
-        .ingest(&store);
-
-    // A receipt the old parser already got right.
-    let good = triaged(acct, "g-ok", "t-ok")
-        .from("receipts@shop.com")
-        .from_name(Some("Shop"))
-        .subject("Your receipt")
-        .body("Thank you for your order.\nOrder total: $12.34")
-        .receipt(crate::triage::ReceiptInfo {
-            amount: Some(12.34),
-            currency: Some("USD".into()),
-        })
-        .ingest(&store);
-    let _ = (bad, good);
-
-    assert_eq!(
-        store.receipts_reparse_cleanup(acct).unwrap(),
-        1,
-        "only the mis-parsed row is corrected"
-    );
-
-    let by_amount = |store: &SqliteStore| -> Vec<Option<f64>> {
-        let mut v: Vec<Option<f64>> = store
-            .list_receipts(acct, 30)
-            .unwrap()
-            .iter()
-            .map(|r| r.amount)
-            .collect();
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v
-    };
-    assert_eq!(
-        by_amount(&store),
-        vec![Some(12.34), Some(67.29)],
-        "the float tail becomes the real total; the good row is untouched"
-    );
-
-    // ONCE PER ACCOUNT: the flag commits with the corrections, so a second call
-    // judges nothing at all.
-    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
-    assert_eq!(by_amount(&store), vec![Some(12.34), Some(67.29)]);
-}
-
-#[test]
-fn reparse_is_a_no_op_on_a_store_that_never_mis_parsed() {
-    // The pass must not invent work. The stored amount already agrees with what
-    // the parser says about this body, so nothing is written.
-    let (store, acct) = store();
-    receipt_triaged(acct, "g-r1", "t-r1", Some(3.49))
-        .body("Thank you for your ride. Total: $3.49")
-        .ingest(&store);
-    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
-    assert_eq!(
-        store.list_receipts(acct, 30).unwrap()[0].amount,
-        Some(3.49),
-        "a correct amount is never rewritten"
-    );
-}
-
-#[test]
-fn reparse_never_clears_an_amount_it_cannot_reproduce() {
-    // ABSENT EVIDENCE IS NOT EVIDENCE OF ABSENCE. A body that yields no total
-    // today does not make yesterday's stored total wrong, and a repair pass that
-    // blanks money on silence is worse than the bug it was written to fix.
-    let (store, acct) = store();
-    receipt_triaged(acct, "g-r2", "t-r2", Some(3.49))
-        .body("Thanks for riding with us.")
-        .ingest(&store);
-    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
-    assert_eq!(
-        store.list_receipts(acct, 30).unwrap()[0].amount,
-        Some(3.49),
-        "an unreproducible amount is left standing, not cleared"
-    );
-}
-
-fn reparse_flag(store: &SqliteStore, acct: AccountId) -> Option<String> {
-    store.get_app_setting(acct, "receipts_reparse_v1").unwrap()
-}
-
-#[test]
-fn the_reparse_records_itself_after_a_correcting_run() {
-    // THE ONCE IS THE STORE'S JOB and it had no test: deleting the flag write
-    // outright left the reparse suite green, because the assertion that looked
-    // like it covered this (a second call returning 0) passes for a different
-    // reason — after the first pass the recompute equals the stored value and
-    // `same_cents` short-circuits. So the pass would silently run on EVERY boot
-    // and nothing would say so.
-    //
-    // NAMED FOR WHAT IT PROVES. An earlier name claimed the flag and the
-    // corrections "commit together", and this does not show that: moving the
-    // flag write to AFTER `tx.commit()` still passes. Real atomicity needs a
-    // failure injected between the two, which the store offers no seam for, so
-    // the claim is dropped rather than implied.
-    let (store, acct) = store();
-    assert_eq!(reparse_flag(&store, acct), None, "unrun");
-
-    triaged(acct, "g-amz", "t-amz")
-        .from("shipment-tracking@amazon.com")
-        .from_name(Some("Amazon.com"))
-        .subject("Shipped: 2 items")
-        .body(AMAZON_FLOAT_BODY)
-        .receipt(crate::triage::ReceiptInfo {
-            amount: Some(28_999_999_999_999.0),
-            currency: Some("USD".into()),
-        })
-        .ingest(&store);
-
-    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 1);
-    assert_eq!(
-        reparse_flag(&store, acct).as_deref(),
-        Some("done"),
-        "the flag commits with the corrections, not after them"
-    );
-}
-
-#[test]
-fn the_reparse_one_shot_records_itself_even_when_it_corrects_nothing() {
-    // A mailbox with nothing to fix must still be marked done, or the pass
-    // re-scans every receipt on every start forever.
-    let (store, acct) = store();
-    receipt_triaged(acct, "g-ok", "t-ok", Some(3.49))
-        .body("Thank you for your ride. Total: $3.49")
-        .ingest(&store);
-
-    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
-    assert_eq!(reparse_flag(&store, acct).as_deref(), Some("done"));
-}
-
-#[test]
-fn sealing_a_message_takes_its_calendar_row_with_it() {
-    // Same leak, one table over, and the one the reviewers rated highest: a
-    // calendar row holds an event title and an ORGANISER'S NAME lifted out of
-    // the mail and renders them on GET /client/calendar.
+fn external_restriction_preserves_human_calendar_record() {
+    // External restriction never deletes records from the human mailbox.
     let (store, acct) = store();
     let id = triaged(acct, "g-cal", "t-cal")
         .from("sam@example.com")
@@ -3168,17 +2644,14 @@ fn sealing_a_message_takes_its_calendar_row_with_it() {
         .unwrap();
 
     assert!(
-        store.list_calendar_updates(acct, 30).unwrap().is_empty(),
-        "a sealed message keeps no calendar row"
+        !store.list_calendar_updates(acct, 30).unwrap().is_empty(),
+        "human calendar records survive external access restriction"
     );
 }
 
 #[test]
-fn sealing_a_message_takes_its_receipt_with_it() {
-    // The seal scrub drops the marketing and banking rows a sealed message fed
-    // and did NOT drop its receipt, so a merchant and an amount lifted out of
-    // mail the owner just called auth kept rendering on the Sitrep's Receipts
-    // zone — the exact leak the neighbouring deletes exist to prevent.
+fn external_restriction_preserves_human_receipt() {
+    // Access decisions govern external reads rather than destroying facts.
     let (store, acct) = store();
     let id = receipt_triaged(acct, "g-r1", "t-r1", Some(3.49)).ingest(&store);
     assert_eq!(store.list_receipts(acct, 30).unwrap().len(), 1);
@@ -3195,8 +2668,8 @@ fn sealing_a_message_takes_its_receipt_with_it() {
         .unwrap();
 
     assert!(
-        store.list_receipts(acct, 30).unwrap().is_empty(),
-        "a sealed message keeps no receipt row"
+        !store.list_receipts(acct, 30).unwrap().is_empty(),
+        "human receipts survive external access restriction"
     );
 }
 
@@ -3224,4 +2697,38 @@ fn sealed_mail_gets_no_receipt_at_first_ingest() {
         store.list_receipts(acct, 30).unwrap().is_empty(),
         "sealed mail writes no receipt"
     );
+}
+
+#[test]
+fn retired_detector_repairs_preserve_stored_facts() {
+    let (store, acct) = store();
+    let message = receipt_triaged(acct, "old-receipt", "thread", Some(1234.0))
+        .body("Total $12.34. No shipping or tracking text.")
+        .ingest(&store);
+    store
+        .upsert_shipment(
+            acct,
+            message,
+            &shipped(
+                "fedex",
+                "123456789012",
+                crate::triage::ShipmentStatus::Shipped,
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(store.shipments_redetect_cleanup(acct).unwrap(), 0);
+    assert_eq!(store.receipts_reparse_cleanup(acct).unwrap(), 0);
+    assert_eq!(
+        store.list_receipts(acct, 30).unwrap()[0].amount,
+        Some(1234.0)
+    );
+    assert_eq!(
+        store
+            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(triage_status(&store, acct, message).0, "new");
 }

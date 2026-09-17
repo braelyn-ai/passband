@@ -22,8 +22,8 @@ private let eyesVisible = 10
 /// Computed at KEY-PRESS AND CLICK TIME ONLY. It re-ranks the standing list,
 /// which is the cost `SitrepCursor` exists to keep out of the render path.
 @MainActor
-private func eyesWalk(_ store: AppStore, weight: Double) -> [AttentionUpdate] {
-    Ranking.rank(store.sitrep.standing, weight: weight)
+private func eyesWalk(_ store: AppStore) -> [AttentionUpdate] {
+    store.sitrep.standing
 }
 
 /// The sitrep's hover + keyboard cursor, in an `@Observable` box rather than
@@ -84,7 +84,7 @@ struct SitrepView: View {
     /// path does NOT come through here — `body` ranks once into a `let` and
     /// passes the result down.
     private var reachable: [AttentionUpdate] {
-        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        let ranked = store.sitrep.standing
         return cursor.expanded ? ranked : Array(ranked.prefix(eyesVisible))
     }
 
@@ -93,7 +93,7 @@ struct SitrepView: View {
         // pass — twice through `visibleEyes`, and once more by each `onChange`,
         // whose value expression is re-evaluated on every body evaluation — and
         // every read re-sorted the entire standing list.
-        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        let ranked = store.sitrep.standing
         let visible = cursor.expanded ? ranked : Array(ranked.prefix(eyesVisible))
         let overflow = ranked.count - eyesVisible
         let threadIds = ranked.map(\.thread_id)
@@ -226,6 +226,7 @@ struct SitrepView: View {
     /// The records zones as the pinned rail shows them: full-width rows.
     @ViewBuilder
     private var railZones: some View {
+        AgentRecordsZone()
         CalendarZone()
         ShipmentsZone()
         BankingZone()
@@ -239,6 +240,7 @@ struct SitrepView: View {
     private var railCards: some View {
         HStack(alignment: .top, spacing: 16) {
             VStack(spacing: 16) {
+                AgentRecordsZone()
                 CalendarZone()
                 BankingZone()
             }
@@ -380,7 +382,7 @@ struct SitrepView: View {
             },
             KeyBinding("Enter", "open email") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
-                store.openThread(u.thread_id, queue: eyesWalk(store, weight: prefs.rankWeight))
+                store.openThread(u.thread_id, queue: eyesWalk(store))
             },
             // Same guard as every other verb here — inert unless a row is
             // actually highlighted. Reply opens the email and composes inside it,
@@ -388,14 +390,13 @@ struct SitrepView: View {
             // inside the reader once the reply is away.
             KeyBinding("r", "reply") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
-                Actions.reply(u, queue: eyesWalk(store, weight: prefs.rankWeight))
+                Actions.reply(u, queue: eyesWalk(store))
             },
             KeyBinding("v", "fix triage") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
                 store.openTriageFix(
                     TriageFixTarget(
-                        messageId: u.id, sender: u.sender, subject: u.one_line,
-                        tier: .some(u.tier.rawValue)))
+                        messageId: u.id, sender: u.sender, subject: u.one_line))
             },
             KeyBinding("h", "remind me later") {
                 guard eyesActionable, let u = reachable[safe: cursor.index] else { return }
@@ -416,7 +417,7 @@ struct SitrepView: View {
         cursor.kbActive = true
         // Ranked once here rather than through `reachable` twice: the expander
         // check needs the full list and the cursor needs the visible one.
-        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        let ranked = store.sitrep.standing
         let rows = cursor.expanded ? ranked : Array(ranked.prefix(eyesVisible))
         let next = cursor.index + delta
 
@@ -687,7 +688,7 @@ private struct DashHero: View {
         let total = standing.count
         if today > 0 {
             return "\(Self.spell(today)) item\(today == 1 ? "" : "s") "
-                + "need\(today == 1 ? "s" : "") you today."
+                + "for your eyes."
         }
         if total > 0 {
             return "\(Self.spell(total)) item\(total == 1 ? "" : "s") on your plate."
@@ -736,7 +737,7 @@ private struct ObligationRow: View {
     private var claimsDate: Bool { update.tier == .pastDue || update.tier == .deadline }
 
     var body: some View {
-        let chip = Fmt.deadlineChip(update.deadline)
+        let chip = Fmt.deadlineChip(update.displayDeadline)
         let overdue = chip?.overdue ?? false
 
         // Click anywhere on the row opens the email; done is keyboard-only (e/d).
@@ -744,7 +745,7 @@ private struct ObligationRow: View {
         // not decide whether `E` inside it has anywhere to go.
         Button {
             cursor.index = index
-            store.openThread(update.thread_id, queue: eyesWalk(store, weight: prefs.rankWeight))
+            store.openThread(update.thread_id, queue: eyesWalk(store))
         } label: {
             HStack(spacing: 9) {
                 Avatar(sender: update.senderString, size: 22)
@@ -948,8 +949,7 @@ struct RetriageButton: View {
             .buttonStyle(.textAction)
             .disabled(busy)
             .help(
-                "dev: reset LLM verdicts for the last \(Self.days) days and re-run triage "
-                    + "(rule-decided and sealed mail untouched)")
+                "dev: re-run agent triage for the last \(Self.days) days")
         }
     }
 }

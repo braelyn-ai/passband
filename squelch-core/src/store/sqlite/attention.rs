@@ -78,11 +78,9 @@ const WITHIN_WINDOW: &str = "(m.received_at >= ?2
 /// pending one because a pending reminder means "not now" — `set_reminder`
 /// marks the thread done precisely to get it out of the bands until it is due.
 ///
-/// What participation deliberately does NOT do: it never unseals anything (the
-/// base predicate's `sensitivity != 'sealed'` is the only gate that matters,
-/// and it is outside this expression), and it never surfaces the user's own
-/// sent mail — the sent sibling is evidence, and `m.is_sent = 0` keeps it out
-/// of every listing.
+/// Human inventory includes restricted mail. The user's own sent messages remain
+/// excluded: a sent sibling supplies correspondence context, while `m.is_sent = 0`
+/// keeps it out of the incoming listing.
 ///
 /// THE HAVING-WRITTEN-TO-THEM ARM IS NOT A MARKETING PASS. It is the weakest
 /// arm by construction — one email, ever, to an address — and it carries no
@@ -142,14 +140,14 @@ impl SqliteStore {
     ) -> Result<Vec<Update>> {
         let conn = self.lock()?;
         let min = min_importance.unwrap_or(0) as i64;
-        // SECURITY: sealed rows excluded in SQL. sensitivity != 'sealed'.
+        // Human inventory includes restricted and pending mail.
         let mut stmt = conn.prepare(
             "SELECT m.id, m.thread_id, t.tier, t.importance, m.from_addr, t.one_line,
                     t.reason, t.deadline, t.matched_rule_id
              FROM triage t
              JOIN messages m ON m.id = t.message_id
              WHERE t.account_id = ?1
-               AND t.sensitivity != 'sealed'
+
                AND m.is_sent = 0
                AND m.is_spam = 0
                AND m.received_at >= ?2
@@ -213,7 +211,7 @@ impl SqliteStore {
         let spam_sql = spam.predicate();
         let mut where_sql = format!(
             "WHERE t.account_id = ?1
-               AND t.sensitivity != 'sealed'
+
                AND m.is_sent = 0
                AND {spam_sql}
                AND {WITHIN_WINDOW}
@@ -339,6 +337,7 @@ impl SqliteStore {
                 update.preview = non_blank(r.get::<_, Option<String>>(19)?);
             }
             Ok(AttentionUpdate {
+                deadline_date: None,
                 update,
                 status: AttentionStatus::parse(&r.get::<_, String>(9)?)
                     .unwrap_or(AttentionStatus::New),
@@ -373,15 +372,14 @@ impl SqliteStore {
         let tx = conn.transaction()?;
         let mut first_surfaced = 0usize;
         {
-            // Stamp surfaced_at only if NULL and promote new->open. The
-            // sensitivity guard means a sealed row is NEVER stamped, so it cannot
-            // leak into a "new since last check" delta. Idempotent.
+            // Stamp surfaced_at once and promote new to open. This is a human
+            // acknowledgement, independent of external agent access.
             let mut stmt = tx.prepare(
                 "UPDATE triage
                  SET surfaced_at = COALESCE(surfaced_at, ?1),
                      status = CASE WHEN status = 'new' THEN 'open' ELSE status END
                  WHERE account_id = ?2 AND message_id = ?3
-                   AND sensitivity != 'sealed'
+
                    AND surfaced_at IS NULL",
             )?;
             for &id in message_ids {
@@ -417,7 +415,7 @@ impl SqliteStore {
                 "UPDATE triage
                  SET opened_at = ?1
                  WHERE account_id = ?2 AND message_id = ?3
-                   AND sensitivity != 'sealed'
+
                    AND opened_at IS NULL",
             )?;
             for &id in message_ids {
@@ -450,7 +448,7 @@ impl SqliteStore {
             "UPDATE triage
                 SET opened_at = ?1
               WHERE account_id = ?2
-                AND sensitivity != 'sealed'
+
                 AND opened_at IS NULL
                 AND message_id IN (
                     SELECT id FROM messages WHERE account_id = ?2 AND thread_id = ?3
@@ -540,8 +538,8 @@ impl SqliteStore {
         status: AttentionStatus,
     ) -> Result<bool> {
         let conn = self.lock()?;
-        // Done stamps resolved_at; reopening (open/new) clears it. Sealed rows are
-        // excluded so this can never touch a sealed message.
+        // Done stamps resolved_at; reopening clears it. Human actions also apply
+        // to mail restricted from external agents.
         let resolved_at = match status {
             AttentionStatus::Done => Some(Utc::now().to_rfc3339()),
             _ => None,
@@ -563,7 +561,7 @@ impl SqliteStore {
             AttentionStatus::Done => conn.execute(
                 "UPDATE triage
                  SET status = ?1, resolved_at = ?2, reminded_at = NULL
-                 WHERE account_id = ?3 AND sensitivity != 'sealed'
+                 WHERE account_id = ?3
                    AND (message_id = ?4 OR message_id IN (
                        SELECT sib.id FROM messages me
                        JOIN messages sib ON sib.account_id = me.account_id
@@ -575,7 +573,7 @@ impl SqliteStore {
             _ => conn.execute(
                 "UPDATE triage
                  SET status = ?1, resolved_at = ?2
-                 WHERE account_id = ?3 AND message_id = ?4 AND sensitivity != 'sealed'",
+                 WHERE account_id = ?3 AND message_id = ?4",
                 params![status.as_str(), resolved_at, account_id, message_id],
             )?,
         };
@@ -600,24 +598,13 @@ impl SqliteStore {
         let mut conn = self.lock()?;
         let now = Utc::now().to_rfc3339();
         let tx = conn.transaction()?;
-        // SECURITY: sealed rows excluded in SQL, so missing and sealed are the
-        // same `false`. `reminded_at` is cleared because a new reminder replaces
-        // whatever the old one already said — the two stamps are the pending and
-        // fired halves of ONE reminder, never a history.
-        //
-        // AND NOT THE USER'S OWN SENT MAIL, NOR PROVIDER SPAM, by the same
-        // indistinguishability rule as sealed: both carry a triage row (neutral,
-        // tier=noise) that no band lists, so a reminder stamped on one would be
-        // unreachable forever — it could never be listed, seen or cancelled, and
-        // firing it would surface nothing. Spam is the sharper case of the two,
-        // because `reminded_at` is the one standing-band arm that carries no tier
-        // test: the stamp is meant to outrank triage's opinion, and the only
-        // thing still keeping the row out of the band would be the spam
-        // predicate. No row, no `true`, and the handler 404s.
+        // Human reminders apply to restricted mail too. Sent mail and provider
+        // spam have separate inventories, so they remain outside this schedule.
+        // A new reminder replaces the previous pending or fired occurrence.
         let stamped = tx.execute(
             "UPDATE triage
              SET remind_at = ?1, reminded_at = NULL
-             WHERE account_id = ?2 AND message_id = ?3 AND sensitivity != 'sealed'
+             WHERE account_id = ?2 AND message_id = ?3
                AND EXISTS(SELECT 1 FROM messages mm
                           WHERE mm.account_id = ?2 AND mm.id = ?3
                             AND mm.is_sent = 0 AND mm.is_spam = 0)",
@@ -636,7 +623,7 @@ impl SqliteStore {
         tx.execute(
             "UPDATE triage
              SET status = 'done', resolved_at = ?1, reminded_at = NULL
-             WHERE account_id = ?2 AND sensitivity != 'sealed'
+             WHERE account_id = ?2
                AND (message_id = ?3 OR message_id IN (
                    SELECT sib.id FROM messages me
                    JOIN messages sib ON sib.account_id = me.account_id
@@ -655,14 +642,13 @@ impl SqliteStore {
     /// the thread (the user may well have meant to resolve it) and it does not
     /// touch `reminded_at` (clearing a pending reminder says nothing about one
     /// that already came due). Idempotent — a row with no reminder is a
-    /// successful no-op, so only missing/sealed returns `false`.
+    /// successful no-op, so only a missing row returns `false`.
     pub(super) fn clear_reminder(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
         let conn = self.lock()?;
-        // SECURITY: sealed rows excluded in SQL.
         let n = conn.execute(
             "UPDATE triage
              SET remind_at = NULL
-             WHERE account_id = ?1 AND message_id = ?2 AND sensitivity != 'sealed'",
+             WHERE account_id = ?1 AND message_id = ?2",
             params![account_id, message_id],
         )?;
         Ok(n > 0)
@@ -685,9 +671,7 @@ impl SqliteStore {
         now: DateTime<Utc>,
     ) -> Result<Vec<i64>> {
         let conn = self.lock()?;
-        // SECURITY: sealed rows excluded in SQL. A sealed row cannot carry a
-        // reminder in the first place (`set_reminder` refuses it), and the guard
-        // is repeated here anyway because "cannot happen" is not a gate.
+        // An explicit reminder is sufficient authority to resurface human mail.
         let mut stmt = conn.prepare(
             "UPDATE triage
              SET status = 'open',
@@ -697,7 +681,7 @@ impl SqliteStore {
              WHERE account_id = ?1
                AND remind_at IS NOT NULL
                AND remind_at <= ?2
-               AND sensitivity != 'sealed'
+
              RETURNING message_id",
         )?;
         let out = stmt
@@ -715,12 +699,12 @@ impl SqliteStore {
         }
         let conn = self.lock()?;
         // Already-done rows are left alone so their original resolved_at — and
-        // whatever resolved them — survives. Sealed excluded, as everywhere.
+        // whatever resolved them — survives. This is an explicit human sweep.
         let n = conn.execute(
             "UPDATE triage
              SET status = 'done', resolved_at = ?1
              WHERE account_id = ?2
-               AND sensitivity != 'sealed'
+
                AND status != 'done'
                AND message_id IN (
                    SELECT m.id FROM messages m
@@ -756,7 +740,7 @@ impl SqliteStore {
             let mut stmt = conn.prepare(
                 "SELECT t.tier, COUNT(*) FROM triage t
                  JOIN messages m ON m.id = t.message_id
-                 WHERE t.account_id=?1 AND t.sensitivity != 'sealed'
+                 WHERE t.account_id=?1
                    AND m.is_sent = 0 AND m.is_spam = 0
                  GROUP BY t.tier",
             )?;
@@ -771,7 +755,11 @@ impl SqliteStore {
         let total: i64 = tier_counts.values().sum();
 
         let sealed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM triage WHERE account_id=?1 AND sensitivity='sealed'",
+            "SELECT COUNT(*) FROM agent_message_state a
+             JOIN agent_message_decisions d ON d.account_id=a.account_id AND d.message_id=a.message_id AND d.revision=a.revision
+             WHERE a.account_id=?1 AND a.access='restricted'
+               AND EXISTS(SELECT 1 FROM json_each(d.decision_json,'$.auth.kinds')
+                 WHERE value IN ('otp','password_reset','sign_in_link','verification'))",
             params![account_id],
             |r| r.get(0),
         )?;
@@ -787,13 +775,13 @@ impl SqliteStore {
             .optional()?;
         let spam_synced_at = spam_synced_at.as_deref().and_then(|s| parse_dt(s).ok());
 
-        // THE SPAM PAGE'S DOOR NUMBER. Counted the same way the page lists —
-        // non-sealed, and served by `idx_messages_spam` — so the chip and the
+        // THE SPAM PAGE'S DOOR NUMBER. Counted the same way the human page lists,
+        // served by `idx_messages_spam` — so the chip and the
         // page it opens cannot disagree.
         let spam: i64 = conn.query_row(
             "SELECT COUNT(*) FROM messages m
              JOIN triage t ON t.message_id = m.id
-             WHERE m.account_id=?1 AND m.is_spam = 1 AND t.sensitivity != 'sealed'",
+             WHERE m.account_id=?1 AND m.is_spam = 1",
             params![account_id],
             |r| r.get(0),
         )?;
@@ -828,7 +816,7 @@ impl SqliteStore {
                               ({STANDING_BAND}) AS standing
                        FROM triage t
                        JOIN messages m ON m.id = t.message_id
-                       WHERE t.account_id = ?1 AND t.sensitivity != 'sealed'
+                       WHERE t.account_id = ?1
                          AND m.is_sent = 0
                          AND m.is_spam = 0
                          AND {WITHIN_WINDOW}) t"
@@ -839,7 +827,7 @@ impl SqliteStore {
 
         let last_surfaced_at = conn.query_row(
             "SELECT MAX(surfaced_at) FROM triage
-             WHERE account_id = ?1 AND sensitivity != 'sealed'",
+             WHERE account_id = ?1",
             params![account_id],
             |r| dt_opt(r, 0),
         )?;
@@ -881,14 +869,18 @@ impl SqliteStore {
             "SELECT substr(m.received_at, 1, 10) AS day,
                     COALESCE(SUM(m.is_sent = 0), 0),
                     COALESCE(SUM(m.is_sent = 1), 0),
-                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity = 'sealed'), 0),
-                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                    COALESCE(SUM(m.is_sent = 0 AND EXISTS(SELECT 1 FROM agent_message_state a
+                      JOIN agent_message_decisions d ON d.account_id=a.account_id AND d.message_id=a.message_id AND d.revision=a.revision
+                      WHERE a.account_id=m.account_id AND a.message_id=m.id AND a.access='restricted'
+                        AND EXISTS(SELECT 1 FROM json_each(d.decision_json,'$.auth.kinds')
+                          WHERE value IN ('otp','password_reset','sign_in_link','verification')))), 0),
+                    COALESCE(SUM(m.is_sent = 0
                                  AND t.tier = 'past_due'), 0),
-                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                    COALESCE(SUM(m.is_sent = 0
                                  AND t.tier = 'deadline'), 0),
-                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                    COALESCE(SUM(m.is_sent = 0
                                  AND t.tier = 'signal'), 0),
-                    COALESCE(SUM(m.is_sent = 0 AND t.sensitivity != 'sealed'
+                    COALESCE(SUM(m.is_sent = 0
                                  AND t.tier = 'noise'), 0)
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id

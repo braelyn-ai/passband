@@ -29,17 +29,21 @@ impl SqliteStore {
         limit: u32,
     ) -> Result<Vec<ShredCandidate>> {
         let conn = self.lock()?;
-        // Sealed rows older than the cutoff and not already shredded. OLDEST
+        // Currently assessed actionable auth older than cutoff, not yet shredded. OLDEST
         // FIRST so a capped pass makes monotonic progress across runs, and
         // `gmail_msg_id <> ''` because an unaddressable row cannot be trashed.
         let mut stmt = conn.prepare(
-            "SELECT m.id, m.gmail_msg_id, m.from_addr, t.sealed_kind, m.received_at
+            "SELECT m.id, m.gmail_msg_id, m.from_addr, (SELECT value FROM json_each(d.decision_json,'$.auth.kinds') WHERE value IN ('otp','password_reset','sign_in_link','verification') LIMIT 1), m.received_at
              FROM messages m
-             JOIN triage t ON t.message_id = m.id
+             JOIN agent_message_state a ON a.message_id=m.id AND a.account_id=m.account_id
+             JOIN agent_message_decisions d ON d.message_id=m.id AND d.account_id=m.account_id
+               AND d.revision=a.revision
              LEFT JOIN shred_log s
                ON s.message_id = m.id AND s.account_id = m.account_id
              WHERE m.account_id = ?1
-               AND t.sensitivity = 'sealed'
+               AND a.access='restricted'
+               AND EXISTS(SELECT 1 FROM json_each(d.decision_json,'$.auth.kinds')
+                 WHERE value IN ('otp','password_reset','sign_in_link','verification'))
                AND m.received_at <= ?2
                AND m.gmail_msg_id IS NOT NULL AND m.gmail_msg_id <> ''
                AND s.id IS NULL
@@ -69,11 +73,15 @@ impl SqliteStore {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*)
              FROM messages m
-             JOIN triage t ON t.message_id = m.id
+             JOIN agent_message_state a ON a.message_id=m.id AND a.account_id=m.account_id
+             JOIN agent_message_decisions d ON d.message_id=m.id AND d.account_id=m.account_id
+               AND d.revision=a.revision
              LEFT JOIN shred_log s
                ON s.message_id = m.id AND s.account_id = m.account_id
              WHERE m.account_id = ?1
-               AND t.sensitivity = 'sealed'
+               AND a.access='restricted'
+               AND EXISTS(SELECT 1 FROM json_each(d.decision_json,'$.auth.kinds')
+                 WHERE value IN ('otp','password_reset','sign_in_link','verification'))
                AND m.received_at <= ?2
                AND m.gmail_msg_id IS NOT NULL AND m.gmail_msg_id <> ''
                AND s.id IS NULL",

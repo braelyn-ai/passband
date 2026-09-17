@@ -108,7 +108,7 @@ fn unsub_violation_ignores_resolved_and_sent_and_is_case_insensitive() {
 }
 
 #[test]
-fn message_unsub_fields_reads_stored_headers_and_hides_sealed() {
+fn human_unsubscribe_reads_headers_including_restricted_mail() {
     let (store, acct) = store();
 
     // Normal message carrying unsubscribe headers.
@@ -125,13 +125,13 @@ fn message_unsub_fields_reads_stored_headers_and_hides_sealed() {
     assert_eq!(f.list_unsubscribe.as_deref(), Some("<https://sub.com/u/1>"));
     assert!(f.list_unsub_one_click);
 
-    // Sealed message => None (indistinguishable from unknown).
+    // Restricted mail remains available for human actions.
     let sid = triaged(acct, "g2", "t2")
         .list_unsubscribe("<https://sub.com/u/2>", false)
         .importance(90)
         .sealed(crate::types::SealedKind::Otp)
         .seed(&store);
-    assert!(store.message_unsub_fields(acct, sid).unwrap().is_none());
+    assert!(store.message_unsub_fields(acct, sid).unwrap().is_some());
 
     // Unknown id => None.
     assert!(store.message_unsub_fields(acct, 999_999).unwrap().is_none());

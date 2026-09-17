@@ -75,3 +75,12 @@ struct ThreadArrivals: Equatable, Sendable {
         return Admission(refetch: true, announce: announced.insert(message).inserted)
     }
 }
+
+/// Opened stamps describe a message at the reader's focus, not a selected id
+/// that may still be offscreen while layout or an arrival refresh settles.
+enum MessageReadVisibility {
+    static func isFocused(minY: Double, maxY: Double, viewportHeight: Double) -> Bool {
+        let focus = min(24, viewportHeight / 2)
+        return viewportHeight > 0 && minY <= focus && maxY > focus
+    }
+}

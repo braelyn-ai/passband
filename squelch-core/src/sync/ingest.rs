@@ -1,19 +1,12 @@
 //! The ingest pipeline: raw RFC822 bytes -> parsed -> flattened text ->
-//! seal-first triage -> a [`TriagedMessage`] ready for an atomic store write.
+//! pending evidence -> a [`TriagedMessage`] ready for an atomic store write.
 //!
-//! ORDERING IS A SECURITY INVARIANT: parse/flatten, then seal detection FIRST
-//! (sealed mail is `sensitivity='sealed'`, importance 0, and never runs Stage-1 or
-//! reaches any LLM), and only then, for non-sealed mail, contacts/rules -> Stage-1.
-//! Network-free by design so it is testable against fixture bytes.
+//! Parsing is network-free. Model-owned triage and external access assessment
+//! happen after durable storage; no content heuristics run here.
 
 use crate::config::Stage1Config;
 use crate::store::{SqliteStore, Store, TriagedMessage};
 use crate::sync::html::sanitize_email_html;
-use crate::triage::calendar;
-use crate::triage::receipt;
-use crate::triage::seal::{self, SealInput};
-use crate::triage::shipment;
-use crate::triage::stage1_with_config;
 use crate::triage::text as text_util;
 use crate::types::{AccountId, AttachmentInfo, FieldReasons, NewMessage, Sensitivity, Tier};
 use chrono::{DateTime, Utc};
@@ -851,8 +844,7 @@ const MESSAGE_ATTACHMENT_TOTAL_CAP_BYTES: usize = 25 * 1024 * 1024;
 /// [`normalize_content_id`]) because it is the ONLY link back from a
 /// `<img src="cid:...">` the sanitizer kept in the body to the bytes that fill it.
 ///
-/// This runs for BOTH sealed and non-sealed mail — storage is fine either way;
-/// the byte-serving endpoint is what guards sealed parents.
+/// Attachments belong to the human message regardless of external-agent access.
 pub fn extract_attachments(m: &mail_parser::Message) -> Vec<AttachmentInfo> {
     let mut out = Vec::new();
     let mut stored_total: usize = 0;
@@ -923,9 +915,9 @@ fn normalize_content_id(raw: Option<&str>) -> Option<String> {
 /// short-circuits before this is ever invoked.
 pub fn ingest(
     fetched: &RawFetched,
-    cfg: &Stage1Config,
+    _cfg: &Stage1Config,
     now: DateTime<Utc>,
-    mut known_contact_lookup: impl FnMut(&str) -> bool,
+    _known_contact_lookup: impl FnMut(&str) -> bool,
 ) -> TriagedMessage {
     let parsed = MessageParser::default().parse(&fetched.raw);
 
@@ -1107,8 +1099,7 @@ pub fn ingest(
     let thread_id = thread_id.unwrap_or_else(|| gmail_msg_id.clone());
 
     // Attachments (real + cid-inline), capped. Extracted once here and moved into
-    // whichever TriagedMessage return path fires. Present for sealed mail too —
-    // storage is fine; the byte-serving endpoint guards sealed parents.
+    // the parsed message carries. External-agent access is assessed later.
     let attachments = parsed.as_ref().map(extract_attachments).unwrap_or_default();
 
     // A compact snippet for list views; body text drives triage.
@@ -1154,239 +1145,45 @@ pub fn ingest(
         auth_pass,
     };
 
-    // ---- SEAL DETECTION FIRST (security invariant) ----------------------
-    let seal_kind = seal::detect_sealed(&SealInput {
-        from_addr: &from_addr,
-        subject: &subject,
-        body: &text,
-    });
-    if let Some(kind) = seal_kind {
-        // Sealed: importance 0, no Stage-1, no deadline, never confident enough
-        // to matter — it will never be surfaced or sent to an LLM.
-        return TriagedMessage {
-            message,
-            recipients,
-            recipient_addrs,
-            sensitivity: Sensitivity::Sealed,
-            sealed_kind: Some(kind),
-            importance: 0,
-            tier: Tier::Noise,
-            one_line: String::new(),
-            reason: format!("sealed at ingest ({})", kind.as_str()),
-            field_reasons: FieldReasons::default(),
-            matched_rule: None,
-            deadline: None,
-            shipment: None,
-            ship_extract: false,
-            receipt: None,
-            calendar: None,
-            attachments,
-            confident: true,
-            // NEVER set here: only the sync engine knows which sync path this
-            // ingest is on, and that is the whole eligibility decision. See
-            // `TriagedMessage::notify_eligible_at`.
-            notify_eligible_at: None,
-        };
-    }
-
-    // ---- Sent mail: seed contacts, but DO NOT run Stage-1 triage ----------
-    // The user's own outbox must never pollute the ranked inbox. We write a
-    // neutral tier=noise/importance=0 row (belt: ranked_updates/search also
-    // exclude is_sent=1) and skip the LLM path entirely. Recipients still seed
-    // the contacts table via `ingest_message`, and ride along on the row itself
-    // as `to_addrs` for the human door's sent listing.
-    if fetched.is_sent {
-        return TriagedMessage {
-            message,
-            recipients,
-            recipient_addrs,
-            sensitivity: Sensitivity::Normal,
-            sealed_kind: None,
-            importance: 0,
-            tier: Tier::Noise,
-            one_line: String::new(),
-            reason: "sent mail (contacts seeded; not triaged)".to_string(),
-            field_reasons: FieldReasons::default(),
-            matched_rule: None,
-            deadline: None,
-            shipment: None,
-            ship_extract: false,
-            receipt: None,
-            calendar: None,
-            attachments,
-            confident: true,
-            // NEVER set here: only the sync engine knows which sync path this
-            // ingest is on, and that is the whole eligibility decision. See
-            // `TriagedMessage::notify_eligible_at`.
-            notify_eligible_at: None,
-        };
-    }
-
-    // ---- Provider spam: store it, show it on request, NEVER triage it -------
-    // Gmail already made this call, and re-litigating it would be the single
-    // most expensive thing this daemon does: spam is the bulk of what arrives
-    // and every row of it would buy a frontier model call to reach the answer
-    // the provider handed us for free.
-    //
-    // It is also the one branch where the body is presumed hostile. Spam is
-    // attacker-authored text selected for its ability to talk a reader into
-    // things, and a Stage-1 prompt is a reader. Not calling the model is a
-    // security property here, not only a cost one — which is why this sits with
-    // the sealed and sent branches rather than behind a config flag.
-    //
-    // AFTER the seal check, deliberately: an OTP that Gmail misfiled stays
-    // sealed, and sealed outranks everything (a sealed row is absent from the
-    // spam page too, which is correct — nothing should page through auth codes).
-    if fetched.is_spam {
-        return TriagedMessage {
-            message,
-            recipients,
-            recipient_addrs,
-            sensitivity: Sensitivity::Normal,
-            sealed_kind: None,
-            importance: 0,
-            tier: Tier::Noise,
-            one_line: String::new(),
-            reason: "spam (sorted by the mail provider; not triaged)".to_string(),
-            field_reasons: FieldReasons::default(),
-            matched_rule: None,
-            deadline: None,
-            // See the sealed arm above: the engine, not ingest, stamps this, and
-            // a spam row is refused at every emission site regardless.
-            notify_eligible_at: None,
-            shipment: None,
-            ship_extract: false,
-            receipt: None,
-            calendar: None,
-            attachments,
-            confident: true,
-        };
-    }
-
-    // ---- Non-sealed: derive known-contact, load rules already provided --
-    let is_known = known_contact_lookup(&from_addr);
-    // Sender rules are matched inside stage1; the caller supplies them via cfg's
-    // sibling argument. We accept them through the wrapper below.
-    let result = stage1_with_config(&message, is_known, &[], cfg, now);
-
-    // SHIPMENT DETECTION runs INDEPENDENTLY of the triage tier: a "your order
-    // shipped" email is noise-tier for the ranked inbox but still feeds the
-    // package tracker. Only ever runs here, on the NON-SEALED path — a sealed OTP
-    // short-circuited above and never reaches this line.
-    let shipment = shipment::detect_shipment(&from_addr, &subject, &text);
-
-    // SHIPMENTS-EXTRACTOR TRIGGER, next to detection and on the SAME non-sealed,
-    // non-sent path: the LOOSE signal (no tracking number required) that stamps
-    // `triage.ship_extract_model='pending'` so the shipments specialist picks the
-    // row up. Wider than `detect_shipment` on purpose — an order confirmation
-    // with no number is exactly the mail the regex cannot handle and the model
-    // can. Sealed mail short-circuited above, so this never sees sealed content.
-    let ship_extract = shipment::has_loose_shipping_signal(&from_addr, &subject, &text);
-
-    // RECEIPT DETECTION runs INDEPENDENTLY of the triage tier AND of shipment
-    // detection: a receipt (record of money already paid) is noise-tier for the
-    // ranked inbox but feeds the Receipts category, and an order-confirmation with
-    // a total AND tracking is BOTH a receipt and a shipment. Only ever runs here,
-    // on the NON-SEALED path — a sealed OTP short-circuited above and never reaches
-    // this line, so a receipt can never carry sealed data. When a receipt is
-    // present, the store's ingest write force-resolves this message's triage row
-    // (status='done') so it never surfaces as inbox clutter.
-    let receipt = receipt::detect_receipt(&from_addr, &subject, &text);
-
-    // CALENDAR DETECTION runs INDEPENDENTLY of the triage tier, exactly like
-    // receipts: an invite/cancellation/RSVP is a record of scheduling state
-    // that feeds the Calendar category (and is auto-resolved to 'done' by the
-    // store's ingest write). Only ever runs here, on the NON-SEALED path — a
-    // sealed OTP short-circuited above and never reaches this line, so a
-    // calendar update can never carry sealed data.
-    let calendar = calendar::detect_calendar(
-        &from_addr,
-        message.from_name.as_deref(),
-        &subject,
-        &text,
-        received_at,
-    );
-
+    // Ingest records evidence. Only the triage agent assigns meaning, placement,
+    // or external access. Legacy fields stay neutral until the new decision commits.
     TriagedMessage {
         message,
         recipients,
         recipient_addrs,
+        attachments,
         sensitivity: Sensitivity::Normal,
         sealed_kind: None,
-        importance: result.importance,
-        tier: result.tier,
-        one_line: result.one_line,
-        reason: result.reason,
-        field_reasons: result.field_reasons,
-        matched_rule: result.matched_rule,
-        deadline: result.deadline,
-        shipment,
-        ship_extract,
-        receipt,
-        calendar,
-        attachments,
-        confident: result.confident,
-        // See the sealed arm above: the engine, not ingest, stamps this.
+        importance: 0,
+        tier: Tier::Noise,
+        one_line: String::new(),
+        reason: "pending agent triage".to_string(),
+        field_reasons: FieldReasons::default(),
+        matched_rule: None,
+        deadline: None,
+        shipment: None,
+        ship_extract: false,
+        receipt: None,
+        calendar: None,
+        confident: false,
         notify_eligible_at: None,
     }
 }
 
-/// Full ingest with sender rules. Kept separate so the common test path
-/// ([`ingest`]) needs no rules argument, while the sync engine passes the
-/// account's rule list.
+/// Compatibility entry point for callers that already load sender preferences.
+/// Preferences are supplied to the agent later; they never classify at ingest.
 pub fn ingest_with_rules(
     fetched: &RawFetched,
     cfg: &Stage1Config,
     now: DateTime<Utc>,
-    rules: &[crate::types::SenderRule],
+    _rules: &[crate::types::SenderRule],
     known_contact_lookup: impl FnMut(&str) -> bool,
 ) -> TriagedMessage {
-    // Reuse the seal-first path from `ingest`, then, if it came back normal,
-    // re-run Stage-1 WITH rules. This keeps the seal invariant in exactly one
-    // place while still honoring user rules.
-    let mut triaged = ingest(fetched, cfg, now, known_contact_lookup);
-    // Sealed, Sent and provider-spam mail never run Stage-1 (the latter two land
-    // neutral tier-noise), so they must not run the rules re-pass either. For
-    // spam that matters beyond tidiness: a `Filtered` rule's re-pass is what sets
-    // `needs_stage2`, and a spam row must never enter an LLM queue.
-    if triaged.sensitivity == Sensitivity::Sealed
-        || fetched.is_sent
-        || fetched.is_spam
-        || rules.is_empty()
-    {
-        return triaged;
-    }
-    let is_known = triaged.matched_rule.is_none() && triaged.reason.contains("known contact");
-    let result = stage1_with_config(&triaged.message, is_known, rules, cfg, now);
-    triaged.importance = result.importance;
-    triaged.tier = result.tier;
-    triaged.one_line = result.one_line;
-    triaged.reason = result.reason;
-    triaged.field_reasons = result.field_reasons;
-    triaged.matched_rule = result.matched_rule;
-    triaged.deadline = result.deadline;
-    triaged.confident = result.confident;
-    triaged
+    ingest(fetched, cfg, now, known_contact_lookup)
 }
 
-/// Ingest ONE message the account just sent, from its raw RFC822 bytes.
-///
-/// Pure bytes-in: the caller (squelch-api's send path, which alone holds write
-/// credentials) does the Gmail fetch and hands the decoded bytes over, so core
-/// stays Gmail-WRITE-free. Runs the same seal-first pipeline as the sync engine
-/// with `is_sent: true`, so no LLM is ever called and the row lands neutral
-/// (tier=noise, importance=0); the attention/search queries filter `is_sent=0`,
-/// so an echoed message creates no attention noise. Idempotent: the store's
-/// `UNIQUE(account_id, gmail_msg_id)` upsert makes a re-ingest of the same Gmail
-/// id a no-op update, returning the existing local id.
-///
-/// A SEALED OUTBOUND COPY IS NOT WRITTEN: `Ok(None)`, nothing committed. Seal
-/// detection runs BEFORE the `is_sent` branch (that ordering is the security
-/// invariant), so a reply quoting an OTP trips it. Committing that row would put a
-/// sealed message in the thread, and `thread_guard_and_subject` 404s any thread
-/// holding one, so echoing the reply would HIDE the counterparty's mail the user
-/// was reading a second ago. Skipping degrades to "your reply appears on the next
-/// backfill", which is exactly the pre-echo status quo.
+/// Store the account's sent message as evidence and queue access assessment.
+/// Sent copies never create arrival notifications or their own FYE cards.
 #[allow(clippy::too_many_arguments)] // the parts of one Gmail fetch, nothing more
 pub fn ingest_sent(
     store: &SqliteStore,
@@ -1409,12 +1206,8 @@ pub fn ingest_sent(
         is_spam: false,
         account_addr: account_addr.to_string(),
     };
-    // Both arguments are unreachable on the sent path: Stage-1 (which cfg tunes)
-    // and the contact lookup only run for non-sealed RECEIVED mail.
+    // Compatibility arguments do not classify mail; the durable agent owns it.
     let triaged = ingest(&fetched, &Stage1Config::default(), now, |_| false);
-    if triaged.sensitivity == Sensitivity::Sealed {
-        return Ok(None);
-    }
     store.ingest_message(&triaged).map(Some)
 }
 
@@ -1458,42 +1251,6 @@ mod tests {
     }
 
     #[test]
-    fn sealed_otp_lands_sealed_with_importance_zero() {
-        let eml = "From: Bank <noreply@bank.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Your verification code\r\n\
-                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Your one-time passcode is 483920. Enter this code to continue.\r\n";
-        let f = raw(1, "g-otp", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(t.sealed_kind.is_some());
-        assert_eq!(t.importance, 0);
-        assert!(t.deadline.is_none());
-    }
-
-    #[test]
-    fn dated_bill_lands_deadline_tier() {
-        let eml = "From: Acme <invoices@acme.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Invoice #4402 from Acme\r\n\
-                   Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Your invoice total is $1,299.00. Payment due by August 15, 2026.\r\n";
-        let f = raw(1, "g-bill", eml, false);
-        let now = DateTime::parse_from_rfc3339("2026-07-07T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let t = ingest(&f, &Stage1Config::default(), now, |_| false);
-        assert_eq!(t.sensitivity, Sensitivity::Normal);
-        assert_eq!(t.tier, Tier::Deadline);
-        let d = t.deadline.expect("deadline extracted");
-        assert_eq!(d.amount, Some(1299.00));
-        assert!(!d.past_due);
-    }
-
-    #[test]
     fn ebay_return_refund_is_not_a_past_due_bill() {
         // The real inbox case (today = 2026-07-09): an eBay RETURN REFUND arriving
         // "by July 13th" was mis-triaged as a past-due bill "104 weeks after due
@@ -1512,54 +1269,6 @@ mod tests {
         assert_ne!(t.tier, Tier::PastDue, "refund must not be past-due");
         assert_ne!(t.tier, Tier::Deadline, "refund must not be a deadline");
         assert!(t.deadline.is_none(), "no deadline row for a refund");
-    }
-
-    #[test]
-    fn yearless_genuine_bill_resolves_to_receipt_year_future() {
-        // A genuine bill "due July 13" (no year) received 2026-07-09 resolves to
-        // 2026-07-13 (this year, future) => Deadline tier, NOT past_due.
-        let eml = "From: Acme <billing@acme.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Invoice #900\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Amount due $50.00. Payment due July 13th.\r\n";
-        let f = raw(1, "g-yearless", eml, false);
-        let now = DateTime::parse_from_rfc3339("2026-07-09T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let t = ingest(&f, &Stage1Config::default(), now, |_| true);
-        assert_eq!(t.tier, Tier::Deadline);
-        let d = t.deadline.expect("deadline extracted");
-        assert!(!d.past_due, "future year-less date is not past-due");
-        assert_eq!(
-            d.due_at,
-            DateTime::parse_from_rfc3339("2026-07-13T23:59:59Z")
-                .unwrap()
-                .with_timezone(&Utc)
-        );
-    }
-
-    #[test]
-    fn yearless_recently_passed_bill_is_past_due_by_days() {
-        // "due July 1" received 2026-07-09 => 2026-07-01 (past by days, within the
-        // 14-day grace) => PastDue, legitimately, not "weeks/years" late.
-        let eml = "From: Acme <billing@acme.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Invoice #901\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Amount due $50.00. Payment due July 1.\r\n";
-        let f = raw(1, "g-recent", eml, false);
-        let now = DateTime::parse_from_rfc3339("2026-07-09T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let t = ingest(&f, &Stage1Config::default(), now, |_| true);
-        let d = t.deadline.expect("deadline extracted");
-        assert!(d.past_due);
-        // Due date is 2026-07-01, ~8 days before receipt — days, not weeks.
-        let days = (now - d.due_at).num_days();
-        assert!((7..=9).contains(&days), "past by days, got {days}");
     }
 
     #[test]
@@ -1619,9 +1328,10 @@ mod tests {
             t.message.body
         );
 
-        let c = t.calendar.expect("reservation detected end-to-end");
-        assert_eq!(c.kind, crate::triage::CalendarKind::Reservation);
-        assert_eq!(c.event_title.as_deref(), Some("EPIC Steak"));
+        assert!(
+            t.calendar.is_none(),
+            "parsing does not classify reservations"
+        );
     }
 
     #[test]
@@ -1784,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn known_contact_lookup_is_consulted_for_normal_mail() {
+    fn ingest_does_not_turn_contact_history_into_a_verdict() {
         let eml = "From: Alice <alice@friends.com>\r\n\
                    Subject: dinner plans\r\n\
                    Date: Mon, 7 Jul 2026 10:00:00 +0000\r\n\
@@ -1796,8 +1506,8 @@ mod tests {
             asked.push(addr.to_string());
             true
         });
-        assert_eq!(t.tier, Tier::Signal);
-        assert!(asked.iter().any(|a| a == "alice@friends.com"));
+        assert_eq!(t.reason, "pending agent triage");
+        assert!(asked.is_empty(), "contact context belongs to the agent");
     }
 
     #[test]
@@ -2010,55 +1720,6 @@ mod tests {
     }
 
     #[test]
-    fn shipping_email_produces_a_shipment() {
-        let eml = "From: UPS <ship-confirm@ups.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Your order of Wireless Headphones has shipped\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Your UPS package is on its way. Tracking number 1Z999AA10123456784.\r\n";
-        let f = raw(1, "g-ship", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        let s = t.shipment.expect("shipment detected");
-        assert_eq!(s.carrier, "ups");
-        assert_eq!(s.tracking_number, "1Z999AA10123456784");
-        assert_eq!(s.item_name, "Wireless Headphones");
-        // Shipping mail is noise-tier for the ranked inbox.
-        assert_eq!(t.tier, Tier::Noise);
-    }
-
-    #[test]
-    fn bay_wheels_receipt_produces_a_receipt_row_with_amount() {
-        // The live bug: a Bay Wheels ride receipt landed in Newsletters. It must
-        // now classify as a receipt (with its total) and drop from inbox clutter.
-        let eml = "From: Bay Wheels <no-reply@baywheels.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Your Bay Wheels ride receipt\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Thanks for riding! Receipt for your ride. Total: $3.49.\r\n";
-        let f = raw(1, "g-baywheels", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        let r = t.receipt.expect("receipt detected");
-        assert_eq!(r.amount, Some(3.49));
-        // Receipts are noise-tier for the ranked inbox.
-        assert_eq!(t.tier, Tier::Noise);
-    }
-
-    #[test]
-    fn order_confirmation_receipt_extracts_total() {
-        let eml = "From: Shop <orders@shop.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Order confirmation #12345\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Thank you for your order. Order total $3.49.\r\n";
-        let f = raw(1, "g-order", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.receipt.expect("receipt").amount, Some(3.49));
-    }
-
-    #[test]
     fn refund_is_not_a_receipt_at_ingest() {
         let eml = "From: eBay <ebay@ebay.com>\r\n\
                    To: me@example.com\r\n\
@@ -2069,43 +1730,6 @@ mod tests {
         let f = raw(1, "g-refund", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
         assert!(t.receipt.is_none(), "a refund must not be a receipt");
-    }
-
-    #[test]
-    fn sealed_otp_never_produces_a_receipt() {
-        // A sealed OTP short-circuits before receipt detection ever runs.
-        let eml = "From: Bank <noreply@bank.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Your verification code\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Your one-time passcode is 483920. Thank you for your payment.\r\n";
-        let f = raw(1, "g-otp-rcpt", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(
-            t.receipt.is_none(),
-            "sealed mail must never yield a receipt"
-        );
-    }
-
-    #[test]
-    fn google_invite_produces_a_calendar_update_at_ingest() {
-        // A Google Calendar invite: classified as a calendar update (with title
-        // + start extracted) so the ingest write auto-resolves it out of the
-        // attention bands and into the Calendar category.
-        let eml = "From: Sam Doe <sam@gmail.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Invitation: Design review @ Wed Jul 22, 2026 10am - 11am (PDT) (me@example.com)\r\n\
-                   Date: Mon, 20 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Sam Doe has invited you. View on Google Calendar.\r\n";
-        let f = raw(1, "g-cal-inv", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        let c = t.calendar.expect("calendar update detected");
-        assert_eq!(c.kind, crate::triage::CalendarKind::Invite);
-        assert_eq!(c.event_title.as_deref(), Some("Design review"));
-        assert!(c.starts_at.is_some());
     }
 
     #[test]
@@ -2121,43 +1745,6 @@ mod tests {
         assert!(
             t.calendar.is_none(),
             "topical calendar prose must not classify"
-        );
-    }
-
-    #[test]
-    fn sealed_otp_never_produces_a_calendar_update() {
-        // A sealed OTP short-circuits before calendar detection ever runs, even
-        // with an invitation-shaped subject.
-        let eml = "From: Bank <noreply@bank.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Your verification code\r\n\
-                   Date: Mon, 20 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Your one-time passcode is 483920. Invitation: security review @ Wed Jul 22, 2026 10am.\r\n";
-        let f = raw(1, "g-otp-cal", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(
-            t.calendar.is_none(),
-            "sealed mail must never yield a calendar update"
-        );
-    }
-
-    #[test]
-    fn sealed_otp_never_produces_a_shipment() {
-        // A sealed OTP short-circuits before shipment detection ever runs.
-        let eml = "From: Bank <noreply@bank.com>\r\n\
-                   To: me@example.com\r\n\
-                   Subject: Your verification code\r\n\
-                   Date: Wed, 9 Jul 2026 10:00:00 +0000\r\n\
-                   \r\n\
-                   Your one-time passcode is 483920123456. Enter this code to continue.\r\n";
-        let f = raw(1, "g-otp2", eml, false);
-        let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.sensitivity, Sensitivity::Sealed);
-        assert!(
-            t.shipment.is_none(),
-            "sealed mail must never yield a shipment"
         );
     }
 
@@ -2864,7 +2451,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_mail_still_extracts_attachments_for_storage() {
+    fn auth_mail_preserves_attachments_for_internal_and_human_reads() {
         // Attachments are STORED for sealed mail like the body; serving is guarded
         // downstream. So extraction must still happen on the sealed path.
         let eml = "From: Bank <noreply@bank.com>\r\n\
@@ -2882,7 +2469,7 @@ mod tests {
                    --B--\r\n";
         let f = raw(1, "g-sealed-att", eml, false);
         let t = ingest(&f, &Stage1Config::default(), Utc::now(), |_| false);
-        assert_eq!(t.sensitivity, Sensitivity::Sealed);
+        assert_eq!(t.reason, "pending agent triage");
         assert_eq!(
             t.attachments.len(),
             1,
@@ -2974,7 +2561,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_sent_skips_a_sealed_outbound_copy_and_commits_nothing() {
+    fn sent_auth_copy_is_stored_for_humans_and_pending_external_assessment() {
         // A reply quoting an OTP trips seal detection (which runs before the
         // `is_sent` branch, by design). Committing that row would make
         // `thread_guard_and_subject` 404 the thread the user is reading, so nothing
@@ -3033,7 +2620,7 @@ mod tests {
             now,
         )
         .unwrap();
-        assert!(echoed.is_none(), "a sealed outbound copy is not echoed");
+        assert!(echoed.is_some(), "the human can see their own sent mail");
 
         // Nothing committed: no sealed row, and the thread still opens with the
         // parent alone rather than 404ing on a sealed member.
@@ -3041,11 +2628,18 @@ mod tests {
         let view = store.thread_view_with_html(acct, "thread-88").unwrap();
         assert_eq!(
             view.messages.len(),
-            1,
-            "only the parent; the echo was skipped"
+            2,
+            "the human can read both parent and sent reply"
         );
         // Contacts are not seeded either — the whole write was skipped.
-        assert!(!store.is_known_contact(acct, "support@bank.com").unwrap());
+        assert!(
+            !crate::store::agent_triage::AgentTriageStore::agent_access_allowed(
+                &store,
+                acct,
+                echoed.unwrap()
+            )
+            .unwrap()
+        );
     }
 
     #[test]

@@ -1299,3 +1299,116 @@ CREATE TABLE IF NOT EXISTS group_send_recipients (
     error         TEXT,
     PRIMARY KEY(group_send_id, addr)
 );
+
+-- Agentic triage owns placement and access. Legacy triage only supplies explicit
+-- user lifecycle state during the transition; its semantic verdict is ignored.
+CREATE TABLE IF NOT EXISTS agent_message_state (
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    content_snapshot TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    access TEXT NOT NULL DEFAULT 'pending' CHECK(access IN ('pending','allowed','restricted')),
+    PRIMARY KEY(account_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS agent_triage_jobs (
+    id INTEGER PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('triage','notification','deliberate_notification','access')),
+    trigger TEXT NOT NULL,
+    input_revision INTEGER NOT NULL,
+    arrival_eligible INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'queued' CHECK(state IN ('queued','leased','completed','failed')),
+    available_at TEXT NOT NULL,
+    lease_token TEXT,
+    lease_until TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    UNIQUE(account_id, message_id, kind, input_revision, trigger)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_claim ON agent_triage_jobs(kind,state,available_at);
+-- Tenant queue scans and active per-thread lease exclusion must not inspect all
+-- completed historical jobs on each idle worker poll.
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_account_ready ON agent_triage_jobs(account_id,state,kind,available_at);
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_active_message ON agent_triage_jobs(account_id,message_id,kind,lease_until) WHERE state='leased';
+CREATE TABLE IF NOT EXISTS agent_message_decisions (
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    decision_json TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,message_id)
+);
+CREATE TABLE IF NOT EXISTS agent_message_destinations (
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    destination TEXT NOT NULL CHECK(destination IN ('reading','records')),
+    PRIMARY KEY(account_id,message_id,destination)
+);
+CREATE TABLE IF NOT EXISTS agent_thread_attention (
+    decision_message_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    show_in_fye INTEGER NOT NULL,
+    attention_json TEXT NOT NULL,
+    relevant_activity TEXT NOT NULL,
+    unresolved_since TEXT,
+    PRIMARY KEY(account_id,thread_id)
+);
+CREATE TABLE IF NOT EXISTS agent_decision_sources (
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    source_revision INTEGER NOT NULL,
+    PRIMARY KEY(account_id,message_id,source_message_id)
+);
+CREATE TABLE IF NOT EXISTS agent_triage_runs (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    completed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_triage_cutover (
+    account_id INTEGER PRIMARY KEY,
+    completed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS agent_triage_corrections (
+    account_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    field TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    source_revision INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,message_id,field)
+);
+
+-- Ownership marker: only agent-created polling rows are deleted on retraction.
+CREATE TABLE IF NOT EXISTS agent_delivery_projections (
+    account_id INTEGER NOT NULL,
+    shipment_id INTEGER NOT NULL,
+    PRIMARY KEY(account_id,shipment_id)
+);
+
+-- Independent model assessments for human notification diagnostics. Multiple
+-- attempts remain inspectable; the notification ledger still records delivery.
+CREATE TABLE IF NOT EXISTS notification_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    lane TEXT NOT NULL,
+    is_auth INTEGER NOT NULL CHECK(is_auth IN (0, 1)),
+    importance INTEGER NOT NULL CHECK(importance BETWEEN 0 AND 100),
+    one_line TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    assessed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notification_assessments_latest
+    ON notification_assessments(account_id, message_id, lane, id DESC);

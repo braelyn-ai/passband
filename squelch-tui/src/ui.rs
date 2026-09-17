@@ -226,7 +226,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn render_detail(f: &mut Frame, view: Option<&squelch_core::types::ThreadView>, scroll: u16) {
+fn render_detail(f: &mut Frame, view: Option<&squelch_core::types::ClientThreadView>, scroll: u16) {
     let area = centered_rect(78, 70, f.area());
     f.render_widget(Clear, area);
 

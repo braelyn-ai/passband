@@ -16,6 +16,7 @@ use squelch_core::types::AccountId;
 pub struct ApiState {
     pub(crate) store: Arc<SqliteStore>,
     pub(crate) account_id: AccountId,
+    pub(crate) triage_config: squelch_core::triage::agent_config::AgentTriageConfig,
     /// The MASTER token from `SQUELCH_API_TOKEN`, checked before any issued
     /// device token and first-class forever: it is the self-host operator's way
     /// in when the store holds no usable credential, including the store whose
@@ -330,6 +331,7 @@ impl ApiState {
         Self {
             store,
             account_id,
+            triage_config: Default::default(),
             master_token: Some(master_token.trim())
                 .filter(|t| !t.is_empty())
                 .map(Arc::from),
@@ -463,6 +465,10 @@ impl ApiState {
     /// The listing policy this door is serving. Public so the process hosting
     /// BOTH doors can hand the agent door the human door's own value instead of
     /// resolving config twice and drifting.
+    pub fn triage_ranking(&self) -> squelch_core::triage::agent_config::RankingConfig {
+        self.triage_config.ranking.clone()
+    }
+
     pub fn shipment_policy(&self) -> squelch_core::config::ShipmentListPolicy {
         self.shipment_policy
     }
@@ -620,6 +626,14 @@ impl ApiState {
 
     /// Set the Stage-2 model + provider labels surfaced on `/client/usage`, so
     /// the usage page shows what model produced the spend.
+    pub fn with_agent_triage(
+        mut self,
+        config: squelch_core::triage::agent_config::AgentTriageConfig,
+    ) -> Self {
+        self.triage_config = config;
+        self
+    }
+
     pub fn with_stage2_model(mut self, model: impl Into<String>, provider: Option<String>) -> Self {
         self.stage2_model = Arc::from(model.into().as_str());
         self.stage2_provider = provider.map(|p| Arc::from(p.as_str()));
@@ -796,6 +810,7 @@ impl ApiState {
     ) -> Result<Self, StateError> {
         let state = Self::from_env(store, account_email)?
             .with_stage2_prices(cfg.stage2.price_in_per_mtok, cfg.stage2.price_out_per_mtok)
+            .with_agent_triage(cfg.triage.clone())
             .with_stage2_model(
                 cfg.stage2.model.clone(),
                 cfg.stage2.stage2_provider.map(|p| p.as_str().to_string()),

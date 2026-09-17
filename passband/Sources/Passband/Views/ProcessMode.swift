@@ -321,7 +321,7 @@ struct ProcessMode: View {
                 .foregroundStyle(Palette.inkFaint)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if let chip = Fmt.deadlineChip(u.deadline) {
+            if let chip = Fmt.deadlineChip(u.displayDeadline) {
                 Chip(
                     text: chip.text, tone: chip.overdue ? Palette.danger : Palette.warn,
                     filled: chip.overdue)
