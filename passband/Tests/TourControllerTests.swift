@@ -28,10 +28,13 @@ final class AppStore {
     /// (draft settlement, the stats read), then the swap — and, like the
     /// real one past its abort point, deliberately deaf to cancellation, so
     /// the controller's handling of a cancel that lands mid-swap is tested.
+    /// The suspension is a GATE the test opens, not a sleep: a timing window
+    /// is exactly what a loaded CI runner does not honour.
+    var holdSwap = false
     func enterPractice() async {
         enters += 1
         connStatus = .loading
-        try? await Task.sleep(for: .milliseconds(120))
+        while holdSwap { await Task.yield() }
         RehearsalMode.setEnabled(true)
         connStatus = .connected
     }
@@ -54,6 +57,17 @@ struct TourControllerTests {
     @MainActor
     /// Longer than the controller's veil beats (450ms in, 650ms out).
     static func settle() async throws { try await Task.sleep(for: .milliseconds(950)) }
+
+    /// Yield until a stub records what it was asked; a bounded spin, never a
+    /// sleep, so a slow runner changes how long it waits and not the answer.
+    @MainActor
+    static func until(_ condition: () -> Bool) async {
+        for _ in 0..<100_000 {
+            if condition() { return }
+            await Task.yield()
+        }
+        preconditionFailure("Timed out waiting for the store stub")
+    }
 
     @MainActor
     static func main() async throws {
@@ -121,10 +135,12 @@ struct TourControllerTests {
         precondition(store.enters == 0, "Cancel before replay executes must not enter practice")
 
         let midFlight = TourController()
+        store.holdSwap = true
         midFlight.replay(store: store)
-        try await Task.sleep(for: .milliseconds(40))
-        precondition(store.enters == 1 && !RehearsalMode.isEnabled, "The swap is still ahead")
+        await until { store.enters == 1 }
+        precondition(!RehearsalMode.isEnabled, "The swap is still ahead")
         midFlight.cancel()
+        store.holdSwap = false
         try await settle()
         precondition(!RehearsalMode.isEnabled && store.exits == 1 && !midFlight.active,
                      "A cancel that lands after the swap puts the live account back instead of stranding fixture mail")
