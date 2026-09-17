@@ -196,7 +196,7 @@ const MARK: &str = concat!(
 /// link-free also keeps it free of configuration, which is what lets the shell
 /// carry it rather than every call site having to pass an origin down.
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
-    render(status, title, body, "")
+    render(status, title, body, r#" class="auth""#)
 }
 
 /// The same shell on the OPERATOR'S surface: the landing page's dark ground in
@@ -213,6 +213,13 @@ fn console(status: StatusCode, title: &str, body: &str) -> Response {
 
 fn render(status: StatusCode, title: &str, body: &str, body_class: &str) -> Response {
     let title = escape_html(title);
+    let masthead =
+        format!(r#"<header class="brand">{MARK}<span class="wordmark">Passband</span></header>"#);
+    let opening = if body_class == r#" class="auth""# {
+        format!("{masthead}<main>")
+    } else {
+        format!("<main>{masthead}")
+    };
     let html = format!(
         r#"<!doctype html>
 <html lang="en">
@@ -415,14 +422,49 @@ body.console .signout {{ margin: 2.75rem 0 0.6rem; }}
    row and the placeholder in it are enough on screen; neither is a label. */
 body.console .sr {{ position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip-path: inset(50%); white-space: nowrap; }}
+/* Account appearance is explicit; browser theme never overrides the URL choice. */
+body.auth {{ color-scheme: light; --brand: #1c63ae; background: #fff; color: #141c26;
+  padding: 2rem 3rem 4rem; }}
+.auth > .brand {{ margin: 0; }}
+.auth main {{ max-width: 42rem; margin: clamp(3rem, 9vh, 6rem) auto 0; overflow-wrap: anywhere; }}
+.auth h1 {{ font-size: 2rem; line-height: 1.2; letter-spacing: -0.035em; margin-bottom: 0.75rem; }}
+.auth .lead {{ color: #455465; margin-bottom: 2rem; }}
+.auth .card {{ background: transparent; border: 0; border-radius: 0; padding: 0; margin-bottom: 1.5rem; }}
+.auth .field {{ margin-bottom: 1.5rem; }}
+.auth label {{ font-size: 0.9rem; font-weight: 500; margin-bottom: 0.5rem; }}
+.auth input {{ background: #fff; border-color: #cbd1d8; border-radius: 8px; padding: 0.8rem 0.9rem; }}
+.auth :is(button, a.button) {{ box-sizing: border-box; width: 100%; text-align: center;
+  padding: 0.85rem 1.25rem; border-radius: 8px; background: #141c26; color: #fff; }}
+.auth :is(button, a.button):hover {{ background: #293746; }}
+.auth :is(.hint, .muted, .suffix) {{ color: #455465; font-size: 0.875rem; }}
+.auth .alt {{ border: 0; padding: 0; text-align: center; margin-bottom: 2rem; }}
+.auth details {{ border-color: #e4e7eb; font-size: 0.875rem; color: #455465; }}
+.auth summary {{ font-weight: 500; }}
+.auth :is(code, .code) {{ background: #f2f4f7; }}
+.auth .stop {{ border-left-color: #b3261e; }}
+body.auth[data-theme="dark"] {{ color-scheme: dark; --brand: #82baf5;
+  background: #0e141d; color: #e9eef5; }}
+.auth[data-theme="dark"] :is(.lead, .hint, .muted, .suffix, details) {{ color: #a8b4c4; }}
+.auth[data-theme="dark"] input {{ background: #131a24; border-color: #39434e; }}
+.auth[data-theme="dark"] :is(button, a.button) {{ background: #e9eef5; color: #0e141d; }}
+.auth[data-theme="dark"] :is(button, a.button):hover {{ background: #fff; }}
+.auth[data-theme="dark"] details {{ border-color: #303740; }}
+.auth[data-theme="dark"] :is(code, .code) {{ background: #1e2835; }}
+.auth[data-theme="dark"] .stop {{ border-left-color: #ff7a68; }}
+@media (max-width: 600px) {{
+  body.auth {{ padding: 1.5rem 1.25rem 2.5rem; }}
+  .auth main {{ margin-top: 3rem; }}
+  .auth h1 {{ font-size: 1.75rem; }}
+}}
 </style>
 </head>
-<body{body_class}><main><header class="brand">{mark}<span class="wordmark">Passband</span></header>
+<body{body_class} data-theme="{theme}">{opening}
 {body}</main></body>
 </html>
 "#,
         title = title,
-        mark = MARK,
+        opening = opening,
+        theme = crate::appearance::current().name(),
         body = body,
         body_class = body_class,
     );
@@ -447,12 +489,11 @@ body.console .sr {{ position: absolute; width: 1px; height: 1px; overflow: hidde
 /// The signup form.
 ///
 /// TWO FIELDS AND ONE BUTTON ARE THE PAGE, and everything else is arranged
-/// around that. The form sits on its own card so the thing to do is the thing
-/// that looks like it; each input carries its own hint, tied to it with
-/// `aria-describedby` rather than left as loose prose a screen reader reads as
-/// an unrelated paragraph.
+/// around that. The form is unboxed on the native app’s white ground. The
+/// address hint is tied to its input with `aria-describedby`; privacy details
+/// stay available in a collapsed disclosure.
 ///
-/// THE GRANT IS STILL STATED BEFORE THE BUTTON, in one line naming all three
+/// THE GRANT IS STILL STATED BESIDE THE BUTTON, in one line naming all three
 /// permissions, because the consent screen that follows is Google's and says it
 /// in Google's vocabulary. What moved is the LONG version: three paragraphs of
 /// scope detail above the fold pushed the form off a phone screen and read as
@@ -503,39 +544,36 @@ pub fn signup_form(
         "Set up your Passband mailbox",
         &format!(
             r#"<h1>Set up your mailbox</h1>
-<p>Passband triages your Gmail and serves it to the app.</p>
+<p class="lead">Connect Gmail to get started with Passband.</p>
 {error_html}
 <form class="card" method="post" action="/signup">
 <div class="field">
 <label for="invite">Invite code</label>
 <input type="text" id="invite" name="invite" value="{invite}" placeholder="XXXX-XXXX-XXXX-XXXX"
-  aria-describedby="invite-hint" autocomplete="off" autocapitalize="off" spellcheck="false"
+  autocomplete="off" autocapitalize="off" spellcheck="false"
   autofocus required>
-<p class="hint" id="invite-hint">Case and dashes do not matter.</p>
 </div>
 <div class="field">
-<label for="label">Choose your address</label>
+<label for="label">Your Passband address</label>
 <input type="text" id="label" name="label" value="{label}" placeholder="yourname"
   aria-describedby="label-hint" autocomplete="off" autocapitalize="off" spellcheck="false" required>
-<p class="hint" id="label-hint">Lives at <span class="suffix">https://</span>yourname<span class="suffix">.{domain}</span>.
-Lowercase, numbers, hyphens, 3 to 30 characters.</p>
+<p class="hint" id="label-hint">yourname<span class="suffix">.{domain}</span> · 3 to 30 lowercase letters, numbers or hyphens.</p>
 </div>
 <button type="submit">Continue to Google</button>
-<p class="hint">Next, Google asks to read, change, and send your Gmail. Passband
-needs all three.</p>
+<p class="hint">Google will ask to read, change, and send your Gmail. Passband needs all three.</p>
 </form>
 {waitlist_html}
 <details>
-<summary>What Google will ask you to approve</summary>
+<summary>Gmail access and privacy</summary>
 <ul>
-<li><strong>Read</strong> (<code>gmail.readonly</code>): what the triage runs on.</li>
-<li><strong>Change</strong> (<code>gmail.modify</code>): archiving and labeling. Never deletion.</li>
+<li><strong>Read</strong> (<code>gmail.readonly</code>): mail triage.</li>
+<li><strong>Change</strong> (<code>gmail.modify</code>): archiving and labeling, never deletion.</li>
 <li><strong>Send</strong> (<code>gmail.send</code>): replying from the app.</li>
 </ul>
-<p>Leave every box checked. A partial grant is sent back.</p>
-</details>
-<p class="muted">We hold your Google refresh token, encrypted, so your daemon can
-sync while you are away. Self-host if you would rather we did not.</p>"#,
+<p>Keep all permissions checked to continue.</p>
+<p>Your Google refresh token is stored encrypted to keep mail in sync.
+Self-host to manage it yourself.</p>
+</details>"#,
             error_html = error_html,
             waitlist_html = waitlist_html,
             invite = escape_html(invite),
@@ -551,6 +589,13 @@ sync while you are away. Self-host if you would rather we did not.</p>"#,
 /// The code and the URL are `user-select: all` text rather than a copy button,
 /// because a copy button is JavaScript and this page has none. The deep link is
 /// the fast path; typing the code into the app is the path that always works.
+///
+/// THE DISCLOSURE'S SUMMARY NAMES THE SYMPTOM, not the mechanism. The path that
+/// always works is folded away, and the person who needs it is the person for
+/// whom the button just did nothing: a summary reading "connect manually" is
+/// findable only by somebody who already knows that is what went wrong, which
+/// is the one thing they do not know. See [`app_signed_in`], where the same
+/// line replaced a standing "if that button does nothing" heading.
 pub fn success(
     tenant_url: &str,
     pair_code: &str,
@@ -563,20 +608,17 @@ pub fn success(
         "Your mailbox is ready",
         &format!(
             r#"<h1>Your mailbox is ready</h1>
-<p>Your daemon is running at <code>{url}</code> and is syncing your mail now.
-One more step: connect the app.</p>
-<ol>
-<li><a href="{download}">Download Passband</a> and open it.</li>
-<li>Press <strong>Pair</strong>.</li>
-<li>Enter the code below, or open the link on the same device.</li>
-</ol>
+<p class="lead">Connect the app to start using Passband.</p>
+<p><a class="button" href="{link}">Open Passband</a></p>
+<p class="alt">Need the app? <a href="{download}">Download Passband</a>.</p>
+<details>
+<summary>Button did nothing? Connect manually</summary>
+<p>Open Passband, choose hosted, and enter your server and pairing code.</p>
+<p><code>{url}</code></p>
 <p><span class="code">{code}</span></p>
-<p><a class="button" href="{link}">Open Passband and pair</a></p>
-<p class="muted">The code is good for {minutes} minutes and works once. If it
-expires before you get to it, that is fine: open Passband, point it at
-<code>{url}</code>, and ask for a new code.</p>
-<p class="muted">Keep the code to yourself while it is live. It is what lets a
-device in.</p>"#,
+<p>The code works once and expires in {minutes} minutes. Keep it private.
+If it expires, request a new code in Passband.</p>
+</details>"#,
             url = escape_html(tenant_url),
             code = escape_html(pair_code),
             link = escape_html(&link),
@@ -594,6 +636,13 @@ device in.</p>"#,
 /// the code and the server are on it as `user-select: all` text too, exactly as
 /// they are on [`success`], and for the same reason: the link is the fast path
 /// and typing is the path that always works.
+///
+/// They are folded into a disclosure now rather than standing open, and the
+/// summary carries what the old standing `<h2>If that button does nothing</h2>`
+/// carried: the SYMPTOM. Every case in the paragraph above arrives here the same
+/// way, by pressing the button and watching nothing happen, so that is what the
+/// one line they will read has to say. A summary reading "connect manually"
+/// describes the remedy to somebody who has not yet worked out they need one.
 ///
 /// NO AUTOMATIC REDIRECT, and that is deliberate rather than unfinished. This
 /// page carries a live pairing code, and a redirect that fires on load would
@@ -616,19 +665,18 @@ pub fn app_signed_in(
         StatusCode::OK,
         "Signed in",
         &format!(
-            r#"<h1>Signed in as {email}</h1>
-<p>Your mailbox is at <code>{url}</code>. One press connects Passband to it.</p>
+            r#"<h1>You’re signed in</h1>
+<p class="lead">{email}</p>
 <p><a class="button" href="{link}">Open Passband</a></p>
-<h2>If that button does nothing</h2>
-<p>Passband may not be installed on this device, or your browser may not open
-app links. <a href="{download}">Download Passband</a> if you need it, then open
-it, choose hosted, and enter these:</p>
+<p class="alt">Need the app? <a href="{download}">Download Passband</a>.</p>
+<details>
+<summary>Button did nothing? Connect manually</summary>
+<p>Open Passband, choose hosted, and enter your server and pairing code.</p>
 <p><code>{url}</code></p>
 <p><span class="code">{code}</span></p>
-<p class="muted">The code is good for {minutes} minutes and works once. If it
-expires before you get to it, come back here and sign in again.</p>
-<p class="muted">Keep the code to yourself while it is live. It is what lets a
-device in.</p>"#,
+<p>The code works once and expires in {minutes} minutes. Keep it private.
+If it expires, sign in again.</p>
+</details>"#,
             email = escape_html(account_email),
             url = escape_html(tenant_url),
             code = escape_html(pair_code),
@@ -1248,7 +1296,7 @@ mod tests {
     }
 
     /// The scope detail may be folded away, but all three permissions are named
-    /// in the open, above the button, where somebody deciding whether to press
+    /// in the open, beside the button, where somebody deciding whether to press
     /// it will read them. The `<details>` block is the long version and is shut
     /// by default; the summary line is not.
     #[tokio::test]
@@ -1333,6 +1381,51 @@ mod tests {
         );
         assert!(html.contains("passband.app"));
         assert!(!html.contains("<script"));
+    }
+
+    /// The fallback is FOLDED AWAY BUT LABELLED WITH THE SYMPTOM, on both pages
+    /// that end a flow.
+    ///
+    /// A `contains` over the whole document cannot tell a code somebody can read
+    /// from a code sealed inside a shut `<details>`, which is how the pairing
+    /// code came to be two presses deep under a green
+    /// `the_success_page_carries_the_code_the_url_and_the_link`. So this asserts
+    /// the arrangement rather than the presence: the code is INSIDE the
+    /// disclosure, and the disclosure's summary names what went wrong rather
+    /// than what to do about it. Moving the code back into the open should fail
+    /// here and be a deliberate edit to this test.
+    #[tokio::test]
+    async fn the_finishing_pages_label_the_fallback_with_the_symptom() {
+        for html in [
+            body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+                None,
+            ))
+            .await,
+        ] {
+            let (open, folded) = html.split_once("<details>").expect("{html}");
+            // The deep link is the page; the code is the way out when it fails.
+            // Asserted on the wrapper, not the code: the `href` above carries
+            // the same string, and a code inside a link is not one to read off.
+            assert!(open.contains("passband://pair?url="), "{html}");
+            assert!(!open.contains(r#"<span class="code">"#), "{html}");
+            assert!(
+                folded.contains(r#"<span class="code">ABCD-EFGH</span>"#),
+                "{html}"
+            );
+            // Shut, so the summary is the whole of what gets read.
+            assert!(!html.contains("<details open"), "{html}");
+            let summary = folded
+                .split_once("</summary>")
+                .expect("{html}")
+                .0
+                .to_lowercase();
+            assert!(summary.contains("did nothing"), "{html}");
+        }
     }
 
     /// THE DOWNLOAD LIVES AT THE END OF THE FLOW, not on the landing page: that
@@ -1786,9 +1879,21 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// House rule: no em dashes in anything a person reads.
+    /// House rule: no typographic dashes in anything a person reads.
+    ///
+    /// THE WHOLE FAMILY, not just the em dash this started as. An en dash is the
+    /// same mistake one code point over, and it walked straight past a test
+    /// written for U+2014 alone: `3–30 lowercase letters` shipped on the signup
+    /// form under a green run of exactly this test. A rule enforced for one
+    /// member of a set it means to cover is a rule that reads as enforced and
+    /// is not. Hyphen-minus is the only dash on these pages.
+    ///
+    /// The list below is every page that renders authored copy, and adding one
+    /// is part of adding a page: the guarantee is only as wide as the list.
     #[tokio::test]
-    async fn no_em_dashes_in_user_facing_copy() {
+    async fn no_typographic_dashes_in_user_facing_copy() {
+        // Figure dash, en dash, em dash, horizontal bar, minus sign.
+        const BANNED: [char; 5] = ['\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}'];
         for html in [
             body_of(signup_form(
                 "passband.email",
@@ -1799,11 +1904,26 @@ mod tests {
             ))
             .await,
             body_of(success("https://ada.passband.email", "ABCD-EFGH", 10, None)).await,
+            body_of(app_signed_in(
+                "ada@example.com",
+                "https://ada.passband.email",
+                "ABCD-EFGH",
+                10,
+                None,
+            ))
+            .await,
             body_of(problem(StatusCode::BAD_REQUEST, "Nope", "Try again.")).await,
             body_of(console_problem(
                 StatusCode::BAD_REQUEST,
                 "Nope",
                 "Try again.",
+            ))
+            .await,
+            body_of(console_problem_with_link(
+                StatusCode::BAD_REQUEST,
+                "Nope",
+                "Try again.",
+                "https://ada.passband.email",
             ))
             .await,
             body_of(admin_login(Some("no"))).await,
@@ -1815,7 +1935,9 @@ mod tests {
             .await,
             body_of(admin_page(&[], &[], None)).await,
         ] {
-            assert!(!html.contains('\u{2014}'), "{html}");
+            for dash in BANNED {
+                assert!(!html.contains(dash), "U+{:04X} in {html}", u32::from(dash));
+            }
         }
     }
 

@@ -24,7 +24,13 @@ struct PassbandApp: App {
                 .frame(minWidth: 980, minHeight: 640)
                 .background(WindowBackdrop().ignoresSafeArea())
                 .background(WindowConfigurator())
-                .onAppear { KeyMonitor.shared.install() }
+                .onAppear {
+                    KeyMonitor.shared.install()
+                    // The tester's panel beside the window, never for a
+                    // customer: the flag is a launch argument only a
+                    // rehearsal script passes.
+                    if RehearsalMode.launchedStandalone { RehearsalControlPanel.shared.show() }
+                }
                 // passband://pair links. Parked on the store rather than acted
                 // on here: only the Connect gate can pair, and an install that
                 // already has an identity must not re-pair over it.
@@ -33,7 +39,14 @@ struct PassbandApp: App {
         .defaultSize(width: 1320, height: 880)
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact)
-        .commands { PassbandCommands(store: store, prefs: prefs, accounts: accounts) }
+        .commands {
+            PassbandCommands(store: store, prefs: prefs, accounts: accounts)
+            if RehearsalMode.launchedStandalone {
+                CommandMenu("Rehearsal") {
+                    Button("Show rehearsal controls") { RehearsalControlPanel.shared.show() }
+                }
+            }
+        }
     }
 }
 
@@ -106,7 +119,13 @@ struct PassbandCommands: Commands {
     /// reach them — ⌘1 would still switch accounts out from under a run that is
     /// counting the mailbox it started on, and ⌘K would still open the ask bar.
     /// Each one that navigates or writes is disabled for the duration.
-    private var blocked: Bool { store.retriage != nil }
+    /// Also the whole of the practice inbox and its veils
+    /// (`accountActionsBlocked`), ON PURPOSE for every command here and not
+    /// only the account ones: navigation is refused by `setView` for the
+    /// duration, a composer could only fail to send, the ask bar has no relay
+    /// behind it, and a refresh has nothing to refresh. A menu that greys out
+    /// is honest about that; one that silently does nothing is not.
+    private var blocked: Bool { store.retriage != nil || store.accountActionsBlocked }
 
     var body: some Commands {
         // Directly under "About Passband", where every Mac app keeps it.

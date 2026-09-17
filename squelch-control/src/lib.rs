@@ -33,6 +33,7 @@
 
 pub mod activation;
 pub mod admin;
+mod appearance;
 pub mod bifrost;
 pub mod config;
 pub mod cookie;
@@ -164,12 +165,18 @@ pub fn router(state: ControlState) -> Router {
         ))
         .with_state(state.clone());
 
-    let app = Router::new()
-        .route("/healthz", get(handlers::healthz))
+    let accounts = Router::new()
         .merge(form)
         .merge(signup)
         .merge(console)
         .merge(callback)
+        .layer(middleware::from_fn_with_state(
+            !state.config().is_insecure(),
+            appearance::apply,
+        ));
+    let app = Router::new()
+        .route("/healthz", get(handlers::healthz))
+        .merge(accounts)
         .merge(tenant);
 
     if state.config().waitlist.is_none() {

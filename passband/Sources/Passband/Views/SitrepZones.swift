@@ -228,7 +228,14 @@ private struct ShipmentCard: View {
         // line only when they have something else to say.
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
-                CarrierBadge(carrier: shipment.carrier)
+                if RehearsalMode.isEnabled, shipment.thread_id == "practice-5" {
+                    RehearsalNewsletterLogo(brand: .exfed, size: 18)
+                } else if RehearsalMode.isEnabled,
+                   shipment.thread_id == "practice-13" || shipment.thread_id == "practice-14" {
+                    RehearsalNewsletterLogo(brand: .rainforest, size: 18)
+                } else {
+                    CarrierBadge(carrier: shipment.carrier)
+                }
                 Text(title)
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Palette.ink)
@@ -564,7 +571,7 @@ private struct NewsletterCard: View {
             // Hero left as a FIXED square, text right: every card in the grid
             // keeps the same height whether or not its sender ships art.
             HStack(alignment: .top, spacing: 9) {
-                NewsletterHero(threadId: newsletter.latestThreadId)
+                NewsletterHero(threadId: newsletter.latestThreadId, sender: newsletter.sender)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Text(SenderCache.resolved(newsletter.sender).displayName)
@@ -623,6 +630,7 @@ private struct NewsletterCard: View {
 /// network fetch happens for unopened mail (see docs/SECURITY.md §3).
 private struct NewsletterHero: View {
     let threadId: String
+    let sender: String
     @State private var resolved: HeroCache.Hero?
 
     /// Side of the square thumb. SMALLER ON THE PHONE, because the card is: a
@@ -649,6 +657,7 @@ private struct NewsletterHero: View {
     var body: some View {
         content
             .task(id: threadId) {
+                guard !RehearsalMode.isEnabled else { return }
                 // Already answered — `hero` is drawing that answer, and resolving
                 // again costs a second body pass. The guard is INSIDE the task,
                 // not around it: a conditional modifier would change this view's
@@ -663,7 +672,9 @@ private struct NewsletterHero: View {
     /// starts with no image, so the fetch that produces one would never run.
     @ViewBuilder
     private var content: some View {
-        if let hero {
+        if let brand = RehearsalNewsletterBrand.matching(sender) {
+            RehearsalNewsletterLogo(brand: brand, size: Self.side)
+        } else if let hero {
             art(hero)
                 .frame(width: Self.side, height: Self.side)
                 // The rest of the square, in the art's own dominant colour, or

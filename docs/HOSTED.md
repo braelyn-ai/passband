@@ -67,6 +67,18 @@ Decisions made and closed:
   (bodies local / index hosted, etc.) complicate everything and convince nobody. The
   privacy product is self-host.
 
+## Account page appearance
+
+The control plane accepts `?theme=light` or `?theme=dark` on account routes.
+For example, the native app can open `/app/auth?theme=dark`; signup links can
+use `/?invite=CODE&theme=dark`. Light is the default for a fresh browser session.
+
+A valid parameter overrides the `passband_theme` session cookie. The cookie
+keeps the choice through signup submissions, validation errors, and the Google
+OAuth redirect back to the signed-in page. Missing or invalid values use the
+saved preference, then light. This preference does not affect Google's consent
+screen or the operator admin console. The native app can opt in independently.
+
 ## OAuth architecture
 
 The load-bearing subtlety: a refresh token is bound to the OAuth client that minted it.

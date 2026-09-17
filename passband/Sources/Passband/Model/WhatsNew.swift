@@ -48,6 +48,7 @@ final class WhatsNew {
     /// user who is owed the tour instead, a tour actually running, or the human
     /// is somewhere other than the board this is shown over.
     func maybeShow() {
+        guard !RehearsalMode.isEnabled else { return }
         let store = AppStore.shared
         guard !active, !dismissedThisSession else { return }
         guard Prefs.shared.tourCompleted, !store.tour.active else { return }
