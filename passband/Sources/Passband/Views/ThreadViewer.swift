@@ -1484,7 +1484,7 @@ struct ThreadViewer: View {
     // MARK: - queue navigation
 
     /// HORIZONTAL queue nav: move between the queued emails WITHOUT resolving
-    /// anything — the newsletter "2 this week" browse.
+    /// anything — the reading zone's "2 this week" browse.
     private func stepQueue(_ delta: Int) {
         let queue = store.threadQueue
         guard queue.count > 1,

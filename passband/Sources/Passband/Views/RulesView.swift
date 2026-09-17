@@ -759,7 +759,7 @@ struct RuleEditor: View {
         guard let all = try? await APIClient.shared.listRules() else { return }
         let address = SenderID.address(sender)
         inEffect = all.filter {
-            Newsletters.ruleMatches(pattern: $0.match_pattern, address: address)
+            Reading.ruleMatches(pattern: $0.match_pattern, address: address)
         }
     }
 

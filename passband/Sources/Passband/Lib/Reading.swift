@@ -1,5 +1,9 @@
-// The Sitrep's newsletters zone — recurring noise-tier senders, and the
+// The Sitrep's reading zone — recurring noise-tier senders, and the
 // rule-onboarding CTA when no rule governs them yet.
+//
+// NOT ALL NEWSLETTERS, which is why the zone is not called that: a digest, a
+// product announcement, a forum roundup and a promo blast all land here on the
+// same qualification, and only some of them are anyone's newsletter.
 //
 // Qualification prefers a real `marketing` classification (GET
 // /client/marketing). The reason-string / recurring-robot fallback is a
@@ -7,8 +11,8 @@
 
 import Foundation
 
-/// A newsletter card: one recurring noise sender for the window.
-struct Newsletter: Identifiable, Hashable, Sendable {
+/// A reading card: one recurring noise sender for the window.
+struct ReadingSender: Identifiable, Hashable, Sendable {
     /// Grouping key = bare lowercased address.
     var address: String
     /// A representative raw sender string (for avatar + display name).
@@ -30,14 +34,16 @@ struct Newsletter: Identifiable, Hashable, Sendable {
     var id: String { address }
 }
 
-enum Newsletters {
+enum Reading {
     /// Exact rung-5 reason literals we key off (substring, case-insensitive).
-    private static let newsletterReason = "unsubscribe footer"
+    private static let bulkReason = "unsubscribe footer"
     private static let receiptReason = "order confirmation / receipt"
 
-    private static func isNewsletterReason(_ reason: String) -> Bool {
+    /// List-mail shape, whatever genre it is — the word "newsletter" is only one
+    /// of the several things the engine writes for it.
+    private static func isBulkReason(_ reason: String) -> Bool {
         let r = reason.lowercased()
-        if r.contains(newsletterReason) { return true }
+        if r.contains(bulkReason) { return true }
         return r.firstMatch(
             of: /(?i)\b(unsubscribe|newsletter|bulk\/list|mailing list|marketing|promotional|digest)\b/
         ) != nil
@@ -92,7 +98,7 @@ enum Newsletters {
 
     private static let weekSeconds: Double = 7 * 86400
 
-    /// Derive newsletter cards from a batch of noise-tier updates.
+    /// Derive reading cards from a batch of noise-tier updates.
     static func derive(
         updates: [AttentionUpdate],
         rules: [SenderRule],
@@ -100,13 +106,13 @@ enum Newsletters {
         since: Double? = nil,
         limit: Int = 24,
         now: Date = Date()
-    ) -> [Newsletter] {
+    ) -> [ReadingSender] {
         let cutoff = since ?? (now.timeIntervalSince1970 - weekSeconds)
 
         struct Bucket {
             var sender: String
             var total = 0
-            var newsletterHits = 0
+            var bulkHits = 0
             var receiptHits = 0
             /// Messages of this sender the pipeline categorized `marketing`.
             var marketingHits = 0
@@ -137,7 +143,7 @@ enum Newsletters {
             byAddr[address]!.total += 1
             byAddr[address]!.items.append(u)
             if marketingIds.contains(u.id) { byAddr[address]!.marketingHits += 1 }
-            if isNewsletterReason(u.reason) { byAddr[address]!.newsletterHits += 1 }
+            if isBulkReason(u.reason) { byAddr[address]!.bulkHits += 1 }
             if isReceiptReason(u.reason) { byAddr[address]!.receiptHits += 1 }
             let d = dateOf(u)
             if d >= byAddr[address]!.latest {
@@ -147,22 +153,22 @@ enum Newsletters {
             }
         }
 
-        var out: [Newsletter] = []
+        var out: [ReadingSender] = []
         for address in order {
             guard let b = byAddr[address] else { continue }
             // Exclude senders whose window is entirely receipts (order updates,
-            // not a newsletter) with no newsletter signal at all.
-            let allReceipts = b.receiptHits > 0 && b.newsletterHits == 0 && b.marketingHits == 0
+            // not something anyone reads) with no list-mail signal at all.
+            let allReceipts = b.receiptHits > 0 && b.bulkHits == 0 && b.marketingHits == 0
             if allReceipts { continue }
 
             let qualifies =
                 marketingIds.isEmpty
-                ? (b.newsletterHits > 0 || (b.robot && b.total >= 2))
+                ? (b.bulkHits > 0 || (b.robot && b.total >= 2))
                 : b.marketingHits > 0
             guard qualifies else { continue }
 
             out.append(
-                Newsletter(
+                ReadingSender(
                     address: address,
                     sender: b.sender,
                     count: b.total,
@@ -178,7 +184,6 @@ enum Newsletters {
         return Array(out.prefix(limit))
     }
 
-    /// The `*@domain` pattern a newsletter CTA prefills into the rule editor.
     /// Drop already-resolved messages from a derived window, recomputing the
     /// fields taken from the newest survivor and removing any sender left with
     /// nothing at all.
@@ -189,15 +194,15 @@ enum Newsletters {
     /// in which marking mail done looked like it had not worked. `resolvedIds`
     /// is already the app's record of "resolved, poll has not caught up", and
     /// undo clears it, so a restored message brings its card straight back.
-    static func prune(_ newsletters: [Newsletter], resolved: Set<Int>) -> [Newsletter] {
-        guard !resolved.isEmpty else { return newsletters }
-        return newsletters.compactMap { nl in
-            let live = nl.items.filter { !resolved.contains($0.id) }
-            if live.count == nl.items.count { return nl }
+    static func prune(_ senders: [ReadingSender], resolved: Set<Int>) -> [ReadingSender] {
+        guard !resolved.isEmpty else { return senders }
+        return senders.compactMap { rs in
+            let live = rs.items.filter { !resolved.contains($0.id) }
+            if live.count == rs.items.count { return rs }
             // Nothing left in the window: the card goes, rather than sitting
             // there at zero until the poll agrees.
             guard let newest = live.first else { return nil }
-            var out = nl
+            var out = rs
             out.items = live
             out.count = live.count
             // `derive` sorts items newest-first and takes these three from the
@@ -209,6 +214,7 @@ enum Newsletters {
         }
     }
 
+    /// The `*@domain` pattern a card's CTA prefills into the rule editor.
     static func domainPattern(_ address: String) -> String {
         let domain =
             SenderID.faviconDomain(address) ?? address.split(separator: "@").last.map(String.init)

@@ -180,7 +180,7 @@ struct SitrepZoneCache: Sendable {
     var shipments: [Shipment] = []
     var banking: [BankingRecord] = []
     var receipts: [Receipt] = []
-    var newsletters: [Newsletter] = []
+    var reading: [ReadingSender] = []
     /// When the last full refresh COMPLETED. nil = never loaded.
     var loadedAt: Date?
 }
@@ -533,7 +533,7 @@ struct RuleEditorRequest: Identifiable, Sendable {
     let id = UUID()
     var sender: String?
     var rule: SenderRule?
-    /// Preselect a disposition (the newsletters CTA preselects "filtered").
+    /// Preselect a disposition (the reading zone's CTA preselects "filtered").
     var disposition: Disposition?
     var want: String?
     /// Explicit match_pattern override; wins over deriving from `sender`.
@@ -1866,7 +1866,7 @@ final class AppStore {
         case shipments([Shipment]?)
         case banking([BankingRecord]?)
         case receipts([Receipt]?)
-        case newsletters([Newsletter])
+        case reading([ReadingSender])
     }
 
     private func performZoneRefresh() async {
@@ -1886,7 +1886,7 @@ final class AppStore {
             }
             group.addTask { .banking(try? await APIClient.shared.getBanking()) }
             group.addTask { .receipts(try? await APIClient.shared.getReceipts()) }
-            group.addTask { .newsletters(await NewsletterFeed.load()) }
+            group.addTask { .reading(await ReadingFeed.load()) }
             for await answer in group {
                 guard e == epoch else {
                     group.cancelAll()
@@ -1897,9 +1897,9 @@ final class AppStore {
                 case .shipments(let rows?): zones.shipments = rows
                 case .banking(let rows?): zones.banking = rows
                 case .receipts(let rows?): zones.receipts = rows
-                case .newsletters(let rows):
-                    if !rows.isEmpty || zones.newsletters.isEmpty {
-                        zones.newsletters = rows
+                case .reading(let rows):
+                    if !rows.isEmpty || zones.reading.isEmpty {
+                        zones.reading = rows
                     }
                 case .calendar, .shipments, .banking, .receipts: break
                 }
@@ -1908,9 +1908,9 @@ final class AppStore {
         guard e == epoch else { return }
         zones.loadedAt = Date()
 
-        HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))
+        HeroCache.shared.preload(zones.reading.map(\.latestThreadId))
         warmZoneThreads()
-        // The newsletter half of the launch image warm's input; the bands are the
+        // The reading half of the launch image warm's input; the bands are the
         // other half, and it starts once both have landed.
         ImageWarmer.shared.noteZonesLanded()
     }
