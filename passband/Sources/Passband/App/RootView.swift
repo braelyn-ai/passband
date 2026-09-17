@@ -10,20 +10,53 @@ import SwiftUI
 
 struct RootView: View {
     @Environment(AppStore.self) private var store
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Tester rehearsal only (`--onboarding-rehearsal`): the opening beats
+    /// ahead of the practice inbox, with no account loaded underneath.
+    @State private var rehearsal = RehearsalSession.shared
 
     var body: some View {
         @Bindable var store = store
 
-        Group {
-            switch store.connStatus {
-            case .loading:
-                LoadingGate()
-            case .connected:
-                MainShell()
-            default:
-                ConnectView()
+        ZStack {
+            if rehearsal.showingIntro {
+                OnboardingIntroView(
+                    onContinue: { rehearsal.enterMailbox() },
+                    continueTitle: rehearsal.entryRequested && !rehearsal.mailboxReady
+                        ? "Preparing your guide…" : "Try the practice inbox",
+                    continueHint: "Continue to the guided product tour")
+                    .id(rehearsal.runID)
+                    .task(id: rehearsal.runID) { await rehearsal.prepareMailbox() }
+                    .transition(reduceMotion ? .opacity : .modifier(
+                        active: IntroMailboxFlight(scale: 1.22, blur: 20, opacity: 0),
+                        identity: IntroMailboxFlight(scale: 1, blur: 0, opacity: 1)))
+                    .zIndex(1)
+            } else {
+                Group {
+                    switch store.connStatus {
+                    case .loading:
+                        LoadingGate()
+                    case .connected:
+                        if store.tour.blocksMailboxForPractice {
+                            LoadingGate()
+                        } else {
+                            MainShell()
+                        }
+                    default:
+                        ConnectView()
+                    }
+                }
+                .transition(reduceMotion ? .opacity : .modifier(
+                    active: IntroMailboxFlight(scale: 0.90, blur: 16, opacity: 0),
+                    identity: IntroMailboxFlight(scale: 1, blur: 0, opacity: 1)))
             }
         }
+        .animation(reduceMotion ? .easeOut(duration: 0.18) : .timingCurve(0.2, 0.7, 0.2, 1, duration: 0.75),
+                   value: rehearsal.showingIntro)
+        // THE PRACTICE VEIL. Entering the practice inbox and leaving it both
+        // swap the whole read model under the shell; this hides the swap
+        // behind one line of copy instead of letting the board flip mid-frame.
+        .modifier(PracticeVeil(text: store.tour.veil))
         // THE APP DRAWS FROM THE WINDOW'S TOP EDGE. SwiftUI insets a window's
         // content below the titlebar strip macOS keeps clear for the traffic
         // lights, which left every page carrying an empty band above its own
@@ -78,16 +111,26 @@ struct RootView: View {
             // Pay WebKit's process-launch cost at boot rather than on the first
             // email the reader opens.
             EmailWebView.warmProcess()
-            await store.loadSettings()
+            if RehearsalMode.includesConnection {
+                await rehearsal.restartConnection()
+            } else {
+                await store.loadSettings()
+            }
         }
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
+                store.tour.maybeStart()
+                guard !store.tour.preparingPractice else { return }
                 SitrepPoller.shared.start()
                 // EVERY account's ears, not just the live one's: the poller
                 // above follows whichever mailbox is on screen, while the event
                 // feeds (and, for the inactive accounts, the auth watches) are
                 // how the human hears about mail in the ones that are not.
-                AccountManager.shared.startAllFeeds()
+                // NOT while the practice inbox is up: the feeds are the real
+                // accounts', and a banner for real mail would point at a thread
+                // the practice board cannot open. `exitPractice` comes back
+                // through this same transition and starts them then.
+                if !RehearsalMode.isEnabled { AccountManager.shared.startAllFeeds() }
                 // Warm the emails page at CONNECT, not on its first visit: the
                 // list lives in the store, so fetching it now means opening the
                 // page lands on rows instead of on "loading mail…". This also
@@ -108,6 +151,45 @@ struct RootView: View {
                 store.addAccountSheetOpen = false
             }
         }
+    }
+}
+
+/// One continuous flight from the opening slides into the prepared mailbox.
+private struct IntroMailboxFlight: ViewModifier {
+    let scale: CGFloat
+    let blur: CGFloat
+    let opacity: Double
+
+    func body(content: Content) -> some View {
+        content.scaleEffect(scale).blur(radius: blur).opacity(opacity)
+    }
+}
+
+/// The shell zoomed back and faded behind one line while the practice inbox
+/// is set up or the live one put back. Reduce Motion keeps the fade and drops
+/// the zoom and blur.
+private struct PracticeVeil: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let text: String?
+
+    func body(content: Content) -> some View {
+        let veiled = text != nil
+        content
+            .scaleEffect(veiled && !reduceMotion ? 0.92 : 1)
+            .blur(radius: veiled && !reduceMotion ? 12 : 0)
+            .opacity(veiled ? 0 : 1)
+            .allowsHitTesting(!veiled)
+            .background {
+                if let text {
+                    VStack(spacing: 14) {
+                        ProgressView(text)
+                            .foregroundStyle(Palette.inkDim)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: reduceMotion ? 0.18 : 0.5), value: veiled)
     }
 }
 
@@ -164,19 +246,12 @@ private struct ShellWatchers: View {
             .onChange(of: store.sitrep.sealed) { _, sealed in
                 AuthArrival.shared.observe(sealed: sealed)
             }
-            // THE TOUR'S TRIGGER: the first sync of the session landing. Not
-            // `onAppear` — the board is empty until a pull returns, and a tour
-            // that opens over "You're all clear." has nothing to point at. Not
-            // connect either, which can succeed against a daemon that then goes
-            // dark. A reconnect clears `lastRefresh`, so this fires again; the
-            // tour's own once-a-session flag is what stops it starting twice.
+            // Connection starts onboarding before the shell is revealed.
+            // Refreshes can still resume a pending live summary.
             .onChange(of: store.lastRefresh) { old, new in
                 if old == nil, new != nil {
                     store.tour.maybeStart()
-                    // The same trigger, and the ORDER is the whole arrangement:
-                    // a first-run tour claims the moment, and the changelog's
-                    // own gate (tourCompleted) then declines it. Neither has to
-                    // know about the other beyond that.
+                    // Onboarding claims the moment before release notes.
                     store.whatsNew.maybeShow()
                 }
             }
@@ -297,6 +372,7 @@ struct MainShell: View {
             }
             .blur(radius: store.modalOverlayOpen ? 9 : 0)
 
+
             // Global overlays: undo toasts, compose ceremony, palettes. OUTSIDE
             // the blurred stack — the modal itself must stay sharp.
             ActionLayer()
@@ -349,6 +425,16 @@ struct MainShell: View {
         // replaced. Refusing the whole set HERE is the only place that covers
         // every one of them at once.
         guard store.retriage == nil else { return [] }
+        if RehearsalMode.isEnabled {
+            return [
+                KeyBinding(declining: "u", "undo last action") {
+                    guard !store.undos.isEmpty else { return false }
+                    Task { await store.fireUndo() }
+                    return true
+                },
+                KeyBinding("\\", "toggle light/dark theme") { Prefs.shared.flipTheme() },
+            ]
+        }
         var bindings: [KeyBinding] = MainView.mainViews.enumerated().map { index, view in
             KeyBinding("\(index + 1)", "go to \(view.rawValue)") { store.setView(view) }
         }

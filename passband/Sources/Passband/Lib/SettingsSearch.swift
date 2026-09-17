@@ -186,7 +186,7 @@ enum SettingsSearch {
         SettingsEntry(
             card: .tour,
             title: "Replay the tour",
-            blurb: "Runs the seven step first run walkthrough over your own board again.",
+            blurb: "Opens the guided practice inbox, then returns to your live inbox.",
             keywords: [
                 "tour", "walkthrough", "onboarding", "tutorial", "guide", "intro",
                 "introduction", "first run", "getting started", "replay", "help", "again",
