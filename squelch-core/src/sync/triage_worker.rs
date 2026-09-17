@@ -25,6 +25,7 @@ fn read_job(account: AccountId, message_id: i64) -> AgentJob {
         lease_token: String::new(),
         attempts: 0,
         arrival_eligible: false,
+        foreground: false,
     }
 }
 
@@ -292,6 +293,10 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     }
 
     pub(super) async fn process_agent_job(&self, job: AgentJob, llm: &ResolvedLlm, day: &str) {
+        if job.kind == "access" {
+            self.process_access_job(job, llm, day).await;
+            return;
+        }
         let mut context = match self.store.load_agent_context(&job) {
             Ok(context) => context,
             Err(_) => {
@@ -314,13 +319,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             );
             return;
         }
-        let limits = match self.investigation_budget_limits(&job, &context) {
-            Ok(limits) => limits,
-            Err(_) => {
-                self.retry_agent(&job, "budget_unavailable");
-                return;
-            }
-        };
+        let limits = investigation_budget_limits(&self.config, &job);
         match self
             .store
             .reserve_agent_budget(self.account_id, day, &limits)
@@ -450,85 +449,138 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                     }
                 }
             }
-            Err(error) => {
-                for usage in error.usage {
-                    let _ = self
-                        .store
-                        .stage2_bump_usage(self.account_id, day, usage.into());
-                }
-                if is_provider_outage(&error.kind) {
-                    if crate::triage::llm::is_config_failure(&error.kind) {
-                        self.metrics.record_llm_config_failure();
-                        // Only a first-call rejection guarantees this reservation
-                        // bought no accepted model work. Paid prior turns stay charged.
-                        if error.model_calls <= 1 {
-                            let _ = self
-                                .store
-                                .refund_agent_budget(self.account_id, day, &limits);
-                        }
-                    }
-                    let until = Utc::now()
-                        + ChronoDuration::seconds(
-                            self.config
-                                .triage
-                                .agent
-                                .outage_retry_secs
-                                .min(i64::MAX as u64) as i64,
-                        );
-                    self.agent_retry_after
-                        .fetch_max(until.timestamp(), Ordering::Relaxed);
-                    let _ = self.store.defer_agent_job(&job, until, &error.kind);
-                    self.metrics.record_agent(AgentVerdict::Retryable);
-                } else {
-                    self.retry_agent(&job, &error.kind);
-                }
-            }
+            Err(error) => self.handle_agent_failure(&job, error, day, &limits, false),
         }
     }
 
-    fn investigation_budget_limits(
+    fn handle_agent_failure(
         &self,
         job: &AgentJob,
-        context: &AgentContext,
-    ) -> Result<Vec<(String, u32)>> {
-        let overrides = self.store.stage2_cap_overrides(self.account_id)?;
-        let global = self
-            .config
-            .triage
-            .agent
-            .daily_run_cap
-            .min(
-                overrides
-                    .global_daily_cap
-                    .unwrap_or(self.config.stage2.global_daily_cap),
-            )
-            .min(
-                overrides
-                    .stage1_global_daily_cap
-                    .unwrap_or(self.config.stage1.global_daily_cap),
-            );
-        let mut limits = vec![
-            (GLOBAL_BUDGET_KEY.into(), global),
-            (
-                format!("agent_thread:{}", context.message.thread_id),
-                overrides
-                    .thread_daily_cap
-                    .unwrap_or(self.config.stage2.thread_daily_cap),
-            ),
-            (
-                format!(
-                    "agent_sender:{}",
-                    context.message.from_addr.to_ascii_lowercase()
-                ),
-                overrides
-                    .sender_daily_cap
-                    .unwrap_or(self.config.stage2.sender_daily_cap),
-            ),
-        ];
-        if job.trigger.starts_with("revisit:") {
-            limits.push(("__agent_revisit__".into(), self.config.revisit.daily_cap));
+        error: crate::triage::agent::AgentFailure,
+        day: &str,
+        limits: &[(String, u32)],
+        access: bool,
+    ) {
+        for usage in error.usage {
+            if access {
+                let _ = self.store.extract_bump_usage(
+                    self.account_id,
+                    day,
+                    crate::triage::access::USAGE_CATEGORY,
+                    usage.into(),
+                );
+            } else {
+                let _ = self
+                    .store
+                    .stage2_bump_usage(self.account_id, day, usage.into());
+            }
         }
-        Ok(limits)
+        let rejected = crate::triage::llm::is_config_failure(&error.kind);
+        if error.model_calls == 0 || (rejected && error.model_calls == 1) {
+            let _ = self.store.refund_agent_budget(self.account_id, day, limits);
+        }
+        if is_provider_outage(&error.kind) {
+            if rejected {
+                self.metrics.record_llm_config_failure();
+            }
+            let until = Utc::now()
+                + ChronoDuration::seconds(
+                    self.config.triage.agent.outage_retry_secs.min(86400) as i64
+                );
+            self.agent_retry_after
+                .fetch_max(until.timestamp(), Ordering::Relaxed);
+            let _ = self.store.defer_agent_job(job, until, &error.kind);
+            self.metrics.record_agent(AgentVerdict::Retryable);
+        } else {
+            self.retry_agent(job, &error.kind);
+        }
+    }
+
+    async fn process_access_job(&self, job: AgentJob, llm: &ResolvedLlm, day: &str) {
+        let now = Utc::now();
+        let retry_after = self.agent_retry_after.load(Ordering::Relaxed);
+        if now.timestamp() < retry_after {
+            let until = DateTime::from_timestamp(retry_after, 0).unwrap_or(now);
+            let _ = self.store.defer_agent_job(&job, until, "provider_cooldown");
+            return;
+        }
+        let message = match self.store.load_agent_access_message(&job) {
+            Ok(message) => message,
+            Err(_) => {
+                self.retry_agent(&job, "context_unavailable");
+                return;
+            }
+        };
+        let limits = investigation_budget_limits(&self.config, &job);
+        match self
+            .store
+            .reserve_agent_budget(self.account_id, day, &limits)
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let tomorrow = (now.date_naive() + ChronoDuration::days(1))
+                    .and_hms_opt(0, 0, 1)
+                    .expect("midnight")
+                    .and_utc();
+                let _ = self
+                    .store
+                    .defer_agent_job(&job, tomorrow, "daily_budget_exhausted");
+                self.metrics.record_agent(AgentVerdict::Deferred);
+                return;
+            }
+            Err(_) => {
+                self.retry_agent(&job, "budget_unavailable");
+                return;
+            }
+        }
+        let notify = &self.config.notify;
+        let model = if llm.provider == Stage2Provider::Anthropic
+            && crate::triage::llm::is_gateway_url(&llm.url)
+        {
+            crate::triage::llm::qualify_gateway_model(&notify.model).unwrap_or(notify.model.clone())
+        } else {
+            notify.model.clone()
+        };
+        let connection = AgentConnection {
+            http: &self.http,
+            url: &llm.url,
+            api_key: &llm.api_key,
+            provider: llm.provider,
+            model: &model,
+            effort: notify.effort.as_deref(),
+        };
+        match crate::triage::access::run_access(
+            connection,
+            notify,
+            &message,
+            self.config.triage.context.max_context_bytes,
+        )
+        .await
+        {
+            Ok(run) => {
+                let metadata = serde_json::json!({"prompt_version":crate::triage::access::PROMPT_VERSION,
+                    "model":model,"model_calls":run.model_calls,"usage":run.usage,"assessment":run.decision});
+                for usage in run.usage {
+                    let _ = self.store.extract_bump_usage(
+                        self.account_id,
+                        day,
+                        crate::triage::access::USAGE_CATEGORY,
+                        usage.into(),
+                    );
+                }
+                match self
+                    .store
+                    .commit_agent_access(&job, &message, &run.decision, &metadata)
+                {
+                    Ok(AgentCommitOutcome::Applied) => {
+                        self.metrics.record_agent(AgentVerdict::Applied)
+                    }
+                    Ok(AgentCommitOutcome::Stale) => self.retry_agent(&job, "context_changed"),
+                    Err(_) => self.retry_agent(&job, "commit_failed"),
+                }
+            }
+            Err(error) => self.handle_agent_failure(&job, error, day, &limits, true),
+        }
     }
 
     fn retry_agent(&self, job: &AgentJob, code: &str) {
@@ -635,10 +687,98 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 /// Provider failures describe shared availability, not a permanently bad email.
 fn is_provider_outage(kind: &str) -> bool {
     crate::triage::llm::is_config_failure(kind)
-        || matches!(kind, "transport" | "agent_timeout" | "http_429")
+        || matches!(kind, "transport" | "http_429")
         || kind
             .strip_prefix("http_")
             .and_then(|v| v.split(':').next())
             .and_then(|v| v.parse::<u16>().ok())
             .is_some_and(|status| (500..600).contains(&status))
+}
+
+/// The total limit bounds all investigations. Background work has a second
+/// ceiling, leaving capacity for genuinely new inbound mail. Historical stage
+/// escalation caps deliberately do not gate this only classification path.
+fn investigation_budget_limits(config: &Config, job: &AgentJob) -> Vec<(String, u32)> {
+    let mut limits = vec![(GLOBAL_BUDGET_KEY.into(), config.triage.agent.daily_run_cap)];
+    if !job.foreground || job.kind == "access" {
+        limits.push((
+            "__agent_background__".into(),
+            config.triage.agent.effective_background_daily_run_cap(),
+        ));
+    }
+    if job.trigger.starts_with("revisit:") {
+        limits.push(("__agent_revisit__".into(), config.revisit.daily_cap));
+    }
+    limits
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::store::{SqliteStore, agent_triage::AgentTriageStore};
+
+    #[test]
+    fn migration_cannot_spend_arrival_reserve_and_old_escalation_caps_do_not_bind() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let account = store.ensure_account("arrival-budget@example.com").unwrap();
+        let config = Config::default();
+        let mut job = read_job(account, 1);
+        let background = investigation_budget_limits(&config, &job);
+        // Simulate a cutover larger than its entire daily budget.
+        for index in 0..1500 {
+            assert_eq!(
+                store
+                    .reserve_agent_budget(account, "today", &background)
+                    .unwrap(),
+                index < 200
+            );
+        }
+        job.foreground = true;
+        let arrival = investigation_budget_limits(&config, &job);
+        // This exceeds the retired 120/account, 5/sender and 3/thread limits.
+        for _ in 0..800 {
+            assert!(
+                store
+                    .reserve_agent_budget(account, "today", &arrival)
+                    .unwrap()
+            );
+        }
+        assert!(
+            !store
+                .reserve_agent_budget(account, "today", &arrival)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .stage2_budget_used(account, GLOBAL_BUDGET_KEY, "today")
+                .unwrap(),
+            1000
+        );
+    }
+
+    #[test]
+    fn access_cannot_borrow_arrival_capacity_and_lowering_total_keeps_a_reserve() {
+        let mut config = Config::default();
+        config.triage.agent.daily_run_cap = 2;
+        let mut job = read_job(1, 1);
+        job.kind = "access".into();
+        job.foreground = true; // Defensive even if a malformed lane reaches us.
+        assert_eq!(
+            investigation_budget_limits(&config, &job),
+            vec![
+                (GLOBAL_BUDGET_KEY.into(), 2),
+                ("__agent_background__".into(), 1)
+            ]
+        );
+        config.triage.agent.background_daily_run_cap = 0;
+        assert_eq!(investigation_budget_limits(&config, &job)[1].1, 0);
+    }
+
+    #[test]
+    fn investigation_deadline_is_not_a_shared_provider_outage() {
+        assert!(!is_provider_outage("agent_timeout"));
+        assert!(is_provider_outage("transport"));
+        assert!(is_provider_outage("http_503"));
+        assert!(is_provider_outage("http_403:permission_error"));
+    }
 }

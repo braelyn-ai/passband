@@ -303,3 +303,7 @@ run_suite recent-search-ring \
 run_suite triage-targets \
   Sources/Passband/Lib/TriageTargets.swift \
   Tests/TriageTargetsTests.swift
+
+run_suite capability-probe \
+  Sources/Passband/Model/APIError.swift \
+  Tests/CapabilityProbeTests.swift

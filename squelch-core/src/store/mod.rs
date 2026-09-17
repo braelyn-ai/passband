@@ -167,6 +167,9 @@ pub struct SenderEntry {
 /// message is never observable as normal mail (docs/SECURITY.md §4).
 #[derive(Debug, Clone)]
 pub struct TriagedMessage {
+    /// First classification from incremental sync may use reserved arrival
+    /// capacity. Historical backfill and repairs use background capacity.
+    pub foreground_triage: bool,
     pub message: NewMessage,
     /// Sent mail only: To/Cc addresses seeding the contacts table (the account's
     /// own address is filtered out at ingest). Contacts come exclusively from

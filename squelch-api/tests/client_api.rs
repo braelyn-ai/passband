@@ -6287,6 +6287,13 @@ async fn triage_config_get_default_shape() {
     assert_eq!(json["thread_daily_cap"], 3);
     assert_eq!(json["sender_daily_cap"], 5);
     assert_eq!(json["global_daily_cap"], 120);
+    assert_eq!(json["agent"]["effective_daily_run_cap"], 1000);
+    assert_eq!(json["agent"]["effective_background_daily_run_cap"], 200);
+    assert_eq!(json["agent"]["reserved_arrival_runs"], 800);
+    assert_eq!(
+        json["agent"]["legacy_stage_caps_are_active_ceilings"],
+        false
+    );
     assert_eq!(json["sources"]["thread_daily_cap"], "default");
     assert_eq!(json["sources"]["sender_daily_cap"], "default");
     assert_eq!(json["sources"]["global_daily_cap"], "default");

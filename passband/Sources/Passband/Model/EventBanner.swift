@@ -208,13 +208,25 @@ struct NotificationTapQueue<Target> {
         var accountId: UUID?
     }
     private(set) var pending: Tap?
+    private var parked = false
 
     mutating func enqueue(_ target: Target, accountId: UUID?) {
         pending = Tap(target: target, accountId: accountId)
+        parked = false
     }
 
+    /// Failed switches wait for a successful connection or another explicit tap.
+    /// A newer tap that arrived during the switch is already a fresh request.
+    mutating func park(_ tap: Tap) {
+        guard pending == nil else { return }
+        pending = tap
+        parked = true
+    }
+
+    mutating func connectionBecameReady() { parked = false }
+
     mutating func take(connected: Bool) -> Tap? {
-        guard connected else { return nil }
+        guard connected, !parked else { return nil }
         defer { pending = nil }
         return pending
     }

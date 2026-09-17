@@ -1375,6 +1375,26 @@ fn external_thread_read_demand_queues_bounded_legacy_access_work() {
         params![acct],|r|r.get(0)).unwrap()
     };
     assert_eq!(count(), 0);
+    for _ in 0..30 {
+        assert!(
+            !store
+                .external_thread_allowed(acct, "legacy-thread")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .thread_view_with_html(acct, "legacy-thread")
+                .unwrap()
+                .messages
+                .len(),
+            20
+        );
+    }
+    assert_eq!(
+        count(),
+        0,
+        "human reads and cache probes never queue paid work"
+    );
     assert!(store.thread_view(acct + 1, "legacy-thread").is_err());
     assert_eq!(count(), 0);
     for expected in [8, 16, 20, 20] {

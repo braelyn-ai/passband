@@ -4,6 +4,7 @@
 //! extraction modules remain for stored-data compatibility; ingest and workers
 //! do not execute the retired classifier or deterministic detectors.
 
+pub mod access;
 pub mod agent;
 pub mod agent_config;
 pub mod calendar;

@@ -215,6 +215,7 @@ impl TriagedBuilder {
 
     pub(super) fn build(&self) -> TriagedMessage {
         TriagedMessage {
+            foreground_triage: false,
             message: self.msg(),
             recipients: vec![],
             // DERIVED from `to_addrs` rather than set separately, so a test that

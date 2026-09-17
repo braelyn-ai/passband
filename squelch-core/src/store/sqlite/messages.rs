@@ -220,6 +220,8 @@ pub(super) fn external_message_allowed_conn(
              LEFT JOIN messages m ON m.id=d.message_id AND m.account_id=?1
              LEFT JOIN agent_message_state a ON a.message_id=d.message_id AND a.account_id=?1
              WHERE m.id IS NULL OR a.access IS NULL OR a.access!='allowed'
+               OR EXISTS(SELECT 1 FROM agent_triage_corrections c WHERE c.account_id=?1
+                   AND c.message_id=d.message_id AND c.field='external_access' AND c.value_json='true')
            )
            AND NOT EXISTS(
              SELECT 1 FROM agent_decision_sources d
@@ -246,6 +248,25 @@ pub(super) fn thread_guard_and_subject(
     if ids.is_empty() {
         return Err(CoreError::NotFound);
     }
+    for id in ids {
+        if !external_message_allowed_conn(conn, account_id, id)? {
+            return Err(CoreError::NotFound);
+        }
+    }
+    conn.query_row(THREAD_SUBJECT_SQL, params![account_id, thread_id], |row| {
+        row.get(0)
+    })
+    .optional()?
+    .ok_or(CoreError::NotFound)
+}
+
+/// Only an explicit external thread-open request may schedule source assessments.
+/// Permission probes for human cache policy, listings and search remain pure.
+fn request_external_thread_access_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    thread_id: &str,
+) -> Result<()> {
     // Reading a legacy thread is demand for assessing its unseen sources. Queue
     // a small batch, never every ancestor at arrival. Existing assessments and
     // active or terminal work remain untouched; access stays closed until every source passes.
@@ -263,16 +284,7 @@ pub(super) fn thread_guard_and_subject(
         .query_map(params![account_id, thread_id], |row| row.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     super::agent_triage::ensure_agent_source_ids_conn(conn, account_id, &missing)?;
-    for id in ids {
-        if !external_message_allowed_conn(conn, account_id, id)? {
-            return Err(CoreError::NotFound);
-        }
-    }
-    conn.query_row(THREAD_SUBJECT_SQL, params![account_id, thread_id], |row| {
-        row.get(0)
-    })
-    .optional()?
-    .ok_or(CoreError::NotFound)
+    Ok(())
 }
 
 // Shared with the query-plan regression test: LIMIT 1 must seek the thread,
@@ -437,6 +449,7 @@ impl SqliteStore {
         Ok(true)
     }
 
+    /// Pure permission probe: human cache checks must never buy model work.
     pub fn external_thread_allowed(&self, account_id: AccountId, thread_id: &str) -> Result<bool> {
         let conn = self.lock()?;
         match thread_guard_and_subject(&conn, account_id, thread_id) {
@@ -460,6 +473,7 @@ impl SqliteStore {
 
     pub(super) fn thread_view(&self, account_id: AccountId, thread_id: &str) -> Result<ThreadView> {
         let conn = self.lock()?;
+        request_external_thread_access_conn(&conn, account_id, thread_id)?;
         let subject = thread_guard_and_subject(&conn, account_id, thread_id)?;
 
         // THE AGENT DOOR GETS NO SPAM AT ALL, not spam it is told to distrust.
@@ -980,7 +994,11 @@ impl SqliteStore {
             &tx,
             triaged.message.account_id,
             id,
-            "ingest",
+            if triaged.foreground_triage {
+                "ingest"
+            } else {
+                "backfill"
+            },
             triaged.notify_eligible_at.is_some(),
         )?;
 

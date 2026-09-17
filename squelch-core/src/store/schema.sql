@@ -1412,3 +1412,24 @@ CREATE TABLE IF NOT EXISTS notification_assessments (
 );
 CREATE INDEX IF NOT EXISTS idx_notification_assessments_latest
     ON notification_assessments(account_id, message_id, lane, id DESC);
+
+-- Scheduling metadata stays separate from the immutable request/run history.
+CREATE TABLE IF NOT EXISTS agent_job_lanes (
+    job_id INTEGER PRIMARY KEY REFERENCES agent_triage_jobs(id) ON DELETE CASCADE,
+    foreground INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS agent_triage_followups (
+    job_id INTEGER PRIMARY KEY REFERENCES agent_triage_jobs(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    trigger TEXT NOT NULL,
+    arrival_eligible INTEGER NOT NULL DEFAULT 0
+);
+-- FYE is a thread-level human choice, so a sibling cannot undo the correction.
+CREATE TABLE IF NOT EXISTS agent_thread_preferences (
+    account_id INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    show_in_fye INTEGER NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,thread_id)
+);

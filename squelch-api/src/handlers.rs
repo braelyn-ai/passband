@@ -2269,7 +2269,9 @@ pub async fn get_usage(
                 state.stage2_price_in_per_mtok,
                 state.stage2_price_out_per_mtok,
             )
-        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY {
+        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY
+            || name == squelch_core::triage::access::USAGE_CATEGORY
+        {
             (
                 state.notify_model.as_ref(),
                 state.notify_price_in_per_mtok,
@@ -2436,11 +2438,12 @@ async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiEr
         "agent": {
             "budget_unit": "bounded_investigation",
             "daily_run_cap": state.triage_config.agent.daily_run_cap,
-            "effective_daily_run_cap": global.min(stage1_global).min(state.triage_config.agent.daily_run_cap),
+            "effective_daily_run_cap": state.triage_config.agent.daily_run_cap,
+            "background_daily_run_cap": state.triage_config.agent.background_daily_run_cap,
+            "effective_background_daily_run_cap": state.triage_config.agent.effective_background_daily_run_cap(),
+            "reserved_arrival_runs": state.triage_config.agent.daily_run_cap - state.triage_config.agent.effective_background_daily_run_cap(),
             "max_model_turns": state.triage_config.agent.max_model_turns,
-            "thread_daily_run_cap": thread,
-            "sender_daily_run_cap": sender,
-            "legacy_stage_caps_are_active_ceilings": true,
+            "legacy_stage_caps_are_active_ceilings": false,
         },
         "sources": {
             "thread_daily_cap": cap_source_str(overrides.thread_daily_cap.is_some(), src.thread_daily_cap),

@@ -1,6 +1,8 @@
 # Triage audit follow-up
 
-This records fixes to the pre-merge audit. The worktree is not deployed.
+This records the first audit at checkpoint `4b7099d`. A second review found
+further issues; the stabilization work and explicitly deferred items are tracked
+in [TRIAGE-STABILIZATION.md](TRIAGE-STABILIZATION.md). The worktree is not deployed.
 Operational settings and daemon-first rollout are in
 [TRIAGE-OPERATIONS.md](TRIAGE-OPERATIONS.md).
 

@@ -1943,6 +1943,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // is on, and that fact is the whole decision.
         triaged.notify_eligible_at =
             notify_eligible_stamp(&triaged, origin, &self.config.notify, now);
+        triaged.foreground_triage = origin == IngestOrigin::Incremental
+            && !triaged.message.is_sent
+            && !triaged.message.is_spam;
         let id = self.store.ingest_message(&triaged)?;
         // Embeddings are internal evidence. Agent search separately checks the
         // current access assessment before releasing results.
@@ -4585,6 +4588,222 @@ mod tests {
         );
         server.abort();
     }
+    #[tokio::test]
+    async fn access_jobs_make_one_small_model_call_without_placement_or_fanout() {
+        use crate::store::agent_triage::AgentTriageStore;
+        for extra_field in [false, true] {
+            let (store, account) = store_at_cursor(Some(100));
+            let fetched = fixture(
+                account,
+                "legacy-access",
+                "From: alice@example.com\r\nSubject: Old note\r\n\r\nHello",
+                false,
+            );
+            let parsed =
+                ingest_with_rules(&fetched, &Stage1Config::default(), Utc::now(), &[], |_| {
+                    false
+                });
+            let id = store.upsert_message(&parsed.message).unwrap();
+            let mut sibling = parsed.message.clone();
+            sibling.gmail_msg_id = "unseen-sibling".into();
+            sibling.body = "SIBLING_MUST_NOT_ENTER_ACCESS_PROMPT".into();
+            store.upsert_message(&sibling).unwrap();
+            store
+                .enqueue_agent_triage(account, id, "source_access", false)
+                .unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = calls.clone();
+            let app=Router::new().route("/",axum::routing::post(move |Json(request):Json<serde_json::Value>| {
+                let counted=counted.clone();
+                async move {
+                    counted.fetch_add(1,Ordering::Relaxed);
+                    assert_eq!(request["model"],"access-test-model");
+                    assert!(!request.to_string().contains("SIBLING_MUST_NOT_ENTER_ACCESS_PROMPT"));
+                    assert!(request["response_format"]["json_schema"]["schema"]["properties"]["destinations"].is_null());
+                    let mut verdict=json!({"restricted":false,"reason":"No actionable authentication material"});
+                    if extra_field { verdict["destinations"]=json!(["reading"]); }
+                    Json(json!({"choices":[{"message":{"content":verdict.to_string()},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":20,"completion_tokens":10}}))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let llm = ResolvedLlm {
+                url: format!("http://{}/", listener.local_addr().unwrap()),
+                api_key: "test".into(),
+                provider: Stage2Provider::OpenAI,
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut config = Config::default();
+            config.notify.model = "access-test-model".into();
+            let engine = engine_with_config(store.clone(), account, "http://127.0.0.1:1", config);
+            let job = store
+                .claim_agent_job(account, "investigation", Utc::now(), 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.kind, "access");
+            engine
+                .process_agent_job(
+                    job.clone(),
+                    &llm,
+                    &Utc::now().format("%Y-%m-%d").to_string(),
+                )
+                .await;
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                1,
+                "no tools or repair turns in access contract"
+            );
+            assert_eq!(
+                store.agent_access_allowed(account, id).unwrap(),
+                !extra_field
+            );
+            let context = store.load_agent_context(&job).unwrap();
+            assert!(context.previous_decision.is_none());
+            assert!(context.attention.is_none());
+            assert!(store.agent_reading(account, 20).unwrap().is_empty());
+            assert!(store.agent_records(account, 20).unwrap().is_empty());
+            assert_eq!(
+                store.agent_diagnostics(account, id).unwrap()["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let usage = store.list_usage_by_category(account, 1).unwrap();
+            let access = usage
+                .iter()
+                .find(|(name, _)| name == crate::triage::access::USAGE_CATEGORY)
+                .unwrap();
+            assert_eq!(
+                access.1.iter().map(|row| row.calls).sum::<u64>(),
+                1,
+                "invalid paid output still records usage"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn investigation_timeouts_exhaust_the_job_without_pausing_other_mail() {
+        use crate::store::agent_triage::AgentTriageStore;
+        let (store, account) = store_at_cursor(Some(100));
+        let id = ingest_into(
+            &store,
+            account,
+            &fixture(
+                account,
+                "timeout-mail",
+                "From: alice@example.com\r\nSubject: Slow\r\n\r\nA note",
+                false,
+            ),
+            Utc::now(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let app = Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Json(json!({}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm = ResolvedLlm {
+            url: format!("http://{}/", listener.local_addr().unwrap()),
+            api_key: "test".into(),
+            provider: Stage2Provider::OpenAI,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut config = Config::default();
+        config.triage.agent.timeout_secs = 1;
+        config.triage.agent.max_attempts = 2;
+        let engine = engine_with_config(store.clone(), account, "http://127.0.0.1:1", config);
+        let day = Utc::now().format("%Y-%m-%d").to_string();
+        for attempt in 1..=2 {
+            let job = store
+                .claim_agent_job(
+                    account,
+                    "investigation",
+                    Utc::now() + ChronoDuration::hours(1),
+                    120,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.attempts, attempt);
+            engine.process_agent_job(job, &llm, &day).await;
+            assert_eq!(engine.agent_retry_after.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            store
+                .stage2_budget_used(account, GLOBAL_BUDGET_KEY, &day)
+                .unwrap(),
+            2,
+            "timed-out requests have uncertain billing, so are not refunded"
+        );
+        assert!(
+            store
+                .claim_agent_job(
+                    account,
+                    "investigation",
+                    Utc::now() + ChronoDuration::days(2),
+                    120
+                )
+                .unwrap()
+                .is_none()
+        );
+        let diagnostics = store.agent_diagnostics(account, id).unwrap().to_string();
+        assert!(diagnostics.contains("agent_timeout"));
+        assert!(diagnostics.contains("\"state\":\"failed\""));
+        server.abort();
+    }
+
+    #[test]
+    fn incremental_origin_not_date_freshness_controls_reserved_triage_capacity() {
+        use crate::store::agent_triage::AgentTriageStore;
+        let (store, account) = store_at_cursor(Some(100));
+        let engine = engine(store.clone(), account, "http://127.0.0.1:1");
+        let raw = "From: alice@example.com\r\nDate: Tue, 01 Jan 2019 12:00:00 +0000\r\nSubject: Note\r\n\r\nHello";
+        engine
+            .ingest_one(
+                &fixture(account, "historical", raw, false),
+                &[],
+                Utc::now(),
+                IngestOrigin::Backfill,
+            )
+            .unwrap();
+        engine
+            .ingest_one(
+                &fixture(account, "new-with-old-date", raw, false),
+                &[],
+                Utc::now(),
+                IngestOrigin::Incremental,
+            )
+            .unwrap();
+        let job = store
+            .claim_agent_job(account, "investigation", Utc::now(), 120)
+            .unwrap()
+            .unwrap();
+        assert!(
+            job.foreground,
+            "freshly discovered incremental mail has reserved capacity regardless of sender Date"
+        );
+        assert!(!job.arrival_eligible, "push freshness is a separate policy");
+        store.fail_agent_job(&job, "test").unwrap();
+        let historical = store
+            .claim_agent_job(account, "investigation", Utc::now(), 120)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !historical.foreground,
+            "initial backfill must use the background sub-cap"
+        );
+    }
+
     #[tokio::test]
     async fn provider_outage_preserves_attempts_refunds_rejection_and_recovers() {
         use crate::store::agent_triage::AgentTriageStore;

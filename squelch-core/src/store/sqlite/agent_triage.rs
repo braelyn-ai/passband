@@ -176,9 +176,10 @@ fn corrections(
     account: AccountId,
     message: i64,
 ) -> Result<Vec<serde_json::Value>> {
-    let mut stmt=conn.prepare("SELECT c.field,c.value_json,c.revision FROM agent_triage_corrections c JOIN
-             agent_message_state a ON a.account_id=c.account_id AND a.message_id=c.message_id AND
-             a.revision=c.source_revision WHERE c.account_id=?1 AND c.message_id=?2 ORDER BY c.field")?;
+    let mut stmt = conn.prepare(
+        "SELECT c.field,c.value_json,c.revision FROM agent_triage_corrections c
+             WHERE c.account_id=?1 AND c.message_id=?2 ORDER BY c.field",
+    )?;
     let rows = stmt
         .query_map(params![account, message], |r| {
             Ok((
@@ -254,6 +255,38 @@ fn apply_correction(
     }
     Ok(())
 }
+pub(super) fn explicit_access_override(
+    conn: &Connection,
+    account: AccountId,
+    message: i64,
+) -> Result<Option<bool>> {
+    let encoded: Option<String> = conn.query_row("SELECT value_json FROM agent_triage_corrections WHERE account_id=?1 AND message_id=?2 AND field='external_access'",
+        params![account,message],|row|row.get(0)).optional()?;
+    encoded.as_deref().map(decode).transpose()
+}
+
+fn thread_fye_override(
+    conn: &Connection,
+    account: AccountId,
+    thread: &str,
+) -> Result<Option<bool>> {
+    let explicit: Option<bool> = conn
+        .query_row(
+            "SELECT show_in_fye FROM agent_thread_preferences WHERE account_id=?1 AND thread_id=?2",
+            params![account, thread],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    // Existing beta corrections predate the thread preference table.
+    let encoded: Option<String> = conn.query_row("SELECT c.value_json FROM agent_triage_corrections c JOIN messages m ON m.account_id=c.account_id AND m.id=c.message_id
+        WHERE c.account_id=?1 AND m.thread_id=?2 AND c.field='show_in_fye' ORDER BY c.updated_at DESC,c.revision DESC,c.message_id DESC LIMIT 1",
+        params![account,thread],|row|row.get(0)).optional()?;
+    encoded.as_deref().map(decode).transpose()
+}
+
 fn apply_corrections(
     conn: &Connection,
     account: AccountId,
@@ -266,6 +299,10 @@ fn apply_corrections(
             correction["field"].as_str().unwrap_or(""),
             &correction["value"],
         )?;
+    }
+    let thread = read_message(conn, account, message)?.thread_id;
+    if let Some(show) = thread_fye_override(conn, account, &thread)? {
+        decision.attention.show_in_fye = show;
     }
     Ok(())
 }
@@ -291,6 +328,13 @@ pub(super) fn correct_agent_triage_conn(
              VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(account_id,message_id,field) DO UPDATE SET
              value_json=excluded.value_json,source_revision=excluded.source_revision,revision=agent_triage_corrections.revision+1,updated_at=excluded.updated_at",
         params![account,message,field,json(value)?,revision,now.to_rfc3339()])?;
+    if field == "show_in_fye" {
+        let thread = read_message(conn, account, message)?.thread_id;
+        conn.execute("INSERT INTO agent_thread_preferences(account_id,thread_id,show_in_fye,updated_at)
+             VALUES(?1,?2,?3,?4) ON CONFLICT(account_id,thread_id) DO UPDATE SET
+             show_in_fye=excluded.show_in_fye,revision=agent_thread_preferences.revision+1,updated_at=excluded.updated_at",
+            params![account,thread,value.as_bool().unwrap(),now.to_rfc3339()])?;
+    }
     let previous:Option<String>=conn.query_row("SELECT decision_json FROM agent_message_decisions WHERE account_id=?1 AND message_id=?2",
         params![account,message],
         |r|r.get(0)).optional()?;
@@ -342,6 +386,112 @@ pub(super) fn correct_agent_triage_conn(
     Ok(())
 }
 
+/// Merge immediate work without resetting its retry state. Autonomous timers
+/// remain separate requests governed by the bounded revisit scheduler.
+#[allow(clippy::too_many_arguments)] // One durable work request and its scheduling metadata.
+fn queue_investigation(
+    conn: &Connection,
+    account: AccountId,
+    message: i64,
+    revision: i64,
+    kind: &str,
+    trigger: &str,
+    eligible: bool,
+    foreground: bool,
+) -> Result<()> {
+    let existing: Option<(i64,String,String,String)> = conn.query_row(
+        "SELECT id,state,kind,trigger FROM agent_triage_jobs WHERE account_id=?1 AND message_id=?2 AND input_revision=?3
+         AND kind IN ('triage','access') AND trigger NOT LIKE 'revisit:%'
+         ORDER BY CASE state WHEN 'leased' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END,id DESC LIMIT 1",
+        params![account,message,revision],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    ).optional()?;
+    if let Some((id, state, existing_kind, existing_trigger)) = existing {
+        let kind = if kind == "triage" || existing_kind == "triage" {
+            "triage"
+        } else {
+            "access"
+        };
+        if state == "leased" {
+            conn.execute("INSERT INTO agent_triage_followups(job_id,kind,trigger,arrival_eligible) VALUES(?1,?2,?3,?4)
+                ON CONFLICT(job_id) DO UPDATE SET kind=CASE WHEN kind='triage' OR excluded.kind='triage' THEN 'triage' ELSE 'access' END,
+                trigger=excluded.trigger,arrival_eligible=MAX(arrival_eligible,excluded.arrival_eligible)",params![id,kind,trigger,eligible])?;
+            return Ok(());
+        }
+        if ((state == "completed" && existing_trigger != trigger)
+            || (state == "failed" && trigger.starts_with("manual:") && existing_trigger != trigger))
+            && !matches!(trigger, "ingest" | "arrival" | "backfill" | "source_access")
+        {
+            conn.execute("UPDATE agent_triage_jobs SET state='queued',kind=?2,trigger=?3,attempts=0,available_at=?4,last_error=NULL WHERE id=?1",
+                params![id,kind,trigger,Utc::now().to_rfc3339()])?;
+            conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,0) ON CONFLICT(job_id) DO UPDATE SET foreground=0",[id])?;
+            return Ok(());
+        }
+        if state == "completed" {
+            return Ok(());
+        }
+        if state == "queued" || state == "failed" {
+            // Keep backoff, attempts and terminal failure intact across trigger
+            // churn. A real content revision creates a new input instead.
+            conn.execute("UPDATE agent_triage_jobs SET kind=?2,trigger=?3,arrival_eligible=MAX(arrival_eligible,?4) WHERE id=?1",
+                params![id,kind,trigger,eligible])?;
+            conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,?2) ON CONFLICT(job_id) DO UPDATE SET foreground=MAX(foreground,excluded.foreground)",params![id,foreground])?;
+            return Ok(());
+        }
+    }
+    conn.execute("INSERT INTO agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,arrival_eligible,available_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING",
+        params![account,message,kind,trigger,revision,eligible,Utc::now().to_rfc3339()])?;
+    conn.execute("INSERT INTO agent_job_lanes(job_id,foreground)
+        SELECT id,?6 FROM agent_triage_jobs WHERE account_id=?1 AND message_id=?2 AND kind=?3 AND trigger=?4 AND input_revision=?5
+        ON CONFLICT(job_id) DO UPDATE SET foreground=MAX(foreground,excluded.foreground)",params![account,message,kind,trigger,revision,foreground])?;
+    Ok(())
+}
+
+fn absorb_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
+    conn.execute("UPDATE agent_triage_jobs SET
+        kind=CASE WHEN kind='triage' OR (SELECT kind FROM agent_triage_followups WHERE job_id=?1)='triage' THEN 'triage' ELSE kind END,
+        trigger=COALESCE((SELECT trigger FROM agent_triage_followups WHERE job_id=?1),trigger),
+        arrival_eligible=MAX(arrival_eligible,COALESCE((SELECT arrival_eligible FROM agent_triage_followups WHERE job_id=?1),0))
+        WHERE id=?1",[job.id])?;
+    conn.execute(
+        "DELETE FROM agent_triage_followups WHERE job_id=?1",
+        [job.id],
+    )?;
+    Ok(())
+}
+
+fn release_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
+    let followup: Option<(String, String, bool)> = conn
+        .query_row(
+            "SELECT kind,trigger,arrival_eligible FROM agent_triage_followups WHERE job_id=?1",
+            [job.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    conn.execute(
+        "DELETE FROM agent_triage_followups WHERE job_id=?1",
+        [job.id],
+    )?;
+    if let Some((kind, trigger, eligible)) = followup {
+        let revision: i64 = conn.query_row(
+            "SELECT input_revision FROM agent_triage_jobs WHERE id=?1",
+            [job.id],
+            |row| row.get(0),
+        )?;
+        queue_investigation(
+            conn,
+            job.account_id,
+            job.message_id,
+            revision,
+            &kind,
+            &trigger,
+            eligible,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 /// Call inside the message ingest transaction. Duplicate provider fetches leave
 /// revisions and notification eligibility untouched.
 pub(crate) fn enqueue_agent_triage_conn(
@@ -357,7 +507,18 @@ pub(crate) fn enqueue_agent_triage_conn(
         params![account,message],
         |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let changed = previous.as_ref().is_none_or(|p| p.0 != snapshot);
-    if !changed && matches!(trigger, "arrival" | "ingest") {
+    if !changed && matches!(trigger, "arrival" | "ingest" | "backfill") {
+        if trigger != "backfill"
+            && previous.as_ref().is_some_and(|p| p.1 == 1)
+            && !m.is_sent
+            && !m.is_spam
+        {
+            conn.execute("INSERT INTO agent_job_lanes(job_id,foreground)
+                SELECT j.id,1 FROM agent_triage_jobs j WHERE j.account_id=?1 AND j.message_id=?2
+                  AND j.input_revision=1 AND j.kind='triage' AND j.state IN ('queued','leased')
+                  AND NOT EXISTS(SELECT 1 FROM agent_message_decisions d WHERE d.account_id=?1 AND d.message_id=?2)
+                ON CONFLICT(job_id) DO UPDATE SET foreground=1",params![account,message])?;
+        }
         return Ok(());
     }
     let revision = previous
@@ -371,6 +532,24 @@ pub(crate) fn enqueue_agent_triage_conn(
              agent_message_state.content_snapshot!=excluded.content_snapshot THEN 'pending' ELSE
              agent_message_state.access END",
         params![account, message, snapshot, revision],
+    )?;
+    if let Some(restricted) = explicit_access_override(conn, account, message)? {
+        conn.execute(
+            "UPDATE agent_message_state SET access=?3 WHERE account_id=?1 AND message_id=?2",
+            params![
+                account,
+                message,
+                if restricted { "restricted" } else { "allowed" }
+            ],
+        )?;
+    }
+    // Healing an unclassified arrival must not move its first classification
+    // into the migration budget. Once any decision exists, later work is refresh.
+    let unclassified_arrival: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_triage_jobs j JOIN agent_job_lanes l ON l.job_id=j.id
+             WHERE j.account_id=?1 AND j.message_id=?2 AND l.foreground=1)
+         AND NOT EXISTS(SELECT 1 FROM agent_message_decisions WHERE account_id=?1 AND message_id=?2)",
+        params![account,message], |row| row.get(0),
     )?;
     let now = Utc::now().to_rfc3339();
     let pending_arrival: bool = conn.query_row(
@@ -389,6 +568,7 @@ pub(crate) fn enqueue_agent_triage_conn(
         conn.execute("UPDATE agent_triage_jobs SET state='completed',lease_token=NULL,lease_until=NULL WHERE
              account_id=?1 AND message_id=?2 AND input_revision!=?3 AND state IN ('queued','leased')",
         params![account,message,revision])?;
+        conn.execute("DELETE FROM agent_triage_followups WHERE job_id IN (SELECT id FROM agent_triage_jobs WHERE account_id=?1 AND message_id=?2 AND input_revision!=?3)",params![account,message,revision])?;
     }
     let kind = if m.is_sent || m.is_spam || trigger == "source_access" {
         "access"
@@ -397,11 +577,16 @@ pub(crate) fn enqueue_agent_triage_conn(
     };
     let new_arrival = arrival_eligible && previous.is_none();
     let eligible = (new_arrival || (changed && pending_arrival)) && !m.is_sent && !m.is_spam;
-    conn.execute("INSERT INTO
-             agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,arrival_eligible,available_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(account_id,message_id,kind,input_revision,trigger)
-             DO NOTHING",
-        params![account,message,kind,trigger,revision,eligible,now])?;
+    let foreground = kind == "triage"
+        && (unclassified_arrival || (revision == 1 && matches!(trigger, "ingest" | "arrival")));
+    if trigger.starts_with("revisit:") {
+        conn.execute("INSERT INTO agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,arrival_eligible,available_at)
+            VALUES(?1,?2,?3,?4,?5,0,?6) ON CONFLICT DO NOTHING",params![account,message,kind,trigger,revision,now])?;
+    } else {
+        queue_investigation(
+            conn, account, message, revision, kind, trigger, eligible, foreground,
+        )?;
+    }
     if eligible && (new_arrival || pending_notification) {
         conn.execute("INSERT INTO
              agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,arrival_eligible,available_at)
@@ -550,6 +735,7 @@ fn finish(
         params![job.id,job.account_id])?;
     conn.execute("INSERT INTO agent_triage_runs(job_id,account_id,message_id,outcome,completed_at,metadata_json) VALUES(?1,?2,?3,?4,?5,?6)",
         params![job.id,job.account_id,job.message_id,outcome,Utc::now().to_rfc3339(),json(metadata)?])?;
+    release_followup(conn, job)?;
     Ok(())
 }
 
@@ -783,8 +969,9 @@ impl AgentTriageStore for SqliteStore {
         let token: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
         let until = (now + Duration::seconds(lease_seconds)).to_rfc3339();
         let row = tx.query_row(
-            "SELECT j.id,j.message_id,j.trigger,j.attempts,j.arrival_eligible,j.kind
+            "SELECT j.id,j.message_id,j.trigger,j.attempts,j.arrival_eligible,j.kind,COALESCE(lane.foreground,0)
              FROM agent_triage_jobs j JOIN messages candidate ON candidate.account_id=j.account_id AND candidate.id=j.message_id
+             LEFT JOIN agent_job_lanes lane ON lane.job_id=j.id
              WHERE j.account_id=?1 AND (j.kind=?2 OR (?2 IN ('investigation','initial_investigation') AND j.kind IN ('triage','access')))
                AND (?2!='initial_investigation' OR j.trigger NOT LIKE 'revisit:%')
                AND j.available_at<=?3 AND (j.state='queued' OR (j.state='leased' AND j.lease_until<=?3))
@@ -793,13 +980,15 @@ impl AgentTriageStore for SqliteStore {
                    WHERE active.account_id=j.account_id AND active.kind IN ('triage','access')
                      AND active.state='leased' AND active.lease_until>?3 AND active.id!=j.id
                      AND other.thread_id=candidate.thread_id))
-             ORDER BY j.arrival_eligible DESC,
+             ORDER BY COALESCE(lane.foreground,0) DESC,j.arrival_eligible DESC,
                CASE WHEN j.trigger IN ('arrival','ingest') THEN 0 WHEN j.trigger='migration' THEN 2 ELSE 1 END,
                j.available_at,j.id LIMIT 1",
             params![account,kind,now.to_rfc3339()],
-            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?)),
+            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?,r.get::<_,bool>(6)?)),
         ).optional()?;
-        let Some((id, message_id, trigger, attempts, arrival_eligible, claimed_kind)) = row else {
+        let Some((id, message_id, trigger, attempts, arrival_eligible, claimed_kind, foreground)) =
+            row
+        else {
             return Ok(None);
         };
         tx.execute(
@@ -817,10 +1006,50 @@ impl AgentTriageStore for SqliteStore {
             lease_token: token,
             attempts: attempts + 1,
             arrival_eligible,
+            foreground,
         }))
     }
     fn load_agent_context(&self, job: &AgentJob) -> Result<AgentContext> {
         context(&*self.lock()?, job.account_id, job.message_id)
+    }
+    fn load_agent_access_message(&self, job: &AgentJob) -> Result<AgentMessage> {
+        let conn = self.lock()?;
+        if job.kind != "access" || !leased(&conn, job)? {
+            return Err(CoreError::NotFound);
+        }
+        read_message(&conn, job.account_id, job.message_id)
+    }
+    fn commit_agent_access(
+        &self,
+        job: &AgentJob,
+        original: &AgentMessage,
+        decision: &crate::triage::access::AccessDecision,
+        metadata: &serde_json::Value,
+    ) -> Result<AgentCommitOutcome> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        if job.kind != "access" || !leased(&tx, job)? {
+            return Ok(AgentCommitOutcome::Stale);
+        }
+        let current = read_message(&tx, job.account_id, job.message_id)?;
+        // Access depends on this message's content and explicit restriction,
+        // not its siblings, opened stamp or attention representation.
+        if current.source.content != original.source.content {
+            return Ok(AgentCommitOutcome::Stale);
+        }
+        let restricted = explicit_access_override(&tx, job.account_id, job.message_id)?
+            .unwrap_or(decision.restricted);
+        tx.execute(
+            "UPDATE agent_message_state SET access=?3 WHERE account_id=?1 AND message_id=?2",
+            params![
+                job.account_id,
+                job.message_id,
+                if restricted { "restricted" } else { "allowed" }
+            ],
+        )?;
+        finish(&tx, job, "access_applied", metadata)?;
+        tx.commit()?;
+        Ok(AgentCommitOutcome::Applied)
     }
     fn complete_agent_job(&self, job: &AgentJob) -> Result<bool> {
         let mut conn = self.lock()?;
@@ -838,10 +1067,19 @@ impl AgentTriageStore for SqliteStore {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
             .take(64)
             .collect();
-        let conn = self.lock()?;
-        Ok(conn.execute("UPDATE agent_triage_jobs SET state='failed',last_error=?1,lease_token=NULL,lease_until=NULL
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute("UPDATE agent_triage_jobs SET state='failed',last_error=?1,lease_token=NULL,lease_until=NULL
              WHERE id=?2 AND account_id=?3 AND state='leased' AND lease_token=?4",
-        params![code,job.id,job.account_id,job.lease_token])?==1)
+        params![code,job.id,job.account_id,job.lease_token])? == 1;
+        if changed {
+            tx.execute(
+                "DELETE FROM agent_triage_followups WHERE job_id=?1",
+                [job.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
     fn retry_agent_job(
         &self,
@@ -855,11 +1093,17 @@ impl AgentTriageStore for SqliteStore {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
             .take(64)
             .collect();
-        let conn = self.lock()?;
-        Ok(conn.execute("UPDATE agent_triage_jobs SET
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let changed = tx.execute("UPDATE agent_triage_jobs SET
              state='queued',available_at=?1,last_error=?2,lease_token=NULL,lease_until=NULL WHERE id=?3
              AND account_id=?4 AND state='leased' AND lease_token=?5",
-        params![retry_at.to_rfc3339(),code,job.id,job.account_id,job.lease_token])?==1)
+        params![retry_at.to_rfc3339(),code,job.id,job.account_id,job.lease_token])? == 1;
+        if changed {
+            absorb_followup(&tx, job)?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
     fn defer_agent_job(
         &self,
@@ -872,10 +1116,11 @@ impl AgentTriageStore for SqliteStore {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
             .take(64)
             .collect();
-        let conn = self.lock()?;
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
         // A lease may be refunded only once. A stale worker cannot change the
         // attempt count or schedule after another worker has claimed the job.
-        Ok(conn.execute(
+        let changed = tx.execute(
             "UPDATE agent_triage_jobs SET state='queued',available_at=?1,last_error=?2,
                  attempts=MAX(attempts-1,0),lease_token=NULL,lease_until=NULL
              WHERE id=?3 AND account_id=?4 AND state='leased' AND lease_token=?5",
@@ -886,7 +1131,12 @@ impl AgentTriageStore for SqliteStore {
                 job.account_id,
                 job.lease_token
             ],
-        )? == 1)
+        )? == 1;
+        if changed {
+            absorb_followup(&tx, job)?;
+        }
+        tx.commit()?;
+        Ok(changed)
     }
     fn commit_agent_decision(
         &self,
@@ -1335,6 +1585,9 @@ fn apply_attention(
         }
     }
     let mut attention = attention.clone();
+    if let Some(show) = thread_fye_override(conn, account, thread)? {
+        attention.show_in_fye = show;
+    }
     for action in &mut attention.actions {
         if action.id.is_none() {
             action.id =
@@ -1470,6 +1723,13 @@ fn list_items(
         )
         .collect::<Result<_>>()?;
     if destination == "fye" {
+        let mut visible = Vec::new();
+        for item in items {
+            if thread_fye_override(conn, account, &item.thread_id)? != Some(false) {
+                visible.push(item);
+            }
+        }
+        items = visible;
         append_due_reminders(conn, account, &mut items)?;
     }
     Ok(items)
@@ -1504,6 +1764,9 @@ fn append_due_reminders(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for (id, thread, sender, subject, received, reminded, encoded) in rows {
+        if thread_fye_override(conn, account, &thread)? == Some(false) {
+            continue;
+        }
         if items.iter().any(|item| item.thread_id == thread) {
             continue;
         }
@@ -1591,6 +1854,323 @@ mod tests {
         let context = store.load_agent_context(&job).unwrap();
         (job, context)
     }
+    #[test]
+    fn restrictions_and_destination_corrections_survive_content_revision() {
+        let store = fixture();
+        let (job, _) = claim(&store, 1);
+        store
+            .correct_agent_triage(
+                1,
+                1,
+                "external_access",
+                &serde_json::json!(true),
+                Utc::now(),
+            )
+            .unwrap();
+        store
+            .correct_agent_triage_delta(1, 1, "destinations", &[], &["reading".into()], Utc::now())
+            .unwrap();
+        // Simulate blank-body healing or provider re-fetch, both bump content.
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE messages SET body='healed body' WHERE id=1", [])
+            .unwrap();
+        store.enqueue_agent_triage(1, 1, "ingest", false).unwrap();
+        assert!(
+            !store.agent_access_allowed(1, 1).unwrap(),
+            "a human restriction must remain effective before the next model call"
+        );
+        let next = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_ne!(job.id, next.id);
+        let ctx = store.load_agent_context(&next).unwrap();
+        assert_eq!(ctx.corrections.len(), 2);
+        let sources = store.snapshot_agent_sources(1, &[1]).unwrap();
+        assert_eq!(
+            store
+                .commit_agent_decision(&next, &ctx, &decision(1), &sources)
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        assert!(
+            !store.agent_access_allowed(1, 1).unwrap(),
+            "model allowed cannot override human restricted"
+        );
+        assert!(store.agent_reading(1, 10).unwrap().is_empty());
+        // Repair the pre-stabilization leak even before the next assessment.
+        store.lock().unwrap().execute("UPDATE agent_message_state SET access='allowed' WHERE account_id=1 AND message_id=1",[]).unwrap();
+        assert!(
+            !store.agent_access_allowed(1, 1).unwrap(),
+            "read guard independently enforces durable human restrictions"
+        );
+    }
+
+    #[test]
+    fn body_healing_retains_initial_arrival_capacity_but_later_refresh_does_not() {
+        let store = fixture();
+        let (original, _) = claim(&store, 1);
+        assert!(original.foreground);
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE messages SET body='healed body' WHERE id=1", [])
+            .unwrap();
+        store.enqueue_agent_triage(1, 1, "backfill", false).unwrap();
+        let healed = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!(healed.foreground);
+        let ctx = store.load_agent_context(&healed).unwrap();
+        store
+            .commit_agent_decision(
+                &healed,
+                &ctx,
+                &decision(1),
+                std::slice::from_ref(&ctx.message.source),
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET body='a later content correction' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        store.enqueue_agent_triage(1, 1, "ingest", false).unwrap();
+        let refresh = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!(!refresh.foreground);
+    }
+
+    #[test]
+    fn sibling_attention_cannot_undo_human_thread_exclusion() {
+        let store = fixture();
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE messages SET thread_id='one' WHERE id=2", [])
+            .unwrap();
+        let (job, ctx) = claim(&store, 1);
+        store
+            .commit_agent_decision(
+                &job,
+                &ctx,
+                &decision(1),
+                std::slice::from_ref(&ctx.message.source),
+            )
+            .unwrap();
+        store
+            .correct_agent_triage(1, 1, "show_in_fye", &serde_json::json!(false), Utc::now())
+            .unwrap();
+        let (sibling, ctx) = claim(&store, 2);
+        store
+            .commit_agent_decision(
+                &sibling,
+                &ctx,
+                &decision(2),
+                std::slice::from_ref(&ctx.message.source),
+            )
+            .unwrap();
+        assert!(
+            !store
+                .agent_thread_context(1, "one")
+                .unwrap()
+                .attention
+                .unwrap()
+                .show_in_fye
+        );
+        assert!(
+            store
+                .agent_fye(1, 20, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trigger_bursts_coalesce_and_retries_do_not_reset_attempts() {
+        let store = fixture();
+        for i in 0..10 {
+            store
+                .enqueue_agent_triage(1, 1, &format!("thread_changed:{i}"), false)
+                .unwrap();
+        }
+        let count = || {
+            store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_triage_jobs WHERE kind IN ('triage','access')",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
+        let job = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        for i in 10..20 {
+            store
+                .enqueue_agent_triage(1, 1, &format!("thread_changed:{i}"), false)
+                .unwrap();
+        }
+        assert_eq!(count(), 1);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM agent_triage_followups", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        store
+            .retry_agent_job(&job, Utc::now() + Duration::hours(1), "context_changed")
+            .unwrap();
+        assert!(
+            store
+                .claim_agent_job(1, "investigation", Utc::now(), 60)
+                .unwrap()
+                .is_none()
+        );
+        let retried = store
+            .claim_agent_job(1, "investigation", Utc::now() + Duration::hours(2), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.id, job.id);
+        assert_eq!(retried.attempts, 2);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM agent_triage_followups", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        store.fail_agent_job(&retried, "exhausted").unwrap();
+        store
+            .enqueue_agent_triage(1, 1, "rule_changed:99", false)
+            .unwrap();
+        assert!(
+            store
+                .claim_agent_job(1, "investigation", Utc::now() + Duration::days(2), 60)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count(), 1);
+        store
+            .enqueue_agent_triage(1, 1, "manual:new-human-request", false)
+            .unwrap();
+        let manual = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manual.attempts, 1,
+            "only an explicit new manual request restarts failed work"
+        );
+        assert!(!manual.foreground);
+        store.complete_agent_job(&manual).unwrap();
+        store
+            .enqueue_agent_triage(1, 1, "manual:new-human-request", false)
+            .unwrap();
+        assert!(
+            store
+                .claim_agent_job(1, "investigation", Utc::now(), 60)
+                .unwrap()
+                .is_none(),
+            "repeating the same completed request is idempotent"
+        );
+    }
+
+    #[test]
+    fn leased_burst_releases_only_one_background_followup() {
+        let store = fixture();
+        let (job, _) = claim(&store, 1);
+        for i in 0..10 {
+            store
+                .enqueue_agent_triage(1, 1, &format!("thread_changed:{i}"), false)
+                .unwrap();
+        }
+        store.complete_agent_job(&job).unwrap();
+        let next = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!(!next.foreground);
+        store.complete_agent_job(&next).unwrap();
+        assert!(
+            store
+                .claim_agent_job(1, "investigation", Utc::now(), 60)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn access_commit_only_changes_access_and_honors_current_human_restriction() {
+        let store = fixture();
+        store
+            .enqueue_agent_triage(1, 1, "source_access", false)
+            .unwrap();
+        let job = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        let original = store.load_agent_access_message(&job).unwrap();
+        store
+            .correct_agent_triage(
+                1,
+                1,
+                "external_access",
+                &serde_json::json!(true),
+                Utc::now(),
+            )
+            .unwrap();
+        let decision = crate::triage::access::AccessDecision {
+            restricted: false,
+            reason: "No actionable auth".into(),
+        };
+        assert_eq!(
+            store
+                .commit_agent_access(&job, &original, &decision, &serde_json::json!({}))
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        assert!(!store.agent_access_allowed(1, 1).unwrap());
+        let conn = store.lock().unwrap();
+        for table in [
+            "agent_message_decisions",
+            "agent_thread_attention",
+            "agent_message_destinations",
+            "agent_decision_sources",
+        ] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0,
+                "access executor cannot populate {table}"
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM agent_triage_jobs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn first_related_attention_accepts_observed_revision_zero() {
         use crate::triage::decision::RelatedAttentionUpdate;
@@ -2806,8 +3386,9 @@ fn human_inventory(
             continue;
         }
         let selected = attention.as_ref().is_some_and(|a| a.show_in_fye);
-        let is_standing =
-            (selected && row.representative == Some(row.id)) || row.reminded.is_some();
+        let is_standing = ((selected && row.representative == Some(row.id))
+            || row.reminded.is_some())
+            && thread_fye_override(conn, account, &row.thread)? != Some(false);
         if let Some(band) = query.band {
             let visible = match band {
                 SitrepBand::Standing => is_standing && status != AttentionStatus::Done,

@@ -22,6 +22,9 @@ pub struct AgentConfig {
     pub worker_poll_secs: u64,
     /// Maximum investigations per account per UTC day; each run has its own turn cap.
     pub daily_run_cap: u32,
+    /// Background investigations share the total cap but cannot consume the
+    /// foreground reserve. Zero pauses background work; notification is separate.
+    pub background_daily_run_cap: u32,
     /// Failed investigations remain inspectable and can be explicitly retried.
     pub max_attempts: u32,
     /// Shared provider-outage circuit cooldown. Outages do not consume attempts.
@@ -39,9 +42,18 @@ impl Default for AgentConfig {
             concurrency: 2,
             worker_poll_secs: 1,
             daily_run_cap: 1000,
+            background_daily_run_cap: 200,
             max_attempts: 6,
             outage_retry_secs: 300,
         }
+    }
+}
+impl AgentConfig {
+    /// Always reserve at least one run for first classification when operators
+    /// lower only the total cap. Both effective values are exposed by the API.
+    pub fn effective_background_daily_run_cap(&self) -> u32 {
+        self.background_daily_run_cap
+            .min(self.daily_run_cap.saturating_sub(1))
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

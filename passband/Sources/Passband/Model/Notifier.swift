@@ -287,6 +287,11 @@ final class Notifier {
         drainPendingTap()
     }
 
+    func connectionBecameReady() {
+        tapQueue.connectionBecameReady()
+        drainPendingTap()
+    }
+
     /// Called only after the shared client has working credentials and the
     /// daemon's v2 contract has been verified. Failed connections retain taps.
     func drainPendingTap() {
@@ -310,7 +315,7 @@ final class Notifier {
             await AccountManager.shared.switchTo(account)
             guard AccountManager.shared.activeId == account, store.connStatus == .connected else {
                 // Retry after reconnect; a newer tap always wins.
-                if tapQueue.pending == nil { tapQueue.enqueue(tap.target, accountId: account) }
+                tapQueue.park(tap)
                 return
             }
             open(tap.target)

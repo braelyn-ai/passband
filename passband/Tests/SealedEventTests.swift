@@ -49,6 +49,20 @@ struct SealedEventTests {
         let delivered = taps.take(connected: true)
         expect(delivered?.target == 92 && delivered?.accountId == account, "Newest tap keeps its account through bootstrap")
         expect(taps.take(connected: true) == nil, "Ready transition drains each tap once")
+        taps.enqueue(93, accountId: account)
+        let failed = taps.take(connected: true)!
+        taps.park(failed)
+        for _ in 0..<3 {
+            expect(taps.take(connected: true) == nil, "Failed switch is not retried by recursive completion drains")
+        }
+        taps.connectionBecameReady()
+        expect(taps.take(connected: true)?.target == 93, "Successful connection enables one new attempt")
+        taps.park(failed)
+        taps.enqueue(94, accountId: account)
+        expect(taps.take(connected: true)?.target == 94, "A newer explicit tap supersedes a parked failure")
+        taps.enqueue(95, accountId: account)
+        taps.park(failed)
+        expect(taps.take(connected: true)?.target == 95, "A tap arriving during the failed switch is not overwritten or blocked")
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")

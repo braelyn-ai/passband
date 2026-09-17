@@ -16,6 +16,8 @@ pub struct AgentJob {
     pub lease_token: String,
     pub attempts: i64,
     pub arrival_eligible: bool,
+    /// First classification of a newly ingested ordinary message; independent of push eligibility.
+    pub foreground: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +165,14 @@ pub trait AgentTriageStore: Send + Sync {
         lease_seconds: i64,
     ) -> Result<Option<AgentJob>>;
     fn load_agent_context(&self, job: &AgentJob) -> Result<AgentContext>;
+    fn load_agent_access_message(&self, job: &AgentJob) -> Result<AgentMessage>;
+    fn commit_agent_access(
+        &self,
+        job: &AgentJob,
+        original: &AgentMessage,
+        decision: &crate::triage::access::AccessDecision,
+        metadata: &serde_json::Value,
+    ) -> Result<AgentCommitOutcome>;
     fn commit_agent_decision(
         &self,
         job: &AgentJob,

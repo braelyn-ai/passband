@@ -33,6 +33,9 @@ Model output owns categories, Reading/Records membership, thread-level FYE
 membership, extracted facts, auth classification, external access, and proposed
 revisits. Structural validation checks IDs, evidence, numeric ranges, and observed
 revisions. User done/snooze/corrections and completed actions remain authoritative.
+Corrections survive content revision changes; thread-level FYE choices apply to
+every sibling. External read guards independently honor human restrictions even
+if an older assessment was incorrectly marked allowed.
 Sender rules are supplied as preferences and may be overridden with an evidenced
 exception. Memory has a read-only context interface; no memory editor ships.
 
@@ -54,6 +57,7 @@ timeout_secs = 90
 concurrency = 2
 worker_poll_secs = 1
 daily_run_cap = 1000
+background_daily_run_cap = 200
 max_attempts = 6
 outage_retry_secs = 300
 
@@ -77,22 +81,37 @@ waiting_saturation_days = 7.0
 Environment overrides: `SQUELCH_TRIAGE_MODEL`, `SQUELCH_TRIAGE_REVIEW_MODEL`,
 `SQUELCH_TRIAGE_MAX_TURNS`, `SQUELCH_TRIAGE_MAX_TOOL_CALLS`,
 `SQUELCH_TRIAGE_TIMEOUT_SECS`, `SQUELCH_TRIAGE_CONCURRENCY`,
-`SQUELCH_TRIAGE_DAILY_RUN_CAP`, `SQUELCH_TRIAGE_MAX_ATTEMPTS`, and
+`SQUELCH_TRIAGE_DAILY_RUN_CAP`, `SQUELCH_TRIAGE_BACKGROUND_DAILY_RUN_CAP`,
+`SQUELCH_TRIAGE_MAX_ATTEMPTS`, and
 `SQUELCH_TRIAGE_OUTAGE_RETRY_SECS`. Other agent levers are configured in TOML. Scores order only agent-selected FYE threads;
 no weight or importance threshold can add a thread to FYE. Recency uses relevant
 message activity, never the time a background job ran.
 
 ### Spend and revisit limits
 
-The budget unit is one bounded investigation, including up to `max_model_turns`
-provider calls. It is not a token or dollar cap. Reservations atomically enforce
-all account, thread, sender, and (when applicable) revisit limits before any call.
-The effective account ceiling is the minimum of `triage.agent.daily_run_cap` and
-the existing stage-1 and stage-2 global caps. Existing per-tenant usage-page and
-warden overrides still apply, as do stage-2 thread and sender caps. With unchanged
-defaults, these ceilings are 120 investigations/account/day, 3/thread/day, and
-5/sender/day. Raising only the new 1000-run ceiling does not raise the other caps.
-`/client/triage-config` exposes the effective agent ceilings and budget unit.
+The budget unit remains one bounded model job, not a token or dollar cap. Full
+triage permits up to `max_model_turns` calls; an access-only job permits one call.
+The account total is `triage.agent.daily_run_cap` (default 1000). Background work
+also consumes `background_daily_run_cap` (default 200), within that total. Thus
+background cannot consume the last 800 runs reserved for new inbound mail.
+Unused arrival capacity is not loaned to background work. Setting the background
+cap to zero pauses background jobs. If only the total is lowered, the effective
+background cap is clamped to at most total minus one, retaining a reserve.
+
+Migration/backfill, sent-mail access, external-demand access, thread refreshes,
+and autonomous revisits are background work. First classification from incremental
+sync uses arrival capacity independently of the sender's Date header and push
+eligibility. The sync origin is persisted explicitly; an initial mailbox import
+cannot pretend to be new arrivals merely because its messages are newly stored.
+
+Legacy stage-1/stage-2 escalation caps, including per-thread/per-sender overrides,
+no longer gate agent triage. Their compatibility fields remain exposed but the
+agent config explicitly reports `legacy_stage_caps_are_active_ceilings: false`.
+Configure agent ceilings through the TOML/environment controls above; moving the
+usage-page and warden controls to a dollar budget is [follow-up #216](https://github.com/braelyn-ai/passband/issues/216).
+`/client/triage-config` reports the configured/effective background cap, total cap,
+and protected arrival capacity. When the true total is exhausted, mail stays
+human-readable and visibly pending until the next UTC day.
 
 The fast notification lane retains its separate `[notify].daily_cap` and
 `SQUELCH_NOTIFY_DAILY_CAP`; investigation backlog cannot consume that allowance.
@@ -102,7 +121,7 @@ overrides: `enabled`, `batch_per_cycle`, `daily_cap`, `max_per_message`,
 `max_per_message_lifetime`, `min_lead_hours`, `max_horizon_days`, and
 `dedupe_window_hours`. Defaults allow 4 pending revisits, 6 lifetime revisits,
 one-hour minimum lead, a 400-day horizon, 12-hour deduplication, and 50 revisit
-investigations/account/day, within the shared account/thread/sender ceilings.
+investigations/account/day, within the shared account/background ceilings.
 Timestamp changes do not evade lifetime limits. The retired deterministic
 `deadline_grace_hours` and `fye_stale_days` sweeps do not run in agent triage.
 
@@ -112,12 +131,19 @@ Jobs have leases, attempt counts, availability times, and bounded error codes.
 Invalid output and stale commits retry with exponential delay, then remain failed
 for inspection and manual re-triage. Observable output constraints get repair
 turns within the same investigation before consuming a new attempt. Provider
-configuration failures, transport failures, rate limits, server errors, and
-timeouts instead leave work pending and retry after the shared outage cooldown;
+configuration failures, transport failures, rate limits, and server errors
+instead leave work pending and retry after the shared outage cooldown;
 they do not consume the terminal-attempt allowance. A first-call configuration
 rejection refunds its budget reservation. Earlier paid calls remain charged.
-Daily budget exhaustion defers work to the next UTC day. Investigations for the
-same thread are serialized, including related-source assessment jobs.
+Whole-investigation and access-call deadlines are job-local failures: they consume
+retry attempts without pausing the account, and their uncertain spend is not
+refunded. Daily budget exhaustion defers work to the next UTC day. Investigations for the
+same thread are serialized, including related-source assessment jobs. Immediate
+requests coalesce by message/content revision, independent of trigger text.
+Changes during a lease accumulate at most one follow-up. Retry absorbs that
+follow-up into its existing attempt sequence; trigger churn never resets exhausted
+work. A new explicit manual retry can restart it. Scheduled revisits retain their
+separate bounded lifetime policy.
 Commits compare content, user-state, preference, and evidence revisions within a
 transaction. Stale output cannot replace newer user/model state. Passive listing
 changes do not invalidate investigations. Worker outcomes appear in
@@ -148,8 +174,13 @@ Reading includes promotional mail by default. Categories and destinations overla
 The embedded assistant and MCP use separate guarded reads that fail closed for
 pending/restricted sources and derivatives of those sources. Reading a legacy
 thread through an external agent queues missing access assessments in bounded
-batches; ordinary reads never reset exhausted jobs. Human TUI reads remain
-available while those assessments are pending.
+batches; ordinary reads never reset exhausted jobs. Human reads and cache probes
+never schedule model work. Access jobs use the configured small notification
+model with a separate one-call schema, no tools, no placements/records/attention,
+and no autonomous follow-ups. Input that cannot fit is rejected without granting
+access, rather than silently truncated. Its token usage is recorded separately as
+`agent_access`, using the notification model's price configuration. Human TUI
+reads remain available while assessments are pending.
 
 Record cards read canonical Receipt, Banking, Calendar and Delivery decisions;
 marketing cards read promotional Reading decisions. Model date-only deadlines
@@ -179,7 +210,10 @@ contracts, not the accuracy of a production model on a user's inbox.
    `pending_message_read`, then check pending-job and provider-error telemetry.
 3. Ship the matching desktop and mobile clients. A new client against an older
    daemon displays an explicit daemon-upgrade requirement; there is no legacy
-   placement fallback. Notification taps wait for an authenticated connection.
+   placement fallback. Temporary network/server failures retry automatically.
+   Account switches probe before changing active state. Notification taps wait
+   for an authenticated connection; failed switches park until a meaningful new
+   connection or explicit tap, without an immediate drain loop.
 4. Verify a fresh message progresses through notification assessment and triage,
    its push opens the exact message, and actionable auth appears in the shredder.
 

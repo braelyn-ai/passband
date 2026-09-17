@@ -62,3 +62,21 @@ func errText(_ error: Error, _ fallback: String) -> String {
     if let api = error as? APIError { return api.message }
     return fallback
 }
+
+/// A temporary outage is not evidence of an incompatible daemon. Keep retries
+/// bounded so a switch cannot hold the account picker indefinitely.
+struct CapabilityProbeRetry {
+    private var failures = 0
+    private static let delays: [TimeInterval] = [1, 3, 10]
+
+    static func isTransient(_ error: Error) -> Bool {
+        guard let error = error as? APIError else { return false }
+        return error.kind == .network || error.kind == .server
+    }
+
+    mutating func delay(after error: Error) -> TimeInterval? {
+        guard Self.isTransient(error), failures < Self.delays.count else { return nil }
+        defer { failures += 1 }
+        return Self.delays[failures]
+    }
+}

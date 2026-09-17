@@ -375,6 +375,20 @@ actor APIClient {
     /// host that answers but is not a daemon must fail the same way it fails at
     /// the Connect gate.
     func probe(baseURL: String, token: String) async throws {
+        var retry = CapabilityProbeRetry()
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await probeOnce(baseURL: baseURL, token: token)
+                return
+            } catch {
+                guard let delay = retry.delay(after: error) else { throw error }
+                try await Task.sleep(for: .seconds(delay))
+            }
+        }
+    }
+
+    private func probeOnce(baseURL: String, token: String) async throws {
         var base = baseURL
         while base.hasSuffix("/") { base.removeLast() }
         guard let url = URL(string: base + "/client/v2/capabilities") else {

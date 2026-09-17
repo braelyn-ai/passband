@@ -1148,6 +1148,7 @@ pub fn ingest(
     // Ingest records evidence. Only the triage agent assigns meaning, placement,
     // or external access. Legacy fields stay neutral until the new decision commits.
     TriagedMessage {
+        foreground_triage: false,
         message,
         recipients,
         recipient_addrs,

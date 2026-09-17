@@ -579,10 +579,16 @@ final class AppStore {
     // MARK: settings slice
     var connStatus: ConnStatus = .loading {
         didSet {
-            if connStatus == .connected { Notifier.shared.drainPendingTap() }
+            if connStatus == .connected { Notifier.shared.connectionBecameReady() }
         }
     }
-    var settings: ConnectionSettings?
+    var settings: ConnectionSettings? {
+        didSet {
+            capabilityRecoveryTask?.cancel()
+            capabilityRecoveryTask = nil
+        }
+    }
+    @ObservationIgnored private var capabilityRecoveryTask: Task<Void, Never>?
     var connError: String?
 
     /// A `passband://pair` link waiting to be acted on. ConnectView is its only
@@ -825,32 +831,8 @@ final class AppStore {
                 await APIClient.shared.configure(
                     baseURL: stored.serverURL, token: stored.apiToken)
                 settings = stored
-                do {
-                    try await APIClient.shared.requireAgentTriage()
-                } catch {
-                    connStatus = .error
-                    connError = Self.connectErrorText(error)
-                    return
-                }
-                connStatus = .connected
-                connError = nil
-                #if os(iOS)
-                    await PushRegistration.shared.registerAndSync()
-                #endif
-                // A link that arrived during boot (the app was LAUNCHED by one)
-                // races the keychain read and finds no Connect gate to land on.
-                // On the Mac it is not dropped for that: this install having an
-                // identity is precisely what makes the link an ADD rather than
-                // a re-pair, so it goes to the same sheet a link arriving a
-                // minute later would, parked for the sheet's ConnectView to
-                // read as it mounts. On the phone nothing presents that sheet,
-                // and a link left parked only goes stale — same policy as
-                // `receivePairLink`, it is dropped instead.
-                #if os(iOS)
-                    pairLink = nil
-                #else
-                    if pairLink != nil { addAccountSheetOpen = true }
-                #endif
+                recoverSavedConnection(stored, accountId: active.id)
+
             } else {
                 connStatus = .disconnected
             }
@@ -882,6 +864,47 @@ final class AppStore {
         if connStatus == .connected { addAccountSheetOpen = true }
     }
 
+    /// Keep a saved identity behind the loading gate during a temporary outage.
+    /// Each probe has bounded short retries; longer outages retry every 30s.
+    /// Credentials or account changes cancel this task and invalidate its result.
+    private func recoverSavedConnection(_ stored: ConnectionSettings, accountId: UUID) {
+        capabilityRecoveryTask?.cancel()
+        let recoveryEpoch = epoch
+        connStatus = .loading
+        capabilityRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                guard isCurrent(recoveryEpoch), AccountManager.shared.activeId == accountId else { return }
+                do {
+                    try await APIClient.shared.probe(baseURL: stored.serverURL, token: stored.apiToken)
+                    guard !Task.isCancelled, isCurrent(recoveryEpoch),
+                        AccountManager.shared.activeId == accountId else { return }
+                    connError = nil
+                    connStatus = .connected
+                    #if os(iOS)
+                        await PushRegistration.shared.registerAndSync()
+                        guard !Task.isCancelled, isCurrent(recoveryEpoch) else { return }
+                        pairLink = nil
+                    #else
+                        if pairLink != nil { addAccountSheetOpen = true }
+                    #endif
+                    return
+                } catch {
+                    guard !Task.isCancelled, isCurrent(recoveryEpoch),
+                        AccountManager.shared.activeId == accountId else { return }
+                    guard CapabilityProbeRetry.isTransient(error) else {
+                        connStatus = .error
+                        connError = Self.connectErrorText(error)
+                        return
+                    }
+                    connError = "Server temporarily unavailable. Retrying automatically…"
+                    do { try await Task.sleep(for: .seconds(30)) }
+                    catch { return }
+                }
+            }
+        }
+    }
+
     /// Verify candidate credentials and triage capabilities, then persist and connect.
     ///
     /// THE GATE'S path, and the first account's: it moves `connStatus`, which
@@ -894,6 +917,8 @@ final class AppStore {
     /// erase a label the account already had.
     @discardableResult
     func connect(serverURL: String, apiToken: String, label: String = "") async -> Bool {
+        capabilityRecoveryTask?.cancel()
+        capabilityRecoveryTask = nil
         connStatus = .connecting
         connError = nil
         // Probe with a throwaway config so a bad token never gets persisted.
@@ -1000,6 +1025,7 @@ final class AppStore {
             #if os(iOS)
                 await PushRegistration.shared.registerAndSync()
             #endif
+            Notifier.shared.connectionBecameReady()
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
@@ -1228,6 +1254,21 @@ final class AppStore {
             return false
         }
 
+        // Probe with the candidate credentials before changing the live client
+        // or any account state. Transient failures retry automatically; a
+        // failed switch leaves the working account and its drafts untouched.
+        do {
+            try await APIClient.shared.probe(baseURL: next.serverURL, token: next.apiToken)
+        } catch {
+            let why = Self.connectErrorText(error)
+            if currentWorldGone {
+                await tearDownToGate(error: why)
+            } else {
+                pushToast(why, .error)
+            }
+            return false
+        }
+
         // (3) From here, every answer still in flight belongs to the old
         //     account and every writer that captured the old epoch is inert.
         epoch &+= 1
@@ -1262,12 +1303,6 @@ final class AppStore {
         connError = nil
         await APIClient.shared.configure(baseURL: next.serverURL, token: next.apiToken)
         AccountManager.shared.markActive(record.id)
-        do {
-            try await APIClient.shared.requireAgentTriage()
-        } catch {
-            await tearDownToGate(error: Self.connectErrorText(error))
-            return false
-        }
         // AFTER `markActive`, deliberately: each ledger's UserDefaults key is
         // derived from the live account id, so reloading them with the
         // singletons in step (7) would have re-read the account that just went
@@ -1283,6 +1318,7 @@ final class AppStore {
         SitrepPoller.shared.start()
         Task { await refreshMail(.inbox) }
         Task { await refreshTrackingConfig() }
+        Notifier.shared.connectionBecameReady()
         return true
     }
 
