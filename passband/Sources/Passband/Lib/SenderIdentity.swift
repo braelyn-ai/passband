@@ -335,6 +335,94 @@ enum SenderID {
         return p.addr
     }
 
+    // MARK: - notification names
+
+    /// The name a NOTIFICATION shows for a sender. Never an address.
+    ///
+    /// `displayName` is the row's label, and a row may fall back to the raw
+    /// address: it sits in a column with room, beside an avatar, and the
+    /// address is at least exact. A banner is a different surface. Its title
+    /// is a few words in bold on a lock screen or over somebody's work, and
+    /// "bounce-1234-5678@em.brand.com" in that spot is not information, it is
+    /// noise the person has to read past to reach the summary. So this walks
+    /// the same evidence in the same order and REFUSES the last step, saying
+    /// the most specific readable thing it can instead:
+    ///
+    ///  1. A display name that is a name: not an address, not an undecoded
+    ///     encoded-word, not a robot word ("No Reply", "Notifications").
+    ///     A display name that is the domain spelled out ("acme.com") is the
+    ///     brand and reads as one.
+    ///  2. A brand's local-part as given ("eBay").
+    ///  3. A robot mailbox's domain label ("Stripe").
+    ///  4. A dotted human local-part, humanized: sarah.chen@ -> "Sarah Chen".
+    ///  5. Anything else at a real domain: the domain's label ("Acme"). The
+    ///     summary under it says what the mail is about; the tap opens the
+    ///     thread with the exact address in it.
+    ///  6. A consumer mailbox with an opaque local-part (bboynton97@gmail.com):
+    ///     the local-part alone. The host names the provider, not the sender,
+    ///     so it is the one piece worth keeping and the "@gmail.com" is not.
+    static func readableName(_ sender: String) -> String {
+        let p = parse(sender)
+        // No address at all ("Bob"): whatever was given IS the name.
+        guard p.addr.contains("@") else { return p.name }
+
+        if let name = usableName(p.name, addr: p.addr) { return name }
+
+        let local = (p.addr.split(separator: "@").first.map(String.init) ?? "")
+            .split(separator: "+").first.map(String.init) ?? ""
+        let domain = faviconDomain(sender)
+
+        if isBrand(sender), !local.isEmpty { return local }
+        if isRobot(sender), let base = baseLabel(sender) { return Fmt.capitalizingFirst(base) }
+        if let human = humanizedLocal(local) { return human }
+        if let domain, !consumerHosts.contains(domain), let base = baseLabel(sender) {
+            return Fmt.capitalizingFirst(base)
+        }
+        return local.isEmpty ? p.name : local
+    }
+
+    /// A display name that reads as a name, cleaned, or nil when it does not.
+    /// A parenthesized address after a real name ("Sarah Chen (sarah@acme.com)")
+    /// is dropped rather than disqualifying the name in front of it.
+    private static func usableName(_ raw: String, addr: String) -> String? {
+        var words = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        words.removeAll { $0.contains("@") }
+        let name =
+            words.joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "()[]<>\"' "))
+        guard !name.isEmpty, name.contains(where: { $0.isLetter }) else { return nil }
+        // An encoded-word the daemon did not decode is bytes, not a name.
+        guard !name.hasPrefix("=?") else { return nil }
+        guard name.lowercased() != addr.lowercased() else { return nil }
+
+        // A name that is only the robot word says nothing about WHO.
+        let squashed = name.lowercased().filter { $0.isLetter || $0.isNumber }
+        if robotLocals.contains(nameTokens(name).joined(separator: "-")) { return nil }
+        if robotLocals.contains(squashed) { return nil }
+        if robotMarkers.contains(where: { squashed.contains($0) }) { return nil }
+
+        // The domain spelled out as the name is the brand: say it as one.
+        if let host = addr.split(separator: "@").last.map({ String($0).lowercased() }),
+            name.lowercased() == host || name.lowercased() == faviconDomain(addr),
+            let base = baseLabel(addr)
+        {
+            return Fmt.capitalizingFirst(base)
+        }
+        return name
+    }
+
+    /// "sarah.chen" / "sarah_chen" / "sarah-chen" -> "Sarah Chen". Two or three
+    /// all-letter tokens, or nothing: a digit, a lone token or a longer run is
+    /// an identifier, not a name, and guessing at it would print "Jsmith" in
+    /// bold. Only the shape a person types their own name in gets read as one.
+    private static func humanizedLocal(_ local: String) -> String? {
+        let tokens = local.split(whereSeparator: { $0 == "." || $0 == "_" || $0 == "-" })
+        guard (2...3).contains(tokens.count) else { return nil }
+        guard tokens.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isLetter) }) else { return nil }
+        return tokens.map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
+            .joined(separator: " ")
+    }
+
     /// DuckDuckGo icon service URL for a base domain.
     static func faviconURL(_ domain: String) -> URL? {
         URL(string: "https://icons.duckduckgo.com/ip3/\(domain).ico")

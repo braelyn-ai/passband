@@ -39,6 +39,8 @@ struct SealedEventTests {
         theAuthBannerStandsAloneWithNoAccountName()
         anUnnamedSenderStillSaysSomething()
         authBannersOfOneMailboxShareAGroup()
+        theThreadBannerNeverTitlesAnAddress()
+        theThreadBannerNeverCarriesADate()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -55,11 +57,13 @@ struct SealedEventTests {
     static func frame(
         sealedKind: String? = nil,
         sender: String = "Acme Security <no-reply@acme.com>",
-        oneLine: String = "Login code arrived"
+        oneLine: String = "Login code arrived",
+        kind: String = "urgent",
+        deadline: String? = nil
     ) -> Data {
         var fields = [
             "\"id\": 41",
-            "\"kind\": \"urgent\"",
+            "\"kind\": \(quoted(kind))",
             "\"message_id\": 907",
             "\"thread_id\": \"t-abc\"",
             "\"tier\": \"signal\"",
@@ -69,6 +73,7 @@ struct SealedEventTests {
             "\"created_at\": \"2026-09-01T10:00:00Z\"",
         ]
         if let sealedKind { fields.append("\"sealed_kind\": \(quoted(sealedKind))") }
+        if let deadline { fields.append("\"deadline\": \(quoted(deadline))") }
         return Data("{\(fields.joined(separator: ","))}".utf8)
     }
 
@@ -223,6 +228,61 @@ struct SealedEventTests {
         expect(
             authCopy(otp).threadIdentifier == EventBanner.authGroup,
             "and the group is the shared constant, not a per-event string")
+    }
+
+    // MARK: - what the thread banner says
+
+    /// The title is a few bold words on a lock screen, and an address there is
+    /// noise in front of the summary. Every shape that has actually landed in
+    /// a title is a name or a brand here, and the auth banner's "from" line
+    /// follows the same rule.
+    static func theThreadBannerNeverTitlesAnAddress() {
+        let senders = [
+            "Sarah Chen <sarah@acme.com>": "Sarah Chen",
+            "bounce-1234-5678@em.brand.com": "Brand",
+            "sarah.chen@acme.com": "Sarah Chen",
+            "No Reply <no-reply@accounts.google.com>": "Google",
+            "notifications@github.com <noreply@github.com>": "Github",
+        ]
+        for (sender, title) in senders {
+            guard let e = decode(frame(sender: sender, oneLine: "Invoice 4471 is overdue")) else {
+                return expect(false, "decodes")
+            }
+            let copy = EventBanner.copy(for: e)
+            expect(copy.title == title, "\(sender) is titled \(title), got \(copy.title)")
+            expect(!copy.title.contains("@"), "no title carries an address")
+            expect(copy.body == "Invoice 4471 is overdue", "and the summary is the body")
+        }
+        guard let auth = decode(frame(sealedKind: "otp", sender: "no-reply@accounts.google.com"))
+        else { return expect(false, "decodes") }
+        expect(
+            authCopy(auth).body == "from Google", "the auth banner's from-line follows the same rule")
+    }
+
+    /// The event's deadline is a snapshot taken at triage, and a banner sits
+    /// on a lock screen for hours. The second line says there IS one and
+    /// nothing about when.
+    static func theThreadBannerNeverCarriesADate() {
+        let past = "2026-08-30T09:00:00Z"
+        guard let urgent = decode(frame(kind: "urgent", deadline: past)),
+            let dated = decode(frame(kind: "deadline", deadline: past)),
+            let plain = decode(frame(kind: "surfaced", deadline: past))
+        else { return expect(false, "decodes") }
+        expect(
+            EventBanner.copy(for: urgent).subtitle == "needs attention",
+            "urgent says why, not when")
+        expect(
+            EventBanner.copy(for: dated).subtitle == "has a deadline",
+            "a deadline event says there is one, not when it is")
+        expect(EventBanner.copy(for: plain).subtitle == "", "surfaced mail has no second line")
+        for e in [urgent, dated, plain] {
+            let copy = EventBanner.copy(for: e)
+            let everything = [copy.title, copy.subtitle, copy.body].joined(separator: " ")
+            expect(!everything.contains("2026"), "no year reaches a banner")
+            expect(
+                !everything.lowercased().contains("due") && !everything.contains("d "),
+                "nor a due chip in any spelling")
+        }
     }
 
     static func expect(_ cond: Bool, _ what: String) {

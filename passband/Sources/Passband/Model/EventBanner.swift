@@ -81,11 +81,13 @@ enum EventBanner {
         var sound: Bool
     }
 
-    static func copy(for event: Event, now: Date = Date()) -> Copy {
-        // "Sarah Chen <sarah@acme.com>" is not a notification title.
-        let sender = flatten(SenderID.displayName(event.sender), max: 64)
+    static func copy(for event: Event) -> Copy {
+        // "Sarah Chen <sarah@acme.com>" is not a notification title, and
+        // neither is "bounce-1234@em.brand.com": `readableName` never answers
+        // with an address, which is the one promise a bold line on a lock
+        // screen has to keep. The exact address is one tap away in the thread.
+        let sender = flatten(SenderID.readableName(event.sender), max: 64)
         let summary = flatten(event.one_line, max: 240)
-        let due = Fmt.deadlineChip(event.deadline, now: now)?.text ?? ""
         // Coalescing key: events on one thread stack into ONE group. The
         // fallback must be unique, or an empty thread id would glue unrelated
         // mail together.
@@ -108,10 +110,14 @@ enum EventBanner {
 
         let subtitle: String
         switch event.kind {
-        // Urgent is the dated-obligation tiers. When there is a real date, SAY it —
-        // "2d PAST DUE" is why the banner is worth interrupting for.
-        case .urgent: subtitle = due.isEmpty ? "needs attention" : due
-        case .deadline: subtitle = due
+        // The time-bound kinds get a second line saying WHY the banner is worth
+        // the interruption, but NOT the date. The event's deadline is a
+        // snapshot taken at triage, and a banner sits on a lock screen for
+        // hours: "due today" read tomorrow morning is wrong, and "2d PAST DUE"
+        // on mail the human already handled is a nag. The thread has the live
+        // chip; the banner says only that there is one.
+        case .urgent: subtitle = "needs attention"
+        case .deadline: subtitle = "has a deadline"
         // No second line for the ordinary case: a subtitle on every
         // notification is a subtitle that means nothing. `.opened` returned
         // above and is listed only to keep this switch exhaustive.
@@ -156,7 +162,7 @@ enum EventBanner {
         // is the app's one vocabulary for the other half ("sealed" is internal
         // jargon and never reaches a human).
         let label = AuthCopy.label(kind)
-        let who = flatten(SenderID.displayName(sender), max: 64)
+        let who = flatten(SenderID.readableName(sender), max: 64)
         return Copy(
             title: accountName.map { "\(label) · \($0)" } ?? label,
             subtitle: "",
