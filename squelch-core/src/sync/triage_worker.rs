@@ -725,6 +725,43 @@ mod budget_tests {
     use crate::store::{SqliteStore, agent_triage::AgentTriageStore};
 
     #[test]
+    fn snapshot_exposes_subject_once_and_tracks_exact_siblings_and_preferences() {
+        let message = |id| {
+            serde_json::json!({
+                "id":id,"thread_id":"thread","from_addr":"sender@test","subject":"subject",
+                "body":format!("body-{id}"),"received_at":"2026-01-01","is_sent":false,
+                "is_spam":false,"status":"new","notify_eligible_at":null,"opened_at":null,"remind_at":null,
+                "source":{"message_id":id,"content":"revision","user_state":"state","attention_revision":1}
+            })
+        };
+        let context: AgentContext = serde_json::from_value(serde_json::json!({
+            "message":message(1),"thread":[message(1),message(2),message(3),message(4)],
+            "previous_decision":null,"attention":null,"rules":[{"id":10},{"id":20}],
+            "matched_rules":[{"id":10}],"sender_is_contact":true,"corrections":[],
+            "revision":{"content":"revision","preferences":"preferences","user_state":"state","attention_revision":1},
+            "memory":[],"run_metadata":{}
+        })).unwrap();
+        let snapshot = snapshot(&context, &read_job(1, 1), 2);
+        assert_eq!(snapshot.source_message_ids, vec![1, 2, 3]);
+        assert_eq!(
+            snapshot.initial["thread"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(snapshot.initial["message"]["id"], 1);
+        assert_eq!(snapshot.rule_ids, vec![10]);
+        assert_eq!(
+            snapshot.initial["sender_preferences"],
+            serde_json::json!([{"id":10}])
+        );
+        assert_eq!(snapshot.initial["sender_is_contact"], true);
+    }
+
+    #[test]
     fn migration_cannot_spend_arrival_reserve_and_old_escalation_caps_do_not_bind() {
         let store = SqliteStore::open_in_memory().unwrap();
         let account = store.ensure_account("arrival-budget@example.com").unwrap();
