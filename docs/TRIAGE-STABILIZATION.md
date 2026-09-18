@@ -78,8 +78,8 @@ The PR remains a draft for live-inbox quality and latency evaluation before roll
 - `cargo test -p squelch-core -p squelch-api -p squelch-mcp -p squelchd -p squelch-tui --quiet`: **1,889 passed, 0 failed, 0 ignored**.
 - Strict Clippy passed for those five packages with `--all-targets -- -D warnings`.
 - `cargo check --workspace` passed; Cargo retains the existing future-compatibility warning for `num-bigint-dig`.
-- Full Swift test script passed: 36 suites, including capability recovery, notification/tap behavior, canonical feeds, reader focus, and rehearsal isolation.
-- Desktop build passed: 158 sources, version 0.0.7, build 1023.
+- Full Swift test script passed: 37 suites, including capability recovery, notification/tap behavior, canonical feeds, reader focus, and rehearsal isolation.
+- Desktop build passed: 158 sources, version 0.0.7, build 1024.
 - iOS generic simulator build passed for the app and notification extension (code signing disabled).
 - Formatting and `git diff --check` passed.
 

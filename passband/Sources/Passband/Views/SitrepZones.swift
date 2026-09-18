@@ -1,4 +1,4 @@
-// THE SITREP RIGHT RAIL + the newsletters zone. Calendar / Shipments / Banking
+// THE SITREP RIGHT RAIL + the reading zone. Calendar / Shipments / Banking
 // / Receipts are RECORDS, not actions: they always render, empty state and all,
 // because a column that comes and goes as mail arrives is one you stop trusting.
 // These records are auto-resolved out of the attention bands at ingest, so this
@@ -461,7 +461,7 @@ struct ReceiptsZone: View {
 
 }
 
-// MARK: - newsletters
+// MARK: - reading
 
 /// THE RULE-ONBOARDING SURFACE: recurring marketing senders; a ruled sender is
 /// marked only by the card's accent border (rules are edited in the Rules view).
@@ -474,11 +474,11 @@ struct ReceiptsZone: View {
 /// NOTHING HERE IS A CLOSURE OR A BINDING, deliberately: both compare unequal on
 /// every render, so a zone that took them could never be skipped when the
 /// dashboard redrew — and skipping it is what keeps a scroll from re-measuring
-/// every card. `[Newsletter]` is Equatable and the cursor is one stable
+/// every card. `[ReadingSender]` is Equatable and the cursor is one stable
 /// reference, so SwiftUI can prove this subtree unchanged and leave it alone.
-struct NewslettersZone: View {
+struct ReadingZone: View {
     @Environment(AppStore.self) private var store
-    let newsletters: [Newsletter]
+    let senders: [ReadingSender]
     let cursor: SitrepCursor
 
     /// Narrowest a card may be drawn; the grid fits as many equal columns of at
@@ -497,10 +497,10 @@ struct NewslettersZone: View {
         // Always on the board, empty or not: a zone that vanishes reads as a
         // missing feature, not as "nothing this week".
         ZoneCard(
-            symbol: "envelope.open", title: "Reading", count: newsletters.count,
+            symbol: "envelope.open", title: "Reading", count: senders.count,
             subtitle: "newsletters, announcements, and offers"
         ) {
-            if newsletters.isEmpty {
+            if senders.isEmpty {
                 EmptyNote("Nothing to read yet.")
             } else {
                 grid
@@ -516,25 +516,24 @@ struct NewslettersZone: View {
     }
 
     @ViewBuilder private var cards: some View {
-        ForEach(newsletters) { nl in
-            NewsletterCard(newsletter: nl, cursor: cursor)
+        ForEach(senders) { rs in
+            ReadingCard(sender: rs, cursor: cursor)
         }
     }
 }
 
-/// Fetch + derive for the newsletters zone. Free-standing so the always-mounted
+/// Fetch + derive for the reading zone. Free-standing so the always-mounted
 /// SitrepView can own it.
-enum NewsletterFeed {
-    /// Pull a generous window of noise-tier updates and filter to the last 7
-    /// days client-side (the wire model carries no received_at).
+enum ReadingFeed {
+    /// Membership comes directly from the canonical Reading destination.
     private static let fetchLimit = 200
 
-    static func load() async -> [Newsletter]? {
+    static func load() async -> [ReadingSender]? {
         do {
             async let feed = APIClient.shared.getFeed(destination: "reading", limit: fetchLimit)
             async let rules = APIClient.shared.listRules()
             let (page, preferences) = try await (feed, rules)
-            return Newsletters.derive(updates: page.items.map(\.readingRow), rules: preferences)
+            return Reading.derive(updates: page.items.map(\.readingRow), rules: preferences)
         } catch {
             // Preserve the last successful reading feed on a transient error.
             return nil
@@ -542,15 +541,15 @@ enum NewsletterFeed {
     }
 }
 
-private struct NewsletterCard: View {
+private struct ReadingCard: View {
     @Environment(AppStore.self) private var store
-    let newsletter: Newsletter
+    let sender: ReadingSender
     let cursor: SitrepCursor
 
     @State private var hovering = false
 
     private var summaryText: String {
-        Fmt.truncate(Newsletters.cleanSummary(newsletter.summary), 90)
+        Fmt.truncate(Reading.cleanSummary(sender.summary), 90)
     }
 
     /// How often this sender wrote, SPELLED OUT on the Mac and a bare multiplier
@@ -560,9 +559,9 @@ private struct NewsletterCard: View {
     /// named by the zone itself.
     private var countLabel: String {
         #if os(iOS)
-            return "\(newsletter.count)×"
+            return "\(sender.count)×"
         #else
-            return "\(newsletter.count) emails"
+            return "\(sender.count) emails"
         #endif
     }
 
@@ -571,10 +570,10 @@ private struct NewsletterCard: View {
             // Hero left as a FIXED square, text right: every card in the grid
             // keeps the same height whether or not its sender ships art.
             HStack(alignment: .top, spacing: 9) {
-                NewsletterHero(threadId: newsletter.latestThreadId, sender: newsletter.sender)
+                ReadingHero(threadId: sender.latestThreadId, sender: sender.sender)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
-                        Text(SenderCache.resolved(newsletter.sender).displayName)
+                        Text(SenderCache.resolved(sender.sender).displayName)
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(Palette.ink)
                             .lineLimit(1)
@@ -584,7 +583,7 @@ private struct NewsletterCard: View {
                             .foregroundStyle(Palette.inkFaintest)
                             .fixedSize()
                     }
-                    if !newsletter.summary.isEmpty {
+                    if !sender.summary.isEmpty {
                         Text(summaryText)
                             .font(Typo.micro)
                             .foregroundStyle(Palette.inkFaint)
@@ -604,7 +603,7 @@ private struct NewsletterCard: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
-                        newsletter.rule != nil ? Palette.accent.opacity(0.35) : .clear,
+                        sender.rule != nil ? Palette.accent.opacity(0.35) : .clear,
                         lineWidth: 1)
             )
             .contentShape(Rectangle())
@@ -614,13 +613,13 @@ private struct NewsletterCard: View {
             hovering = over
             // Nothing READS this during a render — only the `e` handler, at
             // key-press time — so this write is free even at scroll frequency.
-            cursor.newsletter = over ? newsletter.address : nil
+            cursor.reading = over ? sender.address : nil
         }
     }
 
     private func open() {
-        guard !newsletter.latestThreadId.isEmpty else { return }
-        store.openThread(newsletter.latestThreadId, queue: newsletter.items)
+        guard !sender.latestThreadId.isEmpty else { return }
+        store.openThread(sender.latestThreadId, queue: sender.items)
     }
 
 }
@@ -628,7 +627,7 @@ private struct NewsletterCard: View {
 /// Hero thumbnail mined from the latest email's sanitized html via the shared
 /// thread cache. Gated on the remote-images pref: with images "on demand" NO
 /// network fetch happens for unopened mail (see docs/SECURITY.md §3).
-private struct NewsletterHero: View {
+private struct ReadingHero: View {
     let threadId: String
     let sender: String
     @State private var resolved: HeroCache.Hero?
@@ -636,7 +635,7 @@ private struct NewsletterHero: View {
     /// Side of the square thumb. SMALLER ON THE PHONE, because the card is: a
     /// two-up phone card is roughly 160pt wide, and a 54pt square plus its
     /// gutter takes a third of that away from the sender's name, which is the
-    /// one thing on the card you actually pick a newsletter by. The art is a
+    /// one thing on the card you actually pick a sender by. The art is a
     /// recognition cue, and it still works at 40.
     #if os(iOS)
         private static let side: CGFloat = 40

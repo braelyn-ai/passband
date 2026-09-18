@@ -10,9 +10,9 @@ struct OnboardingRehearsalTests {
             precondition(mailbox.messages.filter { $0.category == category }.count == 3)
         }
         precondition(mailbox.messages.allSatisfy { !$0.body.isEmpty && !$0.isRead && !$0.isDone })
-        let newsletters = mailbox.messages.filter { $0.category == .newsletters }
-        precondition(newsletters.map(\.sender) == ["Cats Weekly", "Haightssion", "The Federal Overstatement"])
-        precondition(newsletters.allSatisfy { $0.body.count > 500 })
+        let reading = mailbox.messages.filter { $0.category == .reading }
+        precondition(reading.map(\.sender) == ["Cats Weekly", "Haightssion", "The Federal Overstatement"])
+        precondition(reading.allSatisfy { $0.body.count > 500 })
         precondition(mailbox.messages.first { $0.id == 1 }!.body.contains("No reply needed"))
         mailbox.open(1)
         mailbox.setDone(1, done: true)

@@ -3,7 +3,7 @@ import Foundation
 /// Guided product lessons teach real interactions with the practice mailbox.
 enum PracticeTourStep: Int, CaseIterable, Sendable {
     case welcome, needsYou, openMaya, done, undo
-    case calendar, shipments, otherCategories, newsletters
+    case calendar, shipments, otherCategories, reading
     case learning, openBrightly, rule, ruleSaved, wrap
 
     var targets: [TourTarget] {
@@ -14,7 +14,7 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         case .calendar: [.calendar]
         case .shipments: [.shipments]
         case .otherCategories: [.banking, .receipts]
-        case .newsletters: [.newsletters]
+        case .reading: [.reading]
         default: []
         }
     }
@@ -24,7 +24,7 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         case .openMaya, .done: 1
         case .calendar: 17
         case .shipments: 5
-        case .newsletters: 3
+        case .reading: 3
         case .openBrightly, .rule: 11
         default: nil
         }
@@ -55,7 +55,7 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         case .calendar: "Your plans, in one place."
         case .shipments: "Keep an eye on what’s coming."
         case .otherCategories: "The other categories follow suit."
-        case .newsletters: "Something to read, when you like."
+        case .reading: "Something to read, when you like."
         case .learning: "We learn what matters to you."
         case .openBrightly: "A notice you don’t need."
         case .rule: "Your words become a rule."
@@ -82,8 +82,8 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
             "See what’s on its way without treating every delivery update as a task. Open one if you like, or choose Next."
         case .otherCategories:
             "Banking keeps account updates together. Receipts keep purchases close at hand. The details are here when you need them."
-        case .newsletters:
-            "Newsletters have their own space. Read something interesting whenever you have a moment."
+        case .reading:
+            "Your reading has its own space. Read something interesting whenever you have a moment."
         case .learning:
             "Your actions help Passband learn what matters. You can also nudge the AI directly with a smart rule, written in your own words."
         case .openBrightly:

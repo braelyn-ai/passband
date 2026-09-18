@@ -76,7 +76,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 
 | View | Status | Notes |
 | --- | --- | --- |
-| Sitrep dashboard | **done** | Editorial hero (serif, spelled counts, greeting + name), For-your-eyes ranked list w/ in-place expander, Attention aggregate + deduped sender chips, Offers, Newsletters, status strip |
+| Sitrep dashboard | **done** | Editorial hero (serif, spelled counts, greeting + name), For-your-eyes ranked list w/ in-place expander, Attention aggregate + deduped sender chips, Offers, Reading, status strip |
 | Sitrep right rail | **done** | Calendar · Shipments · Banking · Receipts, each with its empty state (the rail never disappears) |
 | Emails band list | **done** | Flat inbox, newest-first, importance meter, hover/keyboard selection model |
 | Auth | **done** | In-focus panel w/ digit boxes, filter chips, Live/Archive sections, decision rail, shredder card |
@@ -132,7 +132,7 @@ to get subtly wrong:
   held and a plain binding never fires while ⌘ is held, so ⌘[ / ⌘] never
   collide with bare `[` / `]`.
 - **Declining handlers** — a handler returning `false` passes the key on. Used
-  by the newsletter `e` (defers to For-your-eyes when nothing is hovered) and
+  by the reading zone's `e` (defers to For-your-eyes when nothing is hovered) and
   compose's `Enter` (lets the body field type a newline).
 - **Input guard** — single-letter bindings are suppressed while a text field has
   focus unless they opt in via `allowInInput`.
@@ -170,7 +170,7 @@ the registry remains the authority on dispatch semantics.
 | 2FA arrival detection | **done** | Persisted seen-set, 2-minute freshness window, silent first-run seeding |
 | Auth countdown rings | **done** | 60s sweep, resumes correctly mid-flight |
 | Favicon avatars (robot/brand only) | **done** | Human correspondents never resolved over the network; verdict cached across launches |
-| Newsletter derivation | **done** | Pipeline `marketing` classification preferred; legacy heuristic only as a migration bridge |
+| Reading-zone derivation | **done** | Canonical agent Reading destination, grouped by sender; no client classification heuristic |
 | Tracker stripping | **done** | Conservative: tiny-declared, CSS-hidden, or a known endpoint from the deliberately short list |
 | Quoted-history collapse | **done** | Same heuristic for text (native) and HTML (injected script) |
 
@@ -279,7 +279,7 @@ retired Tauri + React client:
     every mount tracked the theme; `@Observable` gives that for free.
 11. **An "Offers" zone** on the sitrep, surfacing `/client/marketing` extractions
     (brand · offer · discount · promo code · expiry). The web build fetched that
-    route only to qualify newsletters and never showed the offers themselves.
+    route only to qualify reading-zone senders and never showed the offers themselves.
     It renders NO link, deliberately: `MarketingOffer` carries no url because a
     model-emitted, email-derived URL rendered as clickable is a prompt-injection
     lever. Clicking a row opens the email, where real links are extracted from
@@ -307,7 +307,7 @@ retired Tauri + React client:
    message/tool-use shape and refuses non-Anthropic keys with a clear message —
    exactly as the web build did. Wiring the OpenAI tool-call shape is a small,
    separate piece of work.
-3. **Newsletter hero fill color.** The web build sampled the hero image's
+3. **Reading-card hero fill color.** The web build sampled the hero image's
    dominant color to tint the card well. Here the thumbnail sits on a neutral
    well. Purely cosmetic; the sampling pass can be added with `NSImage` +
    `CIAreaAverage` if wanted.
@@ -327,7 +327,7 @@ retired Tauri + React client:
   thread viewer would not scroll whenever the pointer was over mail — a
   `PassthroughWebView` now forwards the wheel to the SwiftUI ScrollView that
   owns the column.
-- **The Newsletters zone looked missing.** It derives correctly (33 cards
+- **The Reading zone looked missing.** It derives correctly (33 cards
   against the live daemon); it sits below the fold and was unreachable while
   scrolling was broken.
 - **Caching genuinely did not work.** Every email view got its OWN

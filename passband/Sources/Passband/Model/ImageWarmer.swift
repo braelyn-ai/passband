@@ -60,32 +60,32 @@ final class ImageWarmer {
 
         guard Prefs.shared.loadRemoteImages else { return }
 
-        // Two bounded waves, not one: the newsletter wave must not start while
+        // Two bounded waves, not one: the reading wave must not start while
         // the for-your-eyes wave is still running. Ids are deduped up front —
         // ThreadPrefetch has no in-flight dedup, so two concurrent warms of
         // one thread would each miss its cache and fetch the thread twice.
         var seen = Set<String>()
         let standing = store.sitrep.standing.map(\.thread_id)
             .filter { seen.insert($0).inserted }
-        let newsletters = store.zones.newsletters.map(\.latestThreadId)
+        let reading = store.zones.reading.map(\.latestThreadId)
             .filter { seen.insert($0).inserted }
         await withBoundedTaskGroup(width: Self.warmWidth, over: standing) { threadId in
             await self.warmThread(threadId)
         }
-        await withBoundedTaskGroup(width: Self.warmWidth, over: newsletters) { threadId in
+        await withBoundedTaskGroup(width: Self.warmWidth, over: reading) { threadId in
             await self.warmThread(threadId)
         }
     }
 
-    /// Every message id the sitrep still surfaces, newsletters included (their
+    /// Every message id the sitrep still surfaces, the reading zone included (their
     /// aggregated updates are the same message ids the bands use).
     private static func activePins(_ store: AppStore) -> Set<Int> {
         var ids = Set<Int>()
         for update in store.sitrep.standing + store.sitrep.new + store.sitrep.open {
             ids.insert(update.id)
         }
-        for newsletter in store.zones.newsletters {
-            for item in newsletter.items { ids.insert(item.id) }
+        for sender in store.zones.reading {
+            for item in sender.items { ids.insert(item.id) }
         }
         return ids
     }

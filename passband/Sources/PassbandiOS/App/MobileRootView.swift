@@ -22,7 +22,7 @@
 // AND THE READER IS A PUSH. On the Mac the thread viewer is a zIndex-20 layer
 // that covers the window; here it is a NavigationStack destination — but driven
 // by the SAME `store.threadId`, so every surface that opens mail (a list row, a
-// record zone, a newsletter card) opens it through the identical store call and
+// record zone, a reading card) opens it through the identical store call and
 // leaving nils the identical state.
 //
 // THE ACTION LAYER, MINUS THE PARTS THAT ARE FURNITURE. `Views/ActionLayer.swift`

@@ -70,7 +70,7 @@ actor RehearsalAPI {
             }.map { message in
                 let row = update(message)
                 let kinds: [OnboardingRehearsal.Category: String] = [
-                    .attention: "correspondence", .newsletters: "editorial", .calendar: "event_reservation",
+                    .attention: "correspondence", .reading: "editorial", .calendar: "event_reservation",
                     .shipments: "delivery", .banking: "financial_update", .receipts: "receipt"]
                 return AgentFeedItem(message_id: message.id, thread_id: threadID(message.id),
                     from_addr: address(message), subject: message.subject, received_at: stamp(),
@@ -473,7 +473,7 @@ actor RehearsalAPI {
     /// as received mail. All styling is inline; there are no remote resources,
     /// links, tracking pixels, or scripts. The plain-text alternative stays intact.
     private func renderedHTML(_ message: OnboardingRehearsal.Message) -> String? {
-        if message.category == .newsletters { return newsletterHTML(message) }
+        if message.category == .reading { return newsletterHTML(message) }
         if message.id == 11 { return brightlyHTML() }
         if [10, 18].contains(message.id) { return calendarExperienceHTML(message) }
         if [13, 14].contains(message.id) { return rainforestHTML(message) }

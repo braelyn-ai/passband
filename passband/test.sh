@@ -357,3 +357,13 @@ run_suite triage-targets \
 run_suite capability-probe \
   Sources/Passband/Model/APIError.swift \
   Tests/CapabilityProbeTests.swift
+
+# Reading groups canonical membership without reconstructing triage from copy.
+run_suite reading \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Sources/Passband/Lib/Reading.swift \
+  Tests/ReadingTests.swift

@@ -180,7 +180,7 @@ struct SitrepZoneCache: Sendable {
     var shipments: [Shipment] = []
     var banking: [BankingRecord] = []
     var receipts: [Receipt] = []
-    var newsletters: [Newsletter] = []
+    var reading: [ReadingSender] = []
     var records: [AttentionUpdate] = []
     var recordFacts: [Int: [AgentRecordProposal]] = [:]
     /// When the last full refresh COMPLETED. nil = never loaded.
@@ -531,7 +531,7 @@ struct RuleEditorRequest: Identifiable, Sendable {
     let id = UUID()
     var sender: String?
     var rule: SenderRule?
-    /// Preselect a disposition (the newsletters CTA preselects "filtered").
+    /// Preselect a disposition (the reading zone's CTA preselects "filtered").
     var disposition: Disposition?
     var want: String?
     /// Explicit match_pattern override; wins over deriving from `sender`.
@@ -1940,7 +1940,7 @@ final class AppStore {
     /// nil rows = that endpoint failed and its zone keeps what it had.
     private enum ZoneAnswer: Sendable {
         case shipments([Shipment]?)
-        case newsletters([Newsletter]?)
+        case reading([ReadingSender]?)
         case records(AgentFeed?)
     }
 
@@ -1958,7 +1958,7 @@ final class AppStore {
             group.addTask {
                 .shipments(try? await APIClient.shared.getShipments(includeDelivered: true))
             }
-            group.addTask { .newsletters(await NewsletterFeed.load()) }
+            group.addTask { .reading(await ReadingFeed.load()) }
             group.addTask {
                 .records(try? await APIClient.shared.getFeed(destination: "records", limit: 1000))
             }
@@ -1969,7 +1969,7 @@ final class AppStore {
                 }
                 switch answer {
                 case .shipments(let rows?): zones.shipments = rows
-                case .newsletters(let rows?): zones.newsletters = rows
+                case .reading(let rows?): zones.reading = rows
                 case .records(let feed?):
                     zones.records = feed.items.map(\.readingRow)
                     zones.recordFacts = Dictionary(feed.items.map { ($0.message_id, $0.decision.records ?? []) },
@@ -1977,16 +1977,16 @@ final class AppStore {
                     zones.receipts = feed.receipts
                     zones.banking = feed.banking
                     zones.calendar = feed.calendar
-                case .shipments, .newsletters, .records: break
+                case .shipments, .reading, .records: break
                 }
             }
         }
         guard e == epoch else { return }
         zones.loadedAt = Date()
 
-        HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))
+        HeroCache.shared.preload(zones.reading.map(\.latestThreadId))
         warmZoneThreads()
-        // The newsletter half of the launch image warm's input; the bands are the
+        // The reading half of the launch image warm's input; the bands are the
         // other half, and it starts once both have landed.
         ImageWarmer.shared.noteZonesLanded()
     }

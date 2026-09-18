@@ -61,7 +61,7 @@ struct RehearsalAPITests {
             precondition(thread.messages.count == 1 && thread.messages[0].id == message.id)
             precondition(!thread.messages[0].content.contains("{{") && thread.subject == message.subject)
             if !message.body.contains("{{") { precondition(thread.messages[0].content == message.body) }
-            if message.category == .newsletters {
+            if message.category == .reading {
                 let html = thread.messages[0].html ?? ""
                 precondition(html.contains("<table") && html.contains("<h1"))
                 precondition(!html.contains("<script") && !html.contains("src=\"http"))
