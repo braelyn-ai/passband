@@ -1802,7 +1802,10 @@ final class AppStore {
         guard verdict.refetch else { return }
         openThreadRefreshToken &+= 1
         guard verdict.announce else { return }
-        let name = SenderID.displayName(sender)
+        // The banner's rule, not the row's: this toast fires in exactly the
+        // case the system banner is suppressed (app frontmost, thread open),
+        // and the same arrival must not be announced under two names.
+        let name = SenderID.readableName(sender)
         pushToast(name.isEmpty ? "new message in this thread" : "new message from \(name)")
     }
 
