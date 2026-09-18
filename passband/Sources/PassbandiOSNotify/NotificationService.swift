@@ -261,6 +261,7 @@ final class NotificationService: UNNotificationServiceExtension {
             EventBanner.accountKey: account,
             EventBanner.routeKey: EventBanner.authRoute,
             EventBanner.messageKey: event.message_id,
+            EventBanner.authKey: event.isAuth || event.sealed_kind != nil,
             EventBanner.threadKey: event.thread_id,
         ]
         // Always a chime, and the system's rather than the user's chosen one:
@@ -291,6 +292,7 @@ final class NotificationService: UNNotificationServiceExtension {
             EventBanner.threadKey: event.thread_id,
             EventBanner.eventKey: event.id,
             EventBanner.messageKey: event.message_id,
+            EventBanner.authKey: event.isAuth || event.sealed_kind != nil,
             EventBanner.accountKey: account,
         ]
         // The system default rather than the user's chosen chime: the app's

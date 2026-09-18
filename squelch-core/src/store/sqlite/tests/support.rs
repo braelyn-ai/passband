@@ -547,6 +547,7 @@ pub(super) fn new_event(store: &SqliteStore, acct: AccountId, message_id: i64) -
         one_line: format!("line {message_id}"),
         deadline: None,
         // An ordinary event. The sealed-routing tests set this explicitly.
+        is_auth: false,
         sealed_kind: None,
     }
 }

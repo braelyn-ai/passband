@@ -510,7 +510,14 @@ impl SquelchServer {
         let now = Utc::now();
         let records = self
             .store
-            .external_agent_records(self.account_id, usize::MAX)
+            .external_agent_records_with_query(
+                self.account_id,
+                usize::MAX,
+                &squelch_core::store::agent_triage::AgentListQuery {
+                    since: None,
+                    include_done: false,
+                },
+            )
             .map_err(Self::map_err)?;
         let mut out = Vec::new();
         for item in records {
@@ -606,7 +613,14 @@ impl SquelchServer {
         let include_delivered = params.include_delivered.unwrap_or(false);
         let records = self
             .store
-            .external_agent_records(self.account_id, usize::MAX)
+            .external_agent_records_with_query(
+                self.account_id,
+                usize::MAX,
+                &squelch_core::store::agent_triage::AgentListQuery {
+                    since: None,
+                    include_done: false,
+                },
+            )
             .map_err(Self::map_err)?;
         let shipments = self
             .store
@@ -635,6 +649,14 @@ impl SquelchServer {
                     })
                     .unwrap_or_default();
                 if !number.is_empty() && !represented.insert(number.clone()) {
+                    continue;
+                }
+                if !number.is_empty()
+                    && self
+                        .store
+                        .agent_shipment_is_cleared(self.account_id, &number)
+                        .map_err(Self::map_err)?
+                {
                     continue;
                 }
                 let mut hit = ShipmentHit {
@@ -1071,6 +1093,23 @@ mod tests {
         assert!(
             !deliveries[0]["eta"].is_null(),
             "spaced canonical number receives compact-row carrier observations"
+        );
+        store
+            .clear_shipment(account, polling_row.id, Utc::now())
+            .unwrap();
+        assert!(
+            values(
+                &server
+                    .get_shipments(Parameters(GetShipmentsParams {
+                        include_delivered: Some(true)
+                    }))
+                    .await
+                    .unwrap()
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+            "canonical delivery cannot resurrect an explicitly cleared tracking number"
         );
         store
             .correct_agent_triage(

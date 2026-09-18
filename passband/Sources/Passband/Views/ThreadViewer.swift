@@ -1763,9 +1763,14 @@ struct ThreadViewer: View {
         // LAND ON THE NEWEST. It is last in the stack now, and `tailSpace` is
         // what lets the scroll put it at the top of the window rather than the
         // bottom.
-        index = store.focusedMessageId.flatMap { target in
-            view.messages.firstIndex { $0.id == target }
-        } ?? max(0, view.messages.count - 1)
+        index = ThreadOpeningFocus.index(messageIds: view.messages.map(\.id),
+            requested: opening ? store.focusedMessageId : nil)
+        if opening, store.threadId == threadId {
+            // Exact-message navigation is consumed once. A later sent echo or
+            // live refresh must not jump back to the notification's old target.
+            store.focusedMessageId = nil
+            store.focusedMessageView = nil
+        }
         // What the ⌘K agent is told it is looking at. Lifted into the store
         // because the ask bar is a modal above this view and cannot see its
         // state, and written HERE because this is the one place a thread lands

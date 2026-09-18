@@ -1,9 +1,7 @@
 //! Durable model work. Ingest never waits for these decisions.
 use super::*;
 use crate::metrics::AgentVerdict;
-use crate::store::agent_triage::{
-    AgentCommitOutcome, AgentContext, AgentJob, AgentMessage, AgentSourceSnapshot,
-};
+use crate::store::agent_triage::{AgentCommitOutcome, AgentContext, AgentJob, AgentSourceSnapshot};
 use crate::triage::agent::{AgentConnection, run_agent};
 use crate::triage::context::{ContextSnapshot, EvidenceReader, EvidenceRequest, EvidenceResult};
 use std::collections::BTreeMap;
@@ -89,6 +87,12 @@ impl<S: Store> StoreEvidence<'_, S> {
                     .take(self.limit)
                     .cloned()
                     .collect::<Vec<_>>();
+                // Initialize exactly the sources exposed by this read, before
+                // recording provenance. Keep the original atomic content snapshot.
+                self.store.snapshot_agent_sources(
+                    self.account,
+                    &messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+                )?;
                 self.sources
                     .lock()
                     .expect("evidence sources")
@@ -194,15 +198,13 @@ impl<S: Store> StoreEvidence<'_, S> {
     }
 }
 
-fn bounded_message(message: &AgentMessage, chars: usize) -> serde_json::Value {
-    let mut value = serde_json::to_value(message).expect("message serialization");
-    value["body"] = crate::text::truncate_chars(&message.body, chars).into();
-    value["body_truncated"] = (message.body.chars().count() > chars).into();
-    value
-}
-
 fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnapshot {
-    let siblings = context.thread.iter().take(limit).collect::<Vec<_>>();
+    let siblings = context
+        .thread
+        .iter()
+        .filter(|message| message.id != context.message.id)
+        .take(limit)
+        .collect::<Vec<_>>();
     let mut sources = siblings.iter().map(|m| m.id).collect::<Vec<_>>();
     sources.push(context.message.id);
     sources.sort_unstable();
@@ -212,11 +214,12 @@ fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnap
         message_id: job.message_id,
         thread_id: context.message.thread_id.clone(),
         initial: serde_json::json!({
-            "message": bounded_message(&context.message, 24_000),
-            "thread": siblings.iter().map(|m| bounded_message(m, 6_000)).collect::<Vec<_>>(),
+            "message": context.message,
+            "thread": siblings,
             "previous_decision": context.previous_decision,
             "attention": context.attention,
-            "sender_preferences": context.rules,
+            "sender_preferences": context.matched_rules,
+            "sender_is_contact": context.sender_is_contact,
             "user_corrections": context.corrections,
             "trigger": job.trigger,
             "access_only": context.message.is_sent || context.message.is_spam,
@@ -230,7 +233,7 @@ fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnap
         .into_iter()
         .collect(),
         rule_ids: context
-            .rules
+            .matched_rules
             .iter()
             .filter_map(|r| r.get("id").and_then(|id| id.as_i64()))
             .collect(),
@@ -344,6 +347,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let mut exposed_ids = context
             .thread
             .iter()
+            .filter(|message| message.id != context.message.id)
             .take(self.config.triage.context.initial_thread_messages)
             .map(|message| message.id)
             .collect::<Vec<_>>();
@@ -716,6 +720,98 @@ fn investigation_budget_limits(config: &Config, job: &AgentJob) -> Vec<(String, 
 mod budget_tests {
     use super::*;
     use crate::store::{SqliteStore, agent_triage::AgentTriageStore};
+
+    fn evidence_fixture() -> (SqliteStore, AccountId, Vec<i64>) {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let account = store.ensure_account("context@example.com").unwrap();
+        let ids = (0..3)
+            .map(|index| {
+                store
+                    .upsert_message(&crate::types::NewMessage {
+                        account_id: account,
+                        gmail_msg_id: format!("message-{index}"),
+                        thread_id: "thread".into(),
+                        from_addr: "sender@example.com".into(),
+                        from_name: None,
+                        subject: "Subject".into(),
+                        received_at: Utc::now(),
+                        snippet: String::new(),
+                        body: format!("{}decisive tail", "x".repeat(28_000)),
+                        body_html: None,
+                        is_sent: false,
+                        is_spam: false,
+                        to_addrs: None,
+                        list_unsubscribe: None,
+                        list_unsub_one_click: false,
+                        auth_pass: None,
+                    })
+                    .unwrap()
+            })
+            .collect();
+        (store, account, ids)
+    }
+
+    #[test]
+    fn snapshot_preserves_target_once_and_only_applicable_preferences() {
+        let (store, account, ids) = evidence_fixture();
+        let job = read_job(account, ids[0]);
+        let mut context = store.load_agent_context(&job).unwrap();
+        context.sender_is_contact = true;
+        context.rules = vec![serde_json::json!({"id":99,"want_text":"unrelated"})];
+        context.matched_rules = vec![serde_json::json!({"id":7,"want_text":"relevant"})];
+        let snapshot = snapshot(&context, &job, 8);
+        assert!(
+            snapshot.initial["message"]["body"]
+                .as_str()
+                .unwrap()
+                .ends_with("decisive tail")
+        );
+        assert_eq!(snapshot.initial["thread"].as_array().unwrap().len(), 2);
+        assert!(
+            snapshot.initial["thread"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| message["id"] != ids[0])
+        );
+        assert_eq!(snapshot.initial["sender_is_contact"], true);
+        assert_eq!(snapshot.rule_ids, vec![7]);
+        assert!(!snapshot.initial.to_string().contains("unrelated"));
+    }
+
+    #[test]
+    fn read_thread_initializes_only_exposed_source_assessments() {
+        let (store, account, ids) = evidence_fixture();
+        let reader = StoreEvidence {
+            store: &store,
+            account,
+            limit: 2,
+            sources: std::sync::Mutex::new(Vec::new()),
+        };
+        let result = reader
+            .read(&EvidenceRequest::ReadThread {
+                thread_id: "thread".into(),
+            })
+            .unwrap();
+        assert_eq!(result.source_message_ids.len(), 2);
+        let mut queued = Vec::new();
+        while let Some(job) = store
+            .claim_agent_job(account, "access", Utc::now(), 60)
+            .unwrap()
+        {
+            queued.push(job.message_id);
+            assert!(!job.arrival_eligible);
+            store.complete_agent_job(&job).unwrap();
+        }
+        queued.sort_unstable();
+        let mut exposed = result.source_message_ids;
+        exposed.sort_unstable();
+        assert_eq!(queued, exposed);
+        assert!(
+            !queued.contains(&ids[0]),
+            "unseen oldest sibling remains unqueued"
+        );
+    }
 
     #[test]
     fn migration_cannot_spend_arrival_reserve_and_old_escalation_caps_do_not_bind() {

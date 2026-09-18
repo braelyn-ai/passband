@@ -27,6 +27,7 @@ enum EventBanner {
     static let threadKey = "passband.thread_id"
     static let eventKey = "passband.event_id"
     static let messageKey = "passband.message_id"
+    static let authKey = "passband.is_auth"
     /// The posting account's uuid, as a string (userInfo has to survive being
     /// written to disk by the system and read back into a later launch).
     static let accountKey = "passband.account_id"
@@ -83,6 +84,10 @@ enum EventBanner {
     static func routing(for event: Event) -> Routing {
         guard let kind = event.sealed_kind else { return .threadBanner }
         return .authSignal(kind)
+    }
+
+    static func shouldPresentForeground(appActive: Bool, windowVisible: Bool, isTest: Bool, isAuth: Bool) -> Bool {
+        isTest || isAuth || !(appActive && windowVisible)
     }
 
     // MARK: - content mapping
@@ -142,7 +147,7 @@ enum EventBanner {
             threadIdentifier: group,
             // Sound only for the time-bound kinds — a chime per surfaced email
             // is how a notification stream gets muted wholesale.
-            sound: event.kind != .surfaced)
+            sound: event.isAuth || event.kind != .surfaced)
     }
 
     /// The AUTH banner's copy: a mailbox has just been sent a login code (or a

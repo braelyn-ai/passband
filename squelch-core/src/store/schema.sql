@@ -897,17 +897,14 @@ CREATE TABLE IF NOT EXISTS events (
     message_id  INTEGER NOT NULL UNIQUE,
     thread_id   TEXT NOT NULL,
     kind        TEXT NOT NULL,         -- urgent | deadline | surfaced | opened
+    is_auth     INTEGER NOT NULL DEFAULT 0 CHECK(is_auth IN (0,1)),
     tier        TEXT NOT NULL,
     importance  INTEGER NOT NULL,
     sender      TEXT NOT NULL,
     one_line    TEXT NOT NULL,
     deadline    TEXT,                  -- RFC3339 snapshot, or NULL
-    -- WHICH AUTH SHAPE this row is about (otp | password_reset | magic_link |
-    -- login_alert | verification), NULL for every ordinary event. It exists so a
-    -- client can ROUTE the tap to the sealed reveal flow instead of a thread
-    -- fetch the human door 404s, and pick an icon. It is NOT A GATE: no query
-    -- reads it to decide what to serve, and none may — the serving rules are
-    -- `triage.sensitivity`, as they have always been.
+    -- Legacy subtype retained for replay compatibility. New events carry is_auth
+    -- independently of external-agent access and always open the exact email.
     sealed_kind TEXT,
     created_at  TEXT NOT NULL
 );
@@ -1465,3 +1462,33 @@ CREATE TABLE IF NOT EXISTS agent_thread_preferences (
     updated_at TEXT NOT NULL,
     PRIMARY KEY(account_id,thread_id)
 );
+
+-- Attention may be updated from a different conversation without borrowing that
+-- conversation's message identity, categories, summary, or typed records.
+CREATE TABLE IF NOT EXISTS agent_attention_sources (
+    account_id INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    source_revision INTEGER NOT NULL,
+    PRIMARY KEY(account_id,thread_id,source_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_attention_source_reverse ON agent_attention_sources(account_id,source_message_id);
+CREATE INDEX IF NOT EXISTS idx_agent_decision_source_reverse ON agent_decision_sources(account_id,source_message_id);
+
+-- Repair beta related-thread projections without losing their evidence guard.
+-- Classification belongs to the target; the updating decision is provenance.
+INSERT OR IGNORE INTO agent_attention_sources(account_id,thread_id,source_message_id,source_revision)
+SELECT a.account_id,a.thread_id,d.source_message_id,d.source_revision
+FROM agent_thread_attention a JOIN agent_decision_sources d
+  ON d.account_id=a.account_id AND d.message_id=a.decision_message_id
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id=a.account_id
+                  AND m.id=a.decision_message_id AND m.thread_id=a.thread_id);
+INSERT OR IGNORE INTO agent_attention_sources(account_id,thread_id,source_message_id,source_revision)
+SELECT a.account_id,a.thread_id,a.decision_message_id,COALESCE(s.revision,0)
+FROM agent_thread_attention a
+LEFT JOIN agent_message_state s ON s.account_id=a.account_id AND s.message_id=a.decision_message_id
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id=a.account_id
+                  AND m.id=a.decision_message_id AND m.thread_id=a.thread_id);
+UPDATE agent_thread_attention SET decision_message_id=message_id
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id=agent_thread_attention.account_id
+                  AND m.id=agent_thread_attention.decision_message_id AND m.thread_id=agent_thread_attention.thread_id);

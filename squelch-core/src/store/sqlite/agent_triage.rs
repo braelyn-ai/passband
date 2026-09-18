@@ -126,7 +126,7 @@ fn context(conn: &Connection, account: AccountId, id: i64) -> Result<AgentContex
         params![account, message.from_addr],
         |row| row.get(0),
     )?;
-    let matched_rules = rules
+    let matched_rules: Vec<serde_json::Value> = rules
         .iter()
         .filter(|rule| {
             crate::triage::rules::glob_match(
@@ -152,7 +152,7 @@ fn context(conn: &Connection, account: AccountId, id: i64) -> Result<AgentContex
         .collect();
     let revision = ContextRevision {
         content: fingerprint(&content)?,
-        preferences: fingerprint(&(&rules, &corrections))?,
+        preferences: fingerprint(&(&matched_rules, sender_is_contact, &corrections))?,
         user_state: fingerprint(&state)?,
         attention_revision: attention.as_ref().map(|a| a.1).unwrap_or(0),
     };
@@ -314,8 +314,19 @@ pub(super) fn correct_agent_triage_conn(
     value: &serde_json::Value,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    // Validate before mutation, including on mail awaiting its first decision.
-    apply_correction(&mut MessageDecision::default(), field, value)?;
+    // Validate against the current effective classification before mutating jobs or intent.
+    let encoded: Option<String> = conn.query_row(
+        "SELECT decision_json FROM agent_message_decisions WHERE account_id=?1 AND message_id=?2",
+        params![account,message], |row| row.get(0)).optional()?;
+    let mut candidate: MessageDecision = encoded
+        .as_deref()
+        .map(decode)
+        .transpose()?
+        .unwrap_or_default();
+    apply_correction(&mut candidate, field, value)?;
+    if field == "kinds" && candidate.kinds.is_empty() {
+        return Err(CoreError::InvalidInput("kinds cannot be empty".into()));
+    }
     let trigger = format!("correction:{}", now.to_rfc3339());
     enqueue_agent_triage_conn(conn, account, message, &trigger, false)?;
     let revision: i64 = conn.query_row(
@@ -610,8 +621,105 @@ pub(crate) fn enqueue_agent_triage_conn(
             )?;
         }
     }
+    if changed {
+        queue_dependent_refreshes(conn, account, message, revision)?;
+    }
     Ok(())
 }
+/// A source revision invalidates its consumers' model results, never their
+/// human corrections. The existing per-message queue absorbs overlapping waves.
+fn queue_dependent_refreshes(
+    conn: &Connection,
+    account: AccountId,
+    source: i64,
+    revision: i64,
+) -> Result<()> {
+    let targets = {
+        let mut statement = conn.prepare(
+            "WITH RECURSIVE edges(dependent,source) AS (
+                SELECT message_id,source_message_id FROM agent_decision_sources WHERE account_id=?1
+                UNION SELECT a.message_id,s.source_message_id FROM agent_attention_sources s
+                    JOIN agent_thread_attention a ON a.account_id=s.account_id AND a.thread_id=s.thread_id WHERE s.account_id=?1
+             ), affected(message_id) AS (
+                SELECT dependent FROM edges WHERE source=?2
+                UNION SELECT e.dependent FROM edges e JOIN affected a ON e.source=a.message_id
+             ) SELECT m.id,a.revision,CASE WHEN m.is_sent=1 OR m.is_spam=1 THEN 'access' ELSE 'triage' END
+               FROM affected d JOIN messages m ON m.account_id=?1 AND m.id=d.message_id
+               JOIN agent_message_state a ON a.account_id=m.account_id AND a.message_id=m.id WHERE m.id!=?2 ORDER BY m.id",
+        )?;
+        statement
+            .query_map(params![account, source], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (message, input_revision, kind) in targets {
+        queue_investigation(
+            conn,
+            account,
+            message,
+            input_revision,
+            &kind,
+            &format!("source_changed:{source}:{revision}"),
+            false,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn replace_attention_sources(
+    conn: &Connection,
+    account: AccountId,
+    thread: &str,
+    sources: &[AgentSourceSnapshot],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM agent_attention_sources WHERE account_id=?1 AND thread_id=?2",
+        params![account, thread],
+    )?;
+    for source in sources {
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM agent_message_state WHERE account_id=?1 AND message_id=?2",
+                params![account, source.message_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        conn.execute("INSERT OR IGNORE INTO agent_attention_sources(account_id,thread_id,source_message_id,source_revision) VALUES(?1,?2,?3,?4)",
+            params![account,thread,source.message_id,revision])?;
+    }
+    Ok(())
+}
+
+fn attention_sources_allowed(conn: &Connection, account: AccountId, thread: &str) -> Result<bool> {
+    let mut statement=conn.prepare("SELECT s.source_message_id,s.source_revision,a.revision FROM agent_attention_sources s
+        LEFT JOIN agent_message_state a ON a.account_id=s.account_id AND a.message_id=s.source_message_id
+        WHERE s.account_id=?1 AND s.thread_id=?2")?;
+    let sources = statement
+        .query_map(params![account, thread], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (id, expected, actual) in sources {
+        if actual != Some(expected)
+            || !super::messages::external_message_allowed_conn(conn, account, id)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Revisit limits apply to the message's entire history, not just its current
 /// content revision. Manual requests never reset the autonomous lifetime cap.
 fn schedule_revisit(
@@ -818,8 +926,16 @@ impl AgentTriageStore for SqliteStore {
         account: AccountId,
         limit: usize,
     ) -> Result<Vec<AgentListItem>> {
+        self.external_agent_reading_with_query(account, limit, &AgentListQuery::default())
+    }
+    fn external_agent_reading_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>> {
         let conn = self.lock()?;
-        let mut items = list_items(&conn, account, "reading", Utc::now())?;
+        let mut items = list_items_with_query(&conn, account, "reading", Utc::now(), query)?;
         restrict_external_items(&conn, account, &mut items)?;
         items.sort_by(|a, b| {
             b.received_at
@@ -853,8 +969,16 @@ impl AgentTriageStore for SqliteStore {
         account: AccountId,
         limit: usize,
     ) -> Result<Vec<AgentListItem>> {
+        self.external_agent_records_with_query(account, limit, &AgentListQuery::default())
+    }
+    fn external_agent_records_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>> {
         let conn = self.lock()?;
-        let mut items = list_items(&conn, account, "records", Utc::now())?;
+        let mut items = list_items_with_query(&conn, account, "records", Utc::now(), query)?;
         restrict_external_items(&conn, account, &mut items)?;
         items.sort_by(|a, b| {
             b.received_at
@@ -863,6 +987,11 @@ impl AgentTriageStore for SqliteStore {
         });
         items.truncate(limit);
         Ok(items)
+    }
+    fn agent_shipment_is_cleared(&self, account: AccountId, tracking_number: &str) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM shipments WHERE account_id=?1 AND tracking_number=?2 AND cleared_at IS NOT NULL AND last_update<=cleared_at)",
+            params![account,tracking_number], |row|row.get(0))?)
     }
     fn correct_agent_triage(
         &self,
@@ -1214,6 +1343,14 @@ impl AgentTriageStore for SqliteStore {
         }
         let mut decision = decision.clone();
         apply_corrections(&tx, job.account_id, job.message_id, &mut decision)?;
+        let has_kind_correction: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_triage_corrections WHERE account_id=?1 AND message_id=?2 AND field='kinds')",
+            params![job.account_id,job.message_id], |row|row.get(0))?;
+        if has_kind_correction && decision.kinds.is_empty() {
+            return Err(CoreError::InvalidInput(
+                "kinds cannot be empty after applying user corrections".into(),
+            ));
+        }
         let decision = &decision;
         let revision: i64 = tx.query_row(
             "SELECT revision FROM agent_message_state WHERE account_id=?1 AND message_id=?2",
@@ -1257,6 +1394,7 @@ impl AgentTriageStore for SqliteStore {
                 job.message_id,
                 &decision.attention,
             )?;
+            replace_attention_sources(&tx, job.account_id, &current.message.thread_id, sources)?;
             for update in &decision.related_updates {
                 apply_attention(
                     &tx,
@@ -1265,6 +1403,7 @@ impl AgentTriageStore for SqliteStore {
                     job.message_id,
                     &update.attention,
                 )?;
+                replace_attention_sources(&tx, job.account_id, &update.thread_id, sources)?;
             }
         }
         tx.execute(
@@ -1372,12 +1511,8 @@ impl AgentTriageStore for SqliteStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<AgentMessage>> {
-        let expression = query
-            .split_whitespace()
-            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        if expression.is_empty() {
+        let query = crate::store::FtsQuery::build(query, false);
+        if query.terms.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let conn = self.lock()?;
@@ -1387,12 +1522,23 @@ impl AgentTriageStore for SqliteStore {
              WHERE messages_fts MATCH ?2 AND m.account_id=?1 AND m.is_sent=0 AND m.is_spam=0
              ORDER BY bm25(messages_fts),m.received_at DESC,m.id DESC LIMIT ?3"
         ))?;
-        let rows = statement
-            .query_map(
-                params![account, expression, limit.min(100) as i64],
-                message_row,
-            )?
+        let limit = limit.min(100);
+        let mut rows = statement
+            .query_map(params![account, query.strict, limit as i64], message_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() < limit && query.terms.len() > 1 {
+            let partial = statement
+                .query_map(params![account, query.any, limit as i64], message_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for message in partial {
+                if rows.len() == limit {
+                    break;
+                }
+                if !rows.iter().any(|existing| existing.id == message.id) {
+                    rows.push(message);
+                }
+            }
+        }
         ensure_source_assessments(&conn, account, &rows)?;
         rows.into_iter()
             .map(|message| read_message(&conn, account, message.id))
@@ -1476,8 +1622,17 @@ impl AgentTriageStore for SqliteStore {
         Ok(items)
     }
     fn agent_records(&self, account: AccountId, limit: usize) -> Result<Vec<AgentListItem>> {
+        self.agent_records_with_query(account, limit, &AgentListQuery::default())
+    }
+    fn agent_records_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>> {
         let conn = self.lock()?;
-        let mut items = list_items(&conn, account, "records", Utc::now())?;
+        let mut items = list_items_with_query(&conn, account, "records", Utc::now(), query)?;
+
         items.sort_by(|a, b| {
             b.received_at
                 .cmp(&a.received_at)
@@ -1487,8 +1642,17 @@ impl AgentTriageStore for SqliteStore {
         Ok(items)
     }
     fn agent_reading(&self, account: AccountId, limit: usize) -> Result<Vec<AgentListItem>> {
+        self.agent_reading_with_query(account, limit, &AgentListQuery::default())
+    }
+    fn agent_reading_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>> {
         let conn = self.lock()?;
-        let mut items = list_items(&conn, account, "reading", Utc::now())?;
+        let mut items = list_items_with_query(&conn, account, "reading", Utc::now(), query)?;
+
         items.sort_by(|a, b| {
             b.received_at
                 .cmp(&a.received_at)
@@ -1506,7 +1670,8 @@ fn restrict_external_items(
 ) -> Result<()> {
     let mut allowed = Vec::with_capacity(items.len());
     for item in items.drain(..) {
-        if super::messages::external_message_allowed_conn(conn, account, item.message_id)?
+        if attention_sources_allowed(conn, account, &item.thread_id)?
+            && super::messages::external_message_allowed_conn(conn, account, item.message_id)?
             && super::messages::external_message_allowed_conn(
                 conn,
                 account,
@@ -1623,6 +1788,16 @@ fn apply_attention(
             .optional()?
             .unwrap_or((Utc::now().to_rfc3339(), fallback_message)),
     };
+    let decision_message = if read_message(conn, account, fallback_message)?.thread_id == thread {
+        fallback_message
+    } else {
+        if read_message(conn, account, id)?.thread_id != thread {
+            return Err(CoreError::InvalidInput(
+                "attention has no target-thread representative".into(),
+            ));
+        }
+        id
+    };
     let unresolved_since = if attention.actions.iter().any(|action| !action.resolved)
         || attention.state == crate::triage::decision::AttentionState::NeedsUser
     {
@@ -1645,7 +1820,7 @@ fn apply_attention(
              unresolved_since=CASE WHEN excluded.unresolved_since IS NULL THEN NULL
                  ELSE COALESCE(agent_thread_attention.unresolved_since,excluded.unresolved_since) END",
         params![account,thread,id,attention.show_in_fye,json(&attention)?,
-            activity,unresolved_since,fallback_message],
+            activity,unresolved_since,decision_message],
     )?;
     Ok(())
 }
@@ -1655,16 +1830,26 @@ fn list_items(
     destination: &str,
     now: DateTime<Utc>,
 ) -> Result<Vec<AgentListItem>> {
+    list_items_with_query(conn, account, destination, now, &AgentListQuery::default())
+}
+
+fn list_items_with_query(
+    conn: &Connection,
+    account: AccountId,
+    destination: &str,
+    now: DateTime<Utc>,
+    query: &AgentListQuery,
+) -> Result<Vec<AgentListItem>> {
     let sql = if destination == "fye" {
         "SELECT
              m.id,m.thread_id,m.from_addr,m.subject,
-             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(a.relevant_activity),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,d.message_id
+             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(a.relevant_activity),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,a.decision_message_id
              FROM agent_thread_attention a JOIN messages m ON m.account_id=a.account_id AND
-             m.id=a.message_id JOIN agent_message_decisions d ON d.account_id=m.account_id AND
+             m.id=a.message_id LEFT JOIN agent_message_decisions d ON d.account_id=m.account_id AND
              d.message_id=a.decision_message_id LEFT JOIN triage t ON t.account_id=m.account_id AND
              t.message_id=m.id WHERE a.account_id=?1 AND ?3='fye' AND (a.show_in_fye=1 OR t.reminded_at
              IS NOT NULL) AND m.is_sent=0 AND m.is_spam=0 AND COALESCE(t.status,'new')!='done' AND
-             (t.remind_at IS NULL OR t.remind_at<=?2)"
+             (t.remind_at IS NULL OR t.remind_at<=?2) AND ?4 IS ?4 AND ?5 IS ?5"
     } else {
         "SELECT
              m.id,m.thread_id,m.from_addr,m.subject,
@@ -1674,23 +1859,33 @@ fn list_items(
              d.message_id=m.id LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id
              LEFT JOIN agent_thread_attention a ON a.account_id=m.account_id AND
              a.thread_id=m.thread_id WHERE p.account_id=?1 AND p.destination=?3 AND m.is_sent=0 AND
-             m.is_spam=0 AND ?2 IS NOT NULL"
+             m.is_spam=0 AND (?4 OR COALESCE(t.status,'new')!='done') AND
+             (?5 IS NULL OR min(julianday(m.received_at),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))>=julianday(?5))"
     };
     let mut stmt = conn.prepare(sql)?;
     let raw = stmt
-        .query_map(params![account, now.to_rfc3339(), destination], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<String>>(7)?,
-                r.get::<_, i64>(8)?,
-            ))
-        })?
+        .query_map(
+            params![
+                account,
+                now.to_rfc3339(),
+                destination,
+                query.include_done,
+                query.since.map(|value| value.to_rfc3339())
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, i64>(8)?,
+                ))
+            },
+        )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut items: Vec<AgentListItem> = raw
         .into_iter()
@@ -1713,7 +1908,7 @@ fn list_items(
                     from_addr,
                     subject,
                     received_at,
-                    decision: decode(&d)?,
+                    decision: d.as_deref().map(decode).transpose()?.unwrap_or_default(),
                     attention: a.as_deref().map(decode).transpose()?.unwrap_or_default(),
                     score: 0.0,
                     unresolved_since,
@@ -1818,8 +2013,8 @@ mod tests {
              VALUES(?1,?2,?3,?4,'sender@test','subject',?5,'snippet','body')",
         params![id,account,id.to_string(),thread,Utc::now().to_rfc3339()]).unwrap();
                 conn.execute(
-                    "INSERT INTO triage(account_id,message_id,created_at) VALUES(?1,?2,'2026-01-01')",
-                    params![account, id],
+                    "INSERT INTO triage(account_id,message_id,created_at) VALUES(?1,?2,?3)",
+                    params![account, id, Utc::now().to_rfc3339()],
                 )
                 .unwrap();
             }
@@ -2629,6 +2824,63 @@ mod tests {
                 .is_none(),
             "no self-requeue"
         );
+    }
+
+    #[test]
+    fn unrelated_sender_rule_does_not_stale_an_investigation() {
+        let store = fixture();
+        let (job, original) = claim(&store, 1);
+        crate::store::Store::set_sender_rule(
+            &store,
+            1,
+            "elsewhere@other.test",
+            "ignore promotions",
+            crate::types::Disposition::Squelch,
+        )
+        .unwrap();
+        let fresh = store.load_agent_context(&job).unwrap();
+        assert_eq!(original.revision.preferences, fresh.revision.preferences);
+        assert_eq!(
+            store
+                .commit_agent_decision(
+                    &job,
+                    &original,
+                    &decision(1),
+                    &store.snapshot_agent_sources(1, &[1]).unwrap()
+                )
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn multiword_evidence_search_keeps_partial_matches_below_exact_matches() {
+        let store = fixture();
+        // Update both storage and index: one complete match and one partial.
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("UPDATE messages SET body=CASE id WHEN 1 THEN 'invoice zebra' ELSE 'zebra shipment' END",[]).unwrap();
+            conn.execute("DELETE FROM messages_fts", []).unwrap();
+            conn.execute(
+                "INSERT INTO messages_fts(rowid,subject,body) SELECT id,subject,body FROM messages",
+                [],
+            )
+            .unwrap();
+        }
+        let results = store.agent_search_mail(1, "invoice zebra", 10).unwrap();
+        assert_eq!(results.first().map(|message| message.id), Some(1));
+        assert!(
+            results.iter().any(|message| message.id == 2),
+            "partial matches support investigation"
+        );
+        assert_eq!(
+            store
+                .agent_search_mail(1, "invoice zebra", 1)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.agent_search_mail(1, "", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -3672,5 +3924,371 @@ mod inventory_tests {
             .unwrap();
         assert!(store.external_agent_records(1, 10).unwrap().is_empty());
         assert_eq!(store.agent_records(1, 10).unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::tests::{claim, decision, fixture};
+    use super::*;
+    use crate::triage::decision::{EmailKind, RelatedAttentionUpdate};
+
+    fn commit(store: &SqliteStore, id: i64, sources: &[i64]) {
+        let (job, context) = claim(store, id);
+        assert_eq!(
+            store
+                .commit_agent_decision(
+                    &job,
+                    &context,
+                    &decision(id),
+                    &store.snapshot_agent_sources(1, sources).unwrap()
+                )
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn related_attention_keeps_target_identity_and_guards_its_separate_sources() {
+        let store = fixture();
+        commit(&store, 2, &[2]);
+        let (job, context) = claim(&store, 1);
+        let target = store.agent_thread_context(1, "two").unwrap();
+        let mut proposed = decision(1);
+        proposed.summary = "Source classification must not replace target".into();
+        proposed.kinds = vec![EmailKind::Bill];
+        proposed.external_access.restricted = true;
+        let mut attention = decision(2).attention;
+        attention.summary = "Related evidence changed this attention".into();
+        proposed.related_updates.push(RelatedAttentionUpdate {
+            thread_id: "two".into(),
+            expected_revision: target.revision.attention_revision,
+            attention,
+            evidence: vec![],
+        });
+        let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+        assert_eq!(
+            store
+                .commit_agent_decision(&job, &context, &proposed, &sources)
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        let items = store
+            .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+            .unwrap();
+        let target = items.iter().find(|item| item.thread_id == "two").unwrap();
+        assert_eq!(target.message_id, 2);
+        assert_eq!(target.decision_source_message_id, 2);
+        assert_eq!(target.decision.summary, "Summary");
+        assert_eq!(target.decision.kinds, vec![EmailKind::Correspondence]);
+        assert_eq!(
+            target.attention.summary,
+            "Related evidence changed this attention"
+        );
+        assert!(store.agent_access_allowed(1, 2).unwrap());
+        assert!(
+            store
+                .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn changed_evidence_refreshes_transitive_dependents_once_even_with_cycles() {
+        let store = fixture();
+        // Both decisions consume each other. Source changes must visit each once.
+        commit(&store, 2, &[1, 2]);
+        commit(&store, 1, &[1, 2]);
+        store
+            .correct_agent_triage(
+                1,
+                1,
+                "external_access",
+                &serde_json::json!(true),
+                Utc::now(),
+            )
+            .unwrap();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("UPDATE messages SET body='revised' WHERE id=2", [])
+                .unwrap();
+            enqueue_agent_triage_conn(&conn, 1, 2, "backfill", false).unwrap();
+            enqueue_agent_triage_conn(&conn, 1, 2, "backfill", false).unwrap();
+            let pending:i64=conn.query_row("SELECT COUNT(*) FROM agent_triage_jobs WHERE account_id=1 AND message_id=1 AND kind='triage' AND state IN('queued','leased')",[],|row|row.get(0)).unwrap();
+            assert_eq!(pending, 1);
+            let revision: i64 = conn
+                .query_row(
+                    "SELECT revision FROM agent_message_state WHERE account_id=1 AND message_id=1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                revision, 1,
+                "evidence refresh does not pretend target content changed"
+            );
+        }
+        assert!(
+            !store.agent_access_allowed(1, 1).unwrap(),
+            "human restriction survives evidence refresh"
+        );
+    }
+
+    #[test]
+    fn source_revision_refresh_reaches_indirect_consumers() {
+        let store = fixture();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("UPDATE messages SET account_id=1 WHERE id=3", [])
+                .unwrap();
+            conn.execute("UPDATE triage SET account_id=1 WHERE message_id=3", [])
+                .unwrap();
+        }
+        commit(&store, 2, &[2]);
+        commit(&store, 1, &[1, 2]);
+        commit(&store, 3, &[1, 3]);
+        assert!(store.agent_access_allowed(1, 3).unwrap());
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("UPDATE messages SET body='source changed' WHERE id=2", [])
+                .unwrap();
+            enqueue_agent_triage_conn(&conn, 1, 2, "backfill", false).unwrap();
+            let queued=conn.prepare("SELECT message_id FROM agent_triage_jobs WHERE kind='triage' AND state='queued' ORDER BY message_id").unwrap().query_map([],|row|row.get::<_,i64>(0)).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
+            assert_eq!(queued, vec![1, 2, 3]);
+        }
+        assert!(
+            !store.agent_access_allowed(1, 3).unwrap(),
+            "indirect evidence must remain inaccessible until refreshed"
+        );
+    }
+
+    #[test]
+    fn opening_schema_repairs_old_cross_thread_identity_without_dropping_sources() {
+        let store = fixture();
+        commit(&store, 1, &[1]);
+        commit(&store, 2, &[2]);
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_thread_attention SET decision_message_id=1 WHERE thread_id='two'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM agent_attention_sources WHERE thread_id='two'",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT decision_message_id FROM agent_thread_attention WHERE thread_id='two'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM agent_attention_sources WHERE thread_id='two' AND source_message_id=1",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM agent_attention_sources WHERE thread_id='two' AND source_message_id=1",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn deleted_related_source_does_not_remove_provenance_guard() {
+        let store = fixture();
+        commit(&store, 2, &[2]);
+        let (job, context) = claim(&store, 1);
+        let target = store.agent_thread_context(1, "two").unwrap();
+        let mut proposed = decision(1);
+        proposed.related_updates.push(RelatedAttentionUpdate {
+            thread_id: "two".into(),
+            expected_revision: target.revision.attention_revision,
+            attention: decision(2).attention,
+            evidence: vec![],
+        });
+        store
+            .commit_agent_decision(
+                &job,
+                &context,
+                &proposed,
+                &store.snapshot_agent_sources(1, &[1, 2]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .len(),
+            2
+        );
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("DELETE FROM messages WHERE id=1", []).unwrap();
+            conn.execute("DELETE FROM agent_message_state WHERE message_id=1", [])
+                .unwrap();
+            assert!(!attention_sources_allowed(&conn, 1, "two").unwrap());
+        }
+        assert_eq!(
+            store
+                .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn inventories_default_to_recent_unfinished_with_explicit_history_options() {
+        let store = fixture();
+        commit(&store, 1, &[1]);
+        commit(&store, 2, &[2]);
+        {
+            let conn = store.lock().unwrap();
+            conn.execute("UPDATE triage SET status='done' WHERE message_id=1", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE messages SET received_at=?1 WHERE id=2",
+                [(Utc::now() - Duration::days(40)).to_rfc3339()],
+            )
+            .unwrap();
+        }
+        assert!(store.agent_reading(1, 10).unwrap().is_empty());
+        assert!(store.agent_records(1, 10).unwrap().is_empty());
+        let all = AgentListQuery {
+            since: None,
+            include_done: true,
+        };
+        assert_eq!(
+            store.agent_reading_with_query(1, 10, &all).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store.agent_records_with_query(1, 10, &all).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store
+                .agent_records_with_query(
+                    1,
+                    10,
+                    &AgentListQuery {
+                        since: None,
+                        include_done: false
+                    }
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .agent_reading_with_query(
+                    1,
+                    10,
+                    &AgentListQuery {
+                        since: Some(Utc::now() - Duration::days(30)),
+                        include_done: true
+                    }
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn later_model_proposal_cannot_be_emptied_by_persisted_kind_delta() {
+        let store = fixture();
+        let (job, context) = claim(&store, 1);
+        let mut initial = decision(1);
+        initial.kinds = vec![EmailKind::Correspondence, EmailKind::Bill];
+        store
+            .commit_agent_decision(
+                &job,
+                &context,
+                &initial,
+                &store.snapshot_agent_sources(1, &[1]).unwrap(),
+            )
+            .unwrap();
+        store
+            .correct_agent_triage_delta(1, 1, "kinds", &[], &["bill".into()], Utc::now())
+            .unwrap();
+        let job = store
+            .claim_agent_job(1, "triage", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        let context = store.load_agent_context(&job).unwrap();
+        let sources = store.snapshot_agent_sources(1, &[1]).unwrap();
+        let mut incompatible = decision(1);
+        incompatible.kinds = vec![EmailKind::Bill];
+        incompatible.summary = "Must not be published".into();
+        assert!(matches!(
+            store.commit_agent_decision(&job, &context, &incompatible, &sources),
+            Err(CoreError::InvalidInput(_))
+        ));
+        let existing = store.agent_records(1, 10).unwrap().remove(0);
+        assert_eq!(existing.decision.kinds, vec![EmailKind::Correspondence]);
+        assert_eq!(existing.decision.summary, "Summary");
+        assert!(
+            leased(&store.lock().unwrap(), &job).unwrap(),
+            "rejection preserves the lease for bounded handling"
+        );
+        assert_eq!(
+            store
+                .commit_agent_decision(&job, &context, &decision(1), &sources)
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+    }
+
+    #[test]
+    fn kind_delta_cannot_remove_last_kind_and_rolls_back_intent_and_jobs() {
+        let store = fixture();
+        commit(&store, 1, &[1]);
+        assert!(matches!(
+            store.correct_agent_triage_delta(
+                1,
+                1,
+                "kinds",
+                &[],
+                &["correspondence".into()],
+                Utc::now()
+            ),
+            Err(CoreError::InvalidInput(_))
+        ));
+        {
+            let conn = store.lock().unwrap();
+            assert!(corrections(&conn, 1, 1).unwrap().is_empty());
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM agent_triage_jobs WHERE kind='triage' AND state='queued'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+                0
+            );
+        }
+        store
+            .correct_agent_triage_delta(
+                1,
+                1,
+                "kinds",
+                &["bill".into()],
+                &["correspondence".into()],
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.agent_records(1, 10).unwrap()[0].decision.kinds,
+            vec![EmailKind::Bill]
+        );
     }
 }

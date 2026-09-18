@@ -117,6 +117,9 @@ struct RootView: View {
                 await store.loadSettings()
             }
         }
+        .onChange(of: store.accountActionsBlocked) { _, blocked in
+            if !blocked { Notifier.shared.drainPendingTap() }
+        }
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
                 store.tour.maybeStart()

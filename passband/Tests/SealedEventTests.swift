@@ -29,6 +29,12 @@ struct SealedEventTests {
     static var checks = 0
 
     static func main() {
+        expect(EventBanner.shouldPresentForeground(appActive: true, windowVisible: true, isTest: false, isAuth: true), "Authentication pushes interrupt a foreground Mac")
+        expect(!EventBanner.shouldPresentForeground(appActive: true, windowVisible: true, isTest: false, isAuth: false), "Ordinary mail keeps foreground policy")
+        let auth = try! JSONDecoder().decode(Event.self, from: Data("""
+        {"id":99,"message_id":42,"thread_id":"auth","kind":"surfaced","tier":"signal","importance":0,"sender":"Security","one_line":"Login alert","created_at":"2026-09-17T12:00:00Z","is_auth":true}
+        """.utf8))
+        expect(auth.isAuth && EventBanner.copy(for: auth).sound, "Login alerts carry explicit auth and sound even at low importance")
         anOrdinaryEventDecodesWithNoSealedKey()
         aSealedEventCarriesItsKind()
         anUnheardOfKindKeepsItsRawString()

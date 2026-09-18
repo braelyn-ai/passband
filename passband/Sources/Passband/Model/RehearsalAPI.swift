@@ -57,6 +57,32 @@ actor RehearsalAPI {
         let data: Data
 
         switch (method, path) {
+        case ("GET", "/client/v2/feed"):
+            let destination = query["destination"] ?? "fye"
+            let items = mailbox.messages.filter { message in
+                let row = update(message)
+                switch destination {
+                case "fye": return row.status != .done && row.tier != .noise
+                case "reading": return message.lane == .reading && !message.isDone && ruleFor(message)?.disposition != .squelch
+                case "records": return message.lane == .records
+                default: return false
+                }
+            }.map { message in
+                let row = update(message)
+                let kinds: [OnboardingRehearsal.Category: String] = [
+                    .attention: "correspondence", .newsletters: "editorial", .calendar: "event_reservation",
+                    .shipments: "delivery", .banking: "financial_update", .receipts: "receipt"]
+                return AgentFeedItem(message_id: message.id, thread_id: threadID(message.id),
+                    from_addr: address(message), subject: message.subject, received_at: stamp(),
+                    decision: AgentMessageDecision(kinds: [kinds[message.category]!],
+                        destinations: message.lane == .records ? ["records"] : message.lane == .reading ? ["reading"] : [],
+                        summary: message.explanation, reason: message.explanation, records: recordFacts(message)),
+                    attention: AgentAttention(show_in_fye: row.status != .done && row.tier != .noise,
+                        state: "informational", summary: message.explanation,
+                        factors: AgentAttentionFactors(urgency: 0, action_need: 0, personal_relevance: 1, importance: 0.5)), score: 0)
+            }
+            data = try encode(AgentFeed(total_count: items.count, version: 2, ranked_at: stamp(),
+                items: Array(items.prefix(max(1, query["limit"].flatMap(Int.init) ?? 200)))))
         case ("GET", "/client/stats"):
             let updates = allUpdates()
             let stats = StoreStats(
@@ -138,7 +164,18 @@ actor RehearsalAPI {
             setStatus(id, .done)
             data = try encode(StatusResult(status: "done", message_id: id))
         default:
-            if components.count == 3, components[1] == "thread", method == "GET" {
+            if components.count >= 4, components[1] == "v2", components[2] == "messages",
+               let id = Int(components[3]), has(id) {
+                if components.count == 5, components[4] == "opened", method == "POST" {
+                    mailbox.open(id)
+                    data = try json(["ok": true])
+                } else if components.count == 4, method == "GET" {
+                    let nested = URLRequest(url: URL(string: "https://rehearsal.invalid/client/thread/\(threadID(id))")!)
+                    let (threadData, _) = try response(for: nested)
+                    let thread = try JSONDecoder().decode(ClientThreadView.self, from: threadData)
+                    data = try encode(HumanMessageEnvelope(message_id: id, thread: thread))
+                } else { throw unsupported() }
+            } else if components.count == 3, components[1] == "thread", method == "GET" {
                 let members = mailbox.messages.filter { threadID($0.id) == components[2] }
                 guard let first = members.first else { throw missing() }
                 let messages = members.map { message in
@@ -170,6 +207,23 @@ actor RehearsalAPI {
             } else { throw unsupported() }
         }
         return (data, HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!)
+    }
+
+    /// Fictional record facts use the same typed surface as real triage.
+    private func recordFacts(_ message: OnboardingRehearsal.Message) -> [AgentRecordProposal] {
+        switch message.category {
+        case .receipts:
+            return [AgentRecordProposal(kind: "receipt", merchant: message.sender,
+                amount: [2: 8.50, 8: 4.75, 19: 24.00][message.id], currency: "USD")]
+        case .calendar:
+            let titles = [10: "Dinner at Juniper Table", 17: "Design review with Maya · Zip", 18: "Nora Vale · The Atlas of Small Things"]
+            return [AgentRecordProposal(kind: "event", title: titles[message.id],
+                start: AgentSupportedTime(value: eventDate(message.id).ISO8601Format()))]
+        case .banking:
+            return [AgentRecordProposal(kind: "financial_update", institution: message.sender,
+                description: message.explanation)]
+        default: return []
+        }
     }
 
     private func update(_ message: OnboardingRehearsal.Message) -> AttentionUpdate {

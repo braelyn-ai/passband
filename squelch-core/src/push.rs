@@ -503,6 +503,7 @@ mod tests {
             sender: "alice@example.com".to_string(),
             one_line: "wire transfer needs approval today".to_string(),
             deadline: Some("2026-08-01T00:00:00Z".to_string()),
+            is_auth: false,
             sealed_kind: None,
             created_at: Utc::now(),
         }
@@ -511,7 +512,8 @@ mod tests {
     /// THE INVARIANT: if this test fails, the relay stopped being blind.
     #[test]
     fn body_is_blind() {
-        let ev = event(4711, "abc123");
+        let mut ev = event(4711, "abc123");
+        ev.is_auth = true;
         let tokens = vec!["aa".repeat(32)];
         let body = PushRequest {
             device_tokens: &tokens,

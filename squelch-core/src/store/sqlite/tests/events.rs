@@ -399,6 +399,7 @@ fn arrival_arbitration_obeys_open_done_and_snooze_for_both_lanes() {
         assert_eq!(store.append_event(&event).unwrap(), None, "{state}");
         let auth = NewEvent {
             kind: EventKind::Urgent,
+            is_auth: true,
             ..event
         };
         assert_eq!(
@@ -443,5 +444,33 @@ fn dispatch_rechecks_user_actions_after_an_event_was_queued() {
     assert!(
         store.event_by_id(acct, id).unwrap().is_some(),
         "delivery suppression preserves the event audit trail"
+    );
+}
+
+#[test]
+fn explicit_auth_flag_round_trips_and_legacy_json_defaults_false() {
+    let (store, acct) = store();
+    let mut auth = new_event(&store, acct, 901);
+    auth.is_auth = true;
+    auth.sealed_kind = None;
+    let id = store.append_event(&auth).unwrap().unwrap();
+    let stored = store.event_by_id(acct, id).unwrap().unwrap();
+    assert!(stored.is_auth);
+    assert!(store.events_after(acct, 0, 10).unwrap()[0].is_auth);
+    let mut json = serde_json::to_value(stored).unwrap();
+    assert_eq!(json["is_auth"], true);
+    json.as_object_mut().unwrap().remove("is_auth");
+    assert!(!serde_json::from_value::<Event>(json).unwrap().is_auth);
+    let mut legacy = serde_json::to_value(auth).unwrap();
+    legacy.as_object_mut().unwrap().remove("is_auth");
+    assert!(!serde_json::from_value::<NewEvent>(legacy).unwrap().is_auth);
+    let ordinary = new_event(&store, acct, 902);
+    let ordinary_id = store.append_event(&ordinary).unwrap().unwrap();
+    assert!(
+        !store
+            .event_by_id(acct, ordinary_id)
+            .unwrap()
+            .unwrap()
+            .is_auth
     );
 }

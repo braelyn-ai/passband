@@ -2755,6 +2755,7 @@ pub async fn get_mail_activity(
                 "deadline": r.deadline,
                 "signal": r.signal,
                 "noise": r.noise,
+                "pending": r.pending,
             })
         })
         .collect();

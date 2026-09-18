@@ -15,6 +15,9 @@ struct ThreadArrivalsTests {
     static var checks = 0
 
     static func main() {
+        expect(ThreadOpeningFocus.index(messageIds: [1, 2, 3], requested: 1) == 0, "Notification opens the requested historical message")
+        expect(ThreadOpeningFocus.index(messageIds: [1, 2, 3], requested: 99) == 2, "Unavailable target falls back to newest")
+        expect(ThreadOpeningFocus.index(messageIds: [1, 2, 3, 4], requested: nil) == 3, "Consumed navigation target does not hide sent reply")
         theArrival()
         toldOnceEvenWhenSeenTwice()
         refetchKeepsAsking()

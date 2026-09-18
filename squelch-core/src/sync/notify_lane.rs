@@ -1260,6 +1260,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, crate::types::EventKind::Urgent);
         assert_eq!(events[0].message_id, id);
+        assert!(
+            events[0].is_auth,
+            "login alerts retain their model auth flag"
+        );
+        assert_eq!(events[0].sealed_kind, None);
         let stored = store
             .latest_notification_assessment(acct, id, LaneLabel::Fast)
             .unwrap()
@@ -1413,10 +1418,17 @@ mod tests {
         let (id, candidate) = ingest(&store, account, "full-first", &note_eml(now), now, &cfg());
         let lane = lane(&store, account, Some(&url), cfg());
         let context = durable_context(&store, account, id);
-        lane.request_assessed(&context, true, &advice(), "full-model")
+        let mut auth_advice = advice();
+        auth_advice.importance = 0;
+        lane.request_assessed(&context, true, &auth_advice, "full-model")
             .unwrap();
         lane.clone().run(candidate.unwrap()).await.unwrap();
-        assert_eq!(store.events_after(account, 0, 10).unwrap().len(), 1);
+        let events = store.events_after(account, 0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].is_auth,
+            "deliberate auth survives dedup against later non-auth fast assessment"
+        );
         let rows = store
             .notify_decisions_since(account, now - chrono::Duration::seconds(1), 10)
             .unwrap();

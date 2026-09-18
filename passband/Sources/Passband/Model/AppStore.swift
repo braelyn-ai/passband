@@ -182,6 +182,7 @@ struct SitrepZoneCache: Sendable {
     var receipts: [Receipt] = []
     var newsletters: [Newsletter] = []
     var records: [AttentionUpdate] = []
+    var recordFacts: [Int: [AgentRecordProposal]] = [:]
     /// When the last full refresh COMPLETED. nil = never loaded.
     var loadedAt: Date?
 }
@@ -1971,6 +1972,8 @@ final class AppStore {
                 case .newsletters(let rows?): zones.newsletters = rows
                 case .records(let feed?):
                     zones.records = feed.items.map(\.readingRow)
+                    zones.recordFacts = Dictionary(feed.items.map { ($0.message_id, $0.decision.records ?? []) },
+                        uniquingKeysWith: { _, latest in latest })
                     zones.receipts = feed.receipts
                     zones.banking = feed.banking
                     zones.calendar = feed.calendar

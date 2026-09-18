@@ -462,15 +462,18 @@ actor APIClient {
     }
 
     func getReceipts(days: Int? = nil) async throws -> [Receipt] {
-        try await getFeed(destination: "records", limit: 1000).receipts
+        if RehearsalMode.isEnabled { return try await get("/client/receipts") }
+        return try await getFeed(destination: "records", limit: 1000).receipts
     }
 
     func getCalendar(hours: Int? = nil) async throws -> [CalendarUpdate] {
-        try await getFeed(destination: "records", limit: 1000).calendar
+        if RehearsalMode.isEnabled { return try await get("/client/calendar") }
+        return try await getFeed(destination: "records", limit: 1000).calendar
     }
 
     func getBanking() async throws -> [BankingRecord] {
-        try await getFeed(destination: "records", limit: 1000).banking
+        if RehearsalMode.isEnabled { return try await get("/client/banking") }
+        return try await getFeed(destination: "records", limit: 1000).banking
     }
 
     func getMarketing(days: Int? = nil) async throws -> [MarketingOffer] {

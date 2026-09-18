@@ -1,4 +1,4 @@
-// The `p` triage deck: a card-by-card walk of the new + still-open bands with the
+// The `p` triage deck: a card-by-card walk of the server-ordered FYE list with the
 // list's verbs (e archive, d done, t tune, Space skip). Reads the live bands from
 // the store, so items resolved elsewhere drop out of the queue too. `r` is the
 // one verb that LEAVES: replying happens in the reader, so the deck closes and
@@ -33,8 +33,7 @@ struct ProcessMode: View {
     /// Pending means not handled here *and* still in a live band — the item may
     /// have been resolved elsewhere.
     private var pending: [AttentionUpdate] {
-        let live = Set((store.sitrep.new + store.sitrep.open).map(\.id))
-        return queue.filter { !handled.contains($0.id) && live.contains($0.id) }
+        ProcessQueue.pending(snapshot: queue, live: store.sitrep.standing, handled: handled)
     }
     private var current: AttentionUpdate? { pending[safe: index] }
     private var cleared: Int { queue.count - pending.count }
@@ -45,7 +44,7 @@ struct ProcessMode: View {
             .keyBindings(.modal, bindings)
             .onAppear {
                 // Snapshot on entry so the deck has a stable denominator.
-                queue = store.sitrep.new + store.sitrep.open
+                queue = store.sitrep.standing
             }
             .onChange(of: pending.count) { _, count in
                 if index > count - 1 { index = max(0, count - 1) }

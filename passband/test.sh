@@ -48,6 +48,8 @@ run_suite credential-probe \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Model/APIError.swift \
   Sources/Passband/Model/APIClient.swift \
+  Sources/Passband/Lib/TriageTargets.swift \
+  Sources/Passband/Assistant/JSONValue.swift \
   Tests/CredentialProbeTests.swift
 
 run_suite anthropic-stream \

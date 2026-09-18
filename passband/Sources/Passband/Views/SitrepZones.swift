@@ -888,6 +888,20 @@ struct AgentRecordsZone: View {
                                 Text(item.senderString).font(Typo.rowSub).foregroundStyle(Palette.ink)
                                 Text(item.one_line).font(Typo.micro).foregroundStyle(Palette.inkDim)
                                     .lineLimit(2)
+                                ForEach(Array((store.zones.recordFacts[item.id] ?? []).enumerated()), id: \.offset) { _, record in
+                                    if record.kind == "bill" {
+                                        HStack {
+                                            if let merchant = record.merchant { Text(merchant) }
+                                            if record.amount != nil { Text(Fmt.usd(record.amount, currency: record.currency)) }
+                                            if record.autopay == true { Text("autopay") }
+                                        }
+                                        .font(Typo.micro).foregroundStyle(Palette.ink)
+                                        if let due = Fmt.deadlineChip(record.due?.value) {
+                                            Text(due.text).font(Typo.micro)
+                                                .foregroundStyle(due.overdue ? Palette.danger : Palette.inkDim)
+                                        }
+                                    }
+                                }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())

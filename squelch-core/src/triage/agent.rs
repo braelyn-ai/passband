@@ -248,29 +248,14 @@ fn bound_evidence_text(value: &mut Value, budget: usize) {
     if serde_json::to_vec(value).is_ok_and(|encoded| encoded.len() <= budget) {
         return;
     }
-    fn count(value: &Value) -> usize {
-        match value {
-            Value::Object(fields) => fields
-                .iter()
-                .map(|(key, value)| {
-                    if matches!(key.as_str(), "body" | "content" | "text" | "snippet")
-                        && value.is_string()
-                    {
-                        1
-                    } else {
-                        count(value)
-                    }
-                })
-                .sum(),
-            Value::Array(values) => values.iter().map(count).sum(),
-            _ => 0,
-        }
-    }
     fn trim(value: &mut Value, limit: usize) {
         match value {
             Value::Object(fields) => {
                 let mut indicators = Vec::new();
                 for (key, value) in fields.iter_mut() {
+                    if key == "source" {
+                        continue;
+                    }
                     if matches!(key.as_str(), "body" | "content" | "text" | "snippet")
                         && let Value::String(text) = value
                     {
@@ -310,9 +295,62 @@ fn bound_evidence_text(value: &mut Value, budget: usize) {
             _ => {}
         }
     }
-    let fields = count(value).max(1);
-    // JSON escaping can expand a byte up to six times. Leave structural room.
-    trim(value, budget / (fields * 8));
+    // Measure the actual encoded JSON instead of assuming every character takes
+    // eight bytes. Keep the target body first; distribute remaining bytes across
+    // sibling/tool text with a common cap, letting short fields keep all of theirs.
+    let original = value.clone();
+    let target = original.pointer("/message/body").and_then(Value::as_str);
+    let fit = |other_limit: usize, target_limit: usize| {
+        let mut candidate = original.clone();
+        let primary = candidate
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+            .and_then(|message| message.remove("body"));
+        trim(&mut candidate, other_limit);
+        if let Some(body) = primary {
+            let mut message = json!({"body":body});
+            trim(&mut message, target_limit);
+            let fields = candidate["message"]
+                .as_object_mut()
+                .expect("message object");
+            fields.insert("body".into(), message["body"].clone());
+            if message.get("body_truncated").is_some() {
+                fields.insert("body_truncated".into(), true.into());
+                if let Some(offset) = fields.get("body_offset").and_then(Value::as_u64) {
+                    fields.insert(
+                        "next_offset".into(),
+                        json!(offset.saturating_add(
+                            message["body"].as_str().unwrap().chars().count() as u64
+                        )),
+                    );
+                }
+            }
+        }
+        candidate
+    };
+    let size = |candidate: &Value| {
+        serde_json::to_vec(candidate)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    };
+    let maximize = |mut lo: usize, mut hi: usize, allowed: &dyn Fn(usize) -> bool| {
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if allowed(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    };
+    let target_limit = target
+        .map(|body| maximize(0, body.len(), &|limit| size(&fit(0, limit)) <= budget))
+        .unwrap_or(0);
+    let other_limit = maximize(0, budget, &|limit| {
+        size(&fit(limit, target_limit)) <= budget
+    });
+    *value = fit(other_limit, target_limit);
 }
 
 /// Structural validation only: no category clamps, auth detector, or score floor.
@@ -323,9 +361,23 @@ fn bound_evidence_text(value: &mut Value, budget: usize) {
 struct ObservedDecisionContext {
     message_threads: BTreeMap<i64, String>,
     action_ids: BTreeMap<String, BTreeSet<String>>,
+    target_kind_correction: Option<Value>,
 }
 impl ObservedDecisionContext {
     fn observe(&mut self, data: &Value, current_thread: Option<&str>) {
+        // Only the initial target's corrections apply to its classification.
+        // A related-thread tool result must not replace this user intent.
+        if current_thread.is_some() {
+            self.target_kind_correction = data
+                .get("user_corrections")
+                .and_then(Value::as_array)
+                .and_then(|corrections| {
+                    corrections
+                        .iter()
+                        .find(|correction| correction["field"] == "kinds")
+                })
+                .map(|correction| correction["value"].clone());
+        }
         let mut thread = current_thread.map(str::to_owned);
         let messages = data.get("message").into_iter().chain(
             ["messages", "thread"]
@@ -360,6 +412,28 @@ impl ObservedDecisionContext {
         }
     }
     fn validate(&self, decision: &MessageDecision, thread: &str) -> Result<(), String> {
+        if let Some(correction) = &self.target_kind_correction {
+            let read = |value: &Value| {
+                serde_json::from_value::<Vec<EmailKind>>(value.clone())
+                    .map_err(|_| "invalid_user_kind_correction".to_owned())
+            };
+            let effective = if correction.is_object() {
+                let remove = read(&correction["remove"])?;
+                let mut kinds = decision.kinds.clone();
+                kinds.retain(|kind| !remove.contains(kind));
+                for kind in read(&correction["add"])? {
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                    }
+                }
+                kinds
+            } else {
+                read(correction)?
+            };
+            if effective.is_empty() {
+                return Err("user_kind_correction_removes_all_proposed_kinds; propose an evidence-supported kind the user has not removed".into());
+            }
+        }
         let check = |attention: &ThreadAttentionDecision, target: &str| -> Result<(), String> {
             if attention
                 .relevant_message_ids
@@ -960,7 +1034,7 @@ mod tests {
     async fn commit_constraints_are_repaired_inside_the_paid_investigation() {
         use axum::{Router, routing::post};
         use std::sync::{Arc, Mutex};
-        for invalid_kind in 0..3 {
+        for invalid_kind in 0..4 {
             let mut invalid = valid();
             match invalid_kind {
                 0 => invalid.attention.relevant_message_ids = vec![8],
@@ -970,12 +1044,13 @@ mod tests {
                     evidence: invalid.attention.evidence.clone(),
                     ..Default::default()
                 }),
-                _ => invalid.related_updates.push(RelatedAttentionUpdate {
+                2 => invalid.related_updates.push(RelatedAttentionUpdate {
                     thread_id: "thread".into(),
                     expected_revision: 1,
                     attention: invalid.attention.clone(),
                     evidence: invalid.attention.evidence.clone(),
                 }),
+                _ => invalid.kinds = vec![EmailKind::Receipt],
             }
             let responses = Arc::new(Mutex::new(std::collections::VecDeque::from([
                 json!({"result":{"step":"finish","decision":invalid}}),
@@ -1000,7 +1075,8 @@ mod tests {
                 thread_id: "thread".into(),
                 source_message_ids: vec![7, 8],
                 thread_revisions: BTreeMap::from([("thread".into(), 1)]),
-                initial: json!({"message":{"id":7,"thread_id":"thread"},"thread":[{"id":8,"thread_id":"other"}],"attention":null}),
+                initial: json!({"message":{"id":7,"thread_id":"thread"},"thread":[{"id":8,"thread_id":"other"}],"attention":null,
+                    "user_corrections":[{"field":"kinds","value":{"add":[],"remove":["receipt"]}}]}),
                 ..Default::default()
             };
             let run = run_agent(
@@ -1018,12 +1094,39 @@ mod tests {
     }
 
     #[test]
+    fn long_thread_retains_target_body_and_uses_remaining_budget() {
+        let body = format!(
+            "{}Decisive instruction: reply by Friday.",
+            "x".repeat(24_000)
+        );
+        let mut value = json!({"message":{"id":1,"body":body},
+            "thread":(2..10).map(|id|json!({"id":id,"body":"y".repeat(16_000)})).collect::<Vec<_>>()});
+        bound_evidence_text(&mut value, 40_000);
+        assert!(
+            value["message"]["body"]
+                .as_str()
+                .unwrap()
+                .ends_with("reply by Friday.")
+        );
+        assert!(value["message"].get("body_truncated").is_none());
+        let encoded = serde_json::to_vec(&value).unwrap().len();
+        assert!(
+            (39_900..=40_000).contains(&encoded),
+            "actual encoded budget: {encoded}"
+        );
+        assert!(value["thread"][0]["body"].as_str().unwrap().len() > 1500);
+        assert_eq!(value["thread"][0]["body_truncated"], true);
+    }
+
+    #[test]
     fn text_limits_are_visible_and_preserve_utf8_and_identity() {
         let mut value = json!({"message_id": 7, "body": "é".repeat(10000)});
         bound_evidence_text(&mut value, 1000);
         assert_eq!(value["message_id"], 7);
         assert_eq!(value["body_truncated"], true);
-        assert!(value["body"].as_str().unwrap().len() <= 125);
+        let bytes = serde_json::to_vec(&value).unwrap().len();
+        assert!(bytes <= 1000);
+        assert!(bytes >= 990, "available context should be used: {bytes}");
     }
     struct ExtraEvidence;
     impl EvidenceReader for ExtraEvidence {

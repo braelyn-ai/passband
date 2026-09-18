@@ -44,28 +44,43 @@ failures, relevant code, proposed scope, acceptance criteria, and non-goals.
 4. [#219: Context allocation, prefix reuse, and retired-code cleanup](https://github.com/braelyn-ai/passband/issues/219)
 
 Run/turn caps are not dollar caps. Provider failures such as truncation/refusal
-still need the shared transport usage-shape work in #216. #219 explicitly carries
-the subject-message truncation/duplication, unmatched rules, and multi-word search
-findings; they are not silently declared fixed by this stabilization patch.
+still need the shared transport usage-shape work in #216. Dedicated thread-refresh
+execution remains in #217; prefix reuse and retired-code cleanup remain in #219.
+The evidence and provenance correctness fixes below are implemented here.
 
-## Remaining product review
+## Product review fixes
 
-The following second-review findings remain outside this patch and need separate
-resolution before calling the entire rewrite ready to merge: Process mode's empty
-new/open lists; Reading/Records done/time-window behavior and missing bill details;
-legacy usage/TUI presentation; foreground Mac auth notifications; stale reader focus;
-empty kind corrections; cleared shipment visibility; related-thread representation
-and dependent-source refresh (also covered in #217); and missing assessment
-initialization on the ReadThread evidence path. Do not conflate a green
-stabilization suite with resolution of these product issues.
+- Evidence allocation preserves the target message before trimming sibling text,
+  removes the duplicate target, and measures actual encoded bytes. Context includes
+  matched sender rules and contact status. Search tries exact FTS matching first,
+  then falls back to partial multiword matches.
+- Related-thread updates keep the target message identity and classification.
+  Separate attention provenance gates external access; existing beta rows are
+  repaired without dropping those guards. Changed sources queue coalesced refreshes
+  of direct and transitive dependents. ReadThread initializes only exposed sources.
+- Process uses canonical FYE order. Reading/Records exclude done items and default
+  to the last 30 days; explicit API queries can request another window or all time.
+  Bill cards show amounts, due dates, and autopay. The TUI reads canonical summaries
+  and server order, and usage reporting distinguishes pending from classified mail.
+- Auth events carry an explicit persisted flag for foreground banners and sound.
+  The relay still carries only an event ID. Reader focus is consumed once; empty
+  category corrections are rejected, with model repair before committing an empty
+  effective classification. MCP hides cleared shipments.
+- Main's guided practice and outgoing attachments are preserved. Practice supports
+  v2 feeds and reading; real notification taps wait until practice ends. Restricting
+  an external agent preserves human drafts and their attachments. Explicit draft
+  deletion retains attachment cleanup.
+
+The PR remains a draft for live-inbox quality and latency evaluation before rollout.
 
 ## Verification
 
-- `cargo test -p squelch-core -p squelch-api -p squelch-mcp -p squelchd -p squelch-tui --quiet`: **1,835 passed, 0 failed, 0 ignored**.
+- `cargo test -p squelch-core -p squelch-api -p squelch-mcp -p squelchd -p squelch-tui --quiet`: **1,889 passed, 0 failed, 0 ignored**.
 - Strict Clippy passed for those five packages with `--all-targets -- -D warnings`.
 - `cargo check --workspace` passed; Cargo retains the existing future-compatibility warning for `num-bigint-dig`.
-- Full Swift test script passed, including 12 capability-retry checks and 43 notification/tap checks.
-- Desktop build passed: 145 sources, version 0.0.7, build 1011.
+- Full Swift test script passed: 36 suites, including capability recovery, notification/tap behavior, canonical feeds, reader focus, and rehearsal isolation.
+- Desktop build passed: 158 sources, version 0.0.7, build 1023.
+- iOS generic simulator build passed for the app and notification extension (code signing disabled).
 - Formatting and `git diff --check` passed.
 
 Regressions cover a 1,500-request background backlog with reserved arrival
@@ -75,6 +90,6 @@ access execution without sibling context, placement or fan-out; paid malformed
 access output; pure human cache probes; persistent human restrictions and sibling
 FYE corrections; and coalesced trigger bursts preserving retry state.
 
-No live-inbox evaluation, production rollout, or iOS simulator/device run is
+No live-inbox evaluation, production rollout, or simulator/device runtime session is
 included. Control-plane Postgres integration tests are outside the affected-package
 suite and require `SQUELCH_TEST_PG_URL`.

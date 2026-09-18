@@ -15,6 +15,9 @@ use squelch_core::store::{Store, agent_triage::AgentTriageStore};
 pub struct FeedQuery {
     pub destination: String,
     pub limit: Option<usize>,
+    pub since: Option<chrono::DateTime<Utc>>,
+    pub all_time: Option<bool>,
+    pub include_done: Option<bool>,
 }
 
 pub async fn feed(
@@ -24,11 +27,24 @@ pub async fn feed(
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let ranking = state.triage_config.ranking.clone();
     let now = Utc::now();
+    if query.all_time == Some(true) && query.since.is_some() {
+        return Err(ApiError::bad_request(
+            "since and all_time cannot be combined",
+        ));
+    }
+    let inventory = squelch_core::store::agent_triage::AgentListQuery {
+        since: if query.all_time == Some(true) {
+            None
+        } else {
+            Some(query.since.unwrap_or(now - chrono::Duration::days(30)))
+        },
+        include_done: query.include_done.unwrap_or(false),
+    };
     let mut items = store_call(&state, move |store, account| {
         match query.destination.as_str() {
             "fye" => store.agent_fye(account, usize::MAX, &ranking, now),
-            "reading" => store.agent_reading(account, usize::MAX),
-            "records" => store.agent_records(account, usize::MAX),
+            "reading" => store.agent_reading_with_query(account, usize::MAX, &inventory),
+            "records" => store.agent_records_with_query(account, usize::MAX, &inventory),
             _ => Err(squelch_core::CoreError::InvalidInput(
                 "unsupported destination".into(),
             )),

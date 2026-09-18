@@ -16,7 +16,7 @@ struct CredentialProbeTests {
 
         RehearsalMode.setEnabled(false)
         await expectFailure(client, kind: .network)
-        expect(ProbeProtocol.requests.withLock { $0 } == 1,
+        expect(ProbeProtocol.requests.withLock { $0 } == 4,
                "live credential checks must use the candidate transport")
         let remainingFixtureRequests = await RehearsalAPI.shared.requests
         expect(remainingFixtureRequests == 0, "live failures must not fall back to practice")
@@ -73,4 +73,3 @@ actor RehearsalAPI {
 // These UI-owned enums are irrelevant to credential validation, but appear in
 // other APIClient method signatures.
 enum SearchSortChoice: String, Sendable { case recent, bestMatch = "best_match" }
-enum TriageAxis: String, Sendable { case tier, category, sensitivity }
