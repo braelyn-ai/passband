@@ -1,5 +1,5 @@
 //! Shared provider plumbing for both triage stages (Anthropic Messages API +
-//! OpenAI Chat Completions): wire types, retry policy, truncation-retry,
+//! OpenAI Chat Completions): wire types, retry policy, paid-response usage,
 //! refusal/permanent-failure classification, [`classify_llm`], and the shared
 //! [`LlmOutcome`]/[`classify_into`] verdict shape. Each stage owns only its
 //! system prompt, fenced user message, schema, and verdict validation.
@@ -28,10 +28,10 @@ const GATEWAY_VK_HEADER: &str = "x-bf-vk";
 /// Default max_tokens. The verdict itself is a compact JSON object, but on a
 /// reasoning model THINKING TOKENS BILL AGAINST THIS CEILING TOO, and thinking
 /// runs before the first output byte: a budget sized for the JSON alone
-/// truncates every call before the verdict is ever written. A `max_tokens`
-/// truncation is retried once at the doubled value.
+/// truncates every call before the verdict is ever written. Truncation returns
+/// reported usage to the caller, which owns any subsequent repair attempt.
 pub const MAX_TOKENS: u32 = 8_000;
-pub const MAX_TOKENS_RETRY: u32 = 16_000;
+
 /// Retry policy for retryable statuses (429 / 5xx / 529): the value every
 /// BATCH pass uses, and [`LlmRequest::max_tries`]'s only sane default. Public
 /// because a caller that wants a different one has to be able to say "the usual
@@ -85,10 +85,19 @@ pub enum LlmOutcome<T> {
     /// The model's verdict + usage.
     Ok(T, Option<Usage>),
     /// The model declined (`stop_reason == "refusal"` / OpenAI `refusal` field).
-    Refused,
+    Refused(Option<Usage>),
     /// A permanent (non-retryable, e.g. 400/401/truncation/parse) failure.
-    /// Carries a redacted error type only.
-    Failed(String),
+    /// Carries a redacted error type and any provider-reported usage.
+    Failed(String, Option<Usage>),
+}
+
+impl<T> LlmOutcome<T> {
+    /// None means the provider did not report usage, not that the call was free.
+    pub fn usage(&self) -> Option<Usage> {
+        match self {
+            Self::Ok(_, usage) | Self::Refused(usage) | Self::Failed(_, usage) => *usage,
+        }
+    }
 }
 
 /// A redacted classification error (transport / retry-exhaustion). Never carries
@@ -118,9 +127,9 @@ impl std::fmt::Display for ClassifyError {
 ///
 /// Retry policy: 429 (honors `retry-after`) and 529/5xx retry with exponential
 /// backoff (60s cap, [`LlmRequest::max_tries`] attempts, [`MAX_TRIES`] for every
-/// batch pass); 400/401 are permanent; a truncation retries once at a higher
-/// token budget REGARDLESS of `max_tries`, since that is one request the model
-/// has already answered rather than a retry of a failed one.
+/// batch pass); 400/401 are permanent. Truncation is not retried internally.
+/// Every paid response returns its usage
+/// to the caller; repair turns belong to the caller's explicit budget.
 pub async fn classify_llm(
     http: &reqwest::Client,
     url: &str,
@@ -155,12 +164,12 @@ where
         LlmOutcome::Ok(text, usage) => match serde_json::from_str::<T>(&text) {
             Ok(parsed) => match finish(parsed) {
                 Ok(value) => LlmOutcome::Ok(value, usage),
-                Err(kind) => LlmOutcome::Failed(kind),
+                Err(kind) => LlmOutcome::Failed(kind, usage),
             },
-            Err(_) => LlmOutcome::Failed("json_parse".into()),
+            Err(_) => LlmOutcome::Failed("json_parse".into(), usage),
         },
-        LlmOutcome::Refused => LlmOutcome::Refused,
-        LlmOutcome::Failed(kind) => LlmOutcome::Failed(kind),
+        LlmOutcome::Refused(usage) => LlmOutcome::Refused(usage),
+        LlmOutcome::Failed(kind, usage) => LlmOutcome::Failed(kind, usage),
     })
 }
 
@@ -360,78 +369,71 @@ async fn classify_anthropic(
     api_key: &str,
     req: &LlmRequest<'_>,
 ) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
-    let mut max_tokens = MAX_TOKENS;
-    let mut allow_token_retry = true;
+    let max_tokens = MAX_TOKENS;
 
-    loop {
-        let body = MessagesRequest {
-            model: req.model,
-            max_tokens,
-            system: vec![SystemBlock {
-                kind: "text",
-                text: req.system,
-                cache_control: Some(CacheControl { kind: "ephemeral" }),
-            }],
-            messages: vec![RequestMessage {
-                role: "user",
-                content: req.user,
-            }],
-            output_config: OutputConfig {
-                format: OutputFormat {
-                    kind: "json_schema",
-                    schema: req.schema.clone(),
-                },
-                effort: req.effort,
+    let body = MessagesRequest {
+        model: req.model,
+        max_tokens,
+        system: vec![SystemBlock {
+            kind: "text",
+            text: req.system,
+            cache_control: Some(CacheControl { kind: "ephemeral" }),
+        }],
+        messages: vec![RequestMessage {
+            role: "user",
+            content: req.user,
+        }],
+        output_config: OutputConfig {
+            format: OutputFormat {
+                kind: "json_schema",
+                schema: req.schema.clone(),
             },
-        };
+            effort: req.effort,
+        },
+    };
 
-        let build = || {
-            let req = http
-                .post(url)
-                .header("x-api-key", api_key)
-                .header("anthropic-version", API_VERSION)
-                .header("content-type", "application/json");
-            // See GATEWAY_VK_HEADER: a fronting gateway ignores `x-api-key`
-            // entirely, so the credential has to ride this header too or every
-            // hosted call 401s. Only when a gateway is actually in front —
-            // Anthropic has no use for it, and a credential should not be
-            // copied into extra headers on a request that does not need it.
-            let req = if is_gateway_url(url) {
-                req.header(GATEWAY_VK_HEADER, api_key)
-            } else {
-                req
-            };
-            req.json(&body)
+    let build = || {
+        let req = http
+            .post(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json");
+        // See GATEWAY_VK_HEADER: a fronting gateway ignores `x-api-key`
+        // entirely, so the credential has to ride this header too or every
+        // hosted call 401s. Only when a gateway is actually in front —
+        // Anthropic has no use for it, and a credential should not be
+        // copied into extra headers on a request that does not need it.
+        let req = if is_gateway_url(url) {
+            req.header(GATEWAY_VK_HEADER, api_key)
+        } else {
+            req
         };
-        let parsed: MessagesResponse = match send_with_retry(build, req.max_tries).await? {
-            SendOk::Body(b) => b,
-            SendOk::PermanentFailure(kind) => return Ok(LlmOutcome::Failed(kind)),
-        };
+        req.json(&body)
+    };
+    let parsed: MessagesResponse = match send_with_retry(build, req.max_tries).await? {
+        SendOk::Body(b) => b,
+        SendOk::PermanentFailure(kind) => return Ok(LlmOutcome::Failed(kind, None)),
+    };
 
-        match parsed.stop_reason.as_deref() {
-            Some("refusal") => return Ok(LlmOutcome::Refused),
-            Some("max_tokens") if allow_token_retry => {
-                max_tokens = MAX_TOKENS_RETRY;
-                allow_token_retry = false;
-                continue;
-            }
-            Some("max_tokens") => {
-                return Ok(LlmOutcome::Failed("max_tokens_truncation".into()));
-            }
-            _ => {}
+    let usage = parsed.usage;
+    match parsed.stop_reason.as_deref() {
+        Some("refusal") => return Ok(LlmOutcome::Refused(usage)),
+        Some("max_tokens") => {
+            return Ok(LlmOutcome::Failed("max_tokens_truncation".into(), usage));
         }
-
-        let text = parsed
-            .content
-            .iter()
-            .find(|b| b.kind == "text")
-            .and_then(|b| b.text.as_deref());
-        let text = match text {
-            Some(t) => t.to_string(),
-            None => return Ok(LlmOutcome::Failed("no_text_block".into())),
-        };
-        return Ok(LlmOutcome::Ok(text, parsed.usage));
+        _ => {}
     }
+
+    let text = parsed
+        .content
+        .iter()
+        .find(|b| b.kind == "text")
+        .and_then(|b| b.text.as_deref());
+    let text = match text {
+        Some(t) => t.to_string(),
+        None => return Ok(LlmOutcome::Failed("no_text_block".into(), usage)),
+    };
+    Ok(LlmOutcome::Ok(text, usage))
 }
 
 async fn classify_openai(
@@ -440,78 +442,65 @@ async fn classify_openai(
     api_key: &str,
     req: &LlmRequest<'_>,
 ) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
-    let mut max_completion_tokens = MAX_TOKENS;
-    let mut allow_token_retry = true;
+    let max_completion_tokens = MAX_TOKENS;
 
-    loop {
-        let body = OpenAiRequest {
-            model: req.model,
-            messages: vec![
-                OpenAiMessage {
-                    role: "system",
-                    content: req.system,
-                },
-                OpenAiMessage {
-                    role: "user",
-                    content: req.user,
-                },
-            ],
-            max_completion_tokens,
-            response_format: OpenAiResponseFormat {
-                kind: "json_schema",
-                json_schema: OpenAiJsonSchema {
-                    name: "triage",
-                    strict: true,
-                    schema: req.schema.clone(),
-                },
+    let body = OpenAiRequest {
+        model: req.model,
+        messages: vec![
+            OpenAiMessage {
+                role: "system",
+                content: req.system,
             },
-        };
+            OpenAiMessage {
+                role: "user",
+                content: req.user,
+            },
+        ],
+        max_completion_tokens,
+        response_format: OpenAiResponseFormat {
+            kind: "json_schema",
+            json_schema: OpenAiJsonSchema {
+                name: "triage",
+                strict: true,
+                schema: req.schema.clone(),
+            },
+        },
+    };
 
-        let build = || {
-            http.post(url)
-                .bearer_auth(api_key)
-                .header("content-type", "application/json")
-                .json(&body)
-        };
-        let parsed: OpenAiResponse = match send_with_retry(build, req.max_tries).await? {
-            SendOk::Body(b) => b,
-            SendOk::PermanentFailure(kind) => return Ok(LlmOutcome::Failed(kind)),
-        };
+    let build = || {
+        http.post(url)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json")
+            .json(&body)
+    };
+    let parsed: OpenAiResponse = match send_with_retry(build, req.max_tries).await? {
+        SendOk::Body(b) => b,
+        SendOk::PermanentFailure(kind) => return Ok(LlmOutcome::Failed(kind, None)),
+    };
 
-        let choice = match parsed.choices.into_iter().next() {
-            Some(c) => c,
-            None => return Ok(LlmOutcome::Failed("no_choice".into())),
-        };
-        let message = match choice.message {
-            Some(m) => m,
-            None => return Ok(LlmOutcome::Failed("no_message".into())),
-        };
+    let usage = parsed.usage.map(OpenAiUsage::into_usage);
+    let choice = match parsed.choices.into_iter().next() {
+        Some(c) => c,
+        None => return Ok(LlmOutcome::Failed("no_choice".into(), usage)),
+    };
+    let message = match choice.message {
+        Some(m) => m,
+        None => return Ok(LlmOutcome::Failed("no_message".into(), usage)),
+    };
 
-        if message.refusal.is_some() {
-            return Ok(LlmOutcome::Refused);
-        }
-
-        match choice.finish_reason.as_deref() {
-            Some("length") if allow_token_retry => {
-                max_completion_tokens = MAX_TOKENS_RETRY;
-                allow_token_retry = false;
-                continue;
-            }
-            Some("length") => {
-                return Ok(LlmOutcome::Failed("max_tokens_truncation".into()));
-            }
-            _ => {}
-        }
-
-        let text = match message.content {
-            Some(t) => t,
-            None => return Ok(LlmOutcome::Failed("no_text_block".into())),
-        };
-        return Ok(LlmOutcome::Ok(
-            text,
-            parsed.usage.map(OpenAiUsage::into_usage),
-        ));
+    if message.refusal.is_some() {
+        return Ok(LlmOutcome::Refused(usage));
     }
+
+    if choice.finish_reason.as_deref() == Some("length") {
+        return Ok(LlmOutcome::Failed("max_tokens_truncation".into(), usage));
+    }
+
+    let text = match message.content {
+        Some(t) => t,
+        None => return Ok(LlmOutcome::Failed("no_text_block".into(), usage)),
+    };
+    Ok(LlmOutcome::Ok(text, usage))
 }
 
 /// The two success shapes from [`send_with_retry`].
@@ -727,6 +716,93 @@ mod tests {
         assert!(!is_config_failure("json_parse"));
         assert!(!is_config_failure("response_decode"));
         assert!(!is_config_failure("importance_out_of_range"));
+    }
+
+    #[tokio::test]
+    async fn paid_failures_retain_usage_and_never_retry_behind_the_caller() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for (provider, body, kind) in [
+            (
+                Stage2Provider::Anthropic,
+                serde_json::json!({"stop_reason":"refusal","content":[],"usage":{"input_tokens":11,"output_tokens":7}}),
+                "refused",
+            ),
+            (
+                Stage2Provider::Anthropic,
+                serde_json::json!({"stop_reason":"max_tokens","content":[],"usage":{"input_tokens":11,"output_tokens":7}}),
+                "max_tokens_truncation",
+            ),
+            (
+                Stage2Provider::Anthropic,
+                serde_json::json!({"stop_reason":"end_turn","content":[],"usage":{"input_tokens":11,"output_tokens":7}}),
+                "no_text_block",
+            ),
+            (
+                Stage2Provider::OpenAI,
+                serde_json::json!({"choices":[{"message":{"refusal":"no"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}),
+                "refused",
+            ),
+            (
+                Stage2Provider::OpenAI,
+                serde_json::json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}),
+                "no_choice",
+            ),
+            (
+                Stage2Provider::OpenAI,
+                serde_json::json!({"choices":[{"message":{"content":"invalid json"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}),
+                "json_parse",
+            ),
+            (
+                Stage2Provider::OpenAI,
+                serde_json::json!({"choices":[{"message":{"content":"{}"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}),
+                "invalid_shape",
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let app = Router::new().route(
+                "/",
+                post(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let body = body.clone();
+                    async move { Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let request = LlmRequest {
+                model: "test",
+                system: "test",
+                user: "test",
+                schema: serde_json::json!({}),
+                effort: None,
+                max_tries: 1,
+            };
+            let result = classify_into(
+                &reqwest::Client::new(),
+                &url,
+                "test",
+                provider,
+                &request,
+                |_: serde_json::Value| -> Result<(), String> { Err("invalid_shape".into()) },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.usage().unwrap().input_tokens, 11, "{kind}");
+            assert_eq!(result.usage().unwrap().output_tokens, 7, "{kind}");
+            match result {
+                LlmOutcome::Refused(_) => assert_eq!(kind, "refused"),
+                LlmOutcome::Failed(actual, _) => assert_eq!(actual, kind),
+                _ => panic!("expected failure"),
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
     }
 
     #[test]

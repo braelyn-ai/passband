@@ -323,19 +323,20 @@ impl<S: Store + 'static> NotifyLane<S> {
         )
         .await;
 
+        if let Ok(Ok(response)) = &outcome
+            && let Some(u) = response.usage()
+            && let Err(e) = self.store.extract_bump_usage(
+                self.account_id,
+                &day,
+                NOTIFY_USAGE_CATEGORY,
+                u.into(),
+            )
+        {
+            eprintln!("squelch: notify usage ledger write failed ({e})");
+        }
         let now = Utc::now();
         match outcome {
-            Ok(Ok(LlmOutcome::Ok(out, usage))) => {
-                if let Some(u) = usage
-                    && let Err(e) = self.store.extract_bump_usage(
-                        self.account_id,
-                        &day,
-                        NOTIFY_USAGE_CATEGORY,
-                        u.into(),
-                    )
-                {
-                    eprintln!("squelch: notify usage ledger write failed ({e})");
-                }
+            Ok(Ok(LlmOutcome::Ok(out, _))) => {
                 let importance = out.notify_importance as u8;
                 let one_line = crate::text::truncate_chars(&out.one_line, 160);
                 self.store.record_notification_assessment(
@@ -364,7 +365,7 @@ impl<S: Store + 'static> NotifyLane<S> {
                     LaneLabel::Fast,
                 )?;
             }
-            Ok(Ok(LlmOutcome::Failed(kind))) if llm::is_config_failure(&kind) => {
+            Ok(Ok(LlmOutcome::Failed(kind, _))) if llm::is_config_failure(&kind) => {
                 self.disable_for(DISABLE_AFTER_CONFIG_FAILURE);
                 self.budget()
                     .refund(NOTIFY_FAST_BUDGET_KEY, &day, "notify fast lane");
@@ -384,7 +385,10 @@ impl<S: Store + 'static> NotifyLane<S> {
                     now,
                 )?;
             }
-            Ok(Ok(LlmOutcome::Refused)) | Ok(Ok(LlmOutcome::Failed(_))) | Ok(Err(_)) | Err(_) => {
+            Ok(Ok(LlmOutcome::Refused(_)))
+            | Ok(Ok(LlmOutcome::Failed(_, _)))
+            | Ok(Err(_))
+            | Err(_) => {
                 self.record(
                     m.message_id,
                     NotifyDecision::Unavailable,

@@ -144,19 +144,17 @@ async fn run_bounded(
         // investigation returns to the base model unless another review is
         // explicitly requested within the remaining review budget.
         model = config.agent.model.as_deref().unwrap_or(connection.model);
+        usage.extend(response.usage());
         let step = match response {
-            LlmOutcome::Ok(value, tokens) => {
-                usage.extend(tokens);
-                match serde_json::from_str::<WireStep>(&value) {
-                    Ok(wire) => wire.result,
-                    Err(_) => {
-                        history.push(json!({"validation_error": "invalid_step_shape"}));
-                        continue;
-                    }
+            LlmOutcome::Ok(value, _) => match serde_json::from_str::<WireStep>(&value) {
+                Ok(wire) => wire.result,
+                Err(_) => {
+                    history.push(json!({"validation_error": "invalid_step_shape"}));
+                    continue;
                 }
-            }
-            LlmOutcome::Refused => return Err("agent_refused".into()),
-            LlmOutcome::Failed(kind) => {
+            },
+            LlmOutcome::Refused(_) => return Err("agent_refused".into()),
+            LlmOutcome::Failed(kind, _) => {
                 if llm::is_config_failure(&kind) {
                     return Err(kind);
                 }
