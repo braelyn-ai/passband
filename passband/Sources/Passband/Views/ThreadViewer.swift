@@ -49,6 +49,11 @@ struct ThreadViewer: View {
     @State private var confirmMode: ConfirmMode?
     @State private var confirmBusy = false
     @State private var retriaging = false
+    /// The dev re-triage's own confirm. Cheap next to the 7d run (this one is
+    /// ONE email and never blocks the app), but it throws away a verdict and
+    /// spends on the model to get another, and the button sits in a row with
+    /// "triage debug" and "new rule" where nothing else costs anything (#210).
+    @State private var confirmRetriage = false
     @State private var debugInfo: TriageDebug?
     /// True for `Clip.flashWindow` after the subject is clicked-to-copy.
     @State private var subjectCopied = false
@@ -197,6 +202,12 @@ struct ThreadViewer: View {
                         }
                     },
                     onCancel: { if !confirmBusy { self.confirmMode = nil } })
+            }
+            if confirmRetriage {
+                MessageRetriageConfirm(
+                    busy: retriaging,
+                    onConfirm: { Task { await retriageThis() } },
+                    onCancel: { if !retriaging { confirmRetriage = false } })
             }
         }
         .keyContext(.thread)
@@ -510,7 +521,7 @@ struct ThreadViewer: View {
                 Button("triage debug") { Task { await openDebug() } }
                     .buttonStyle(.textAction).font(Typo.micro)
                 Button(retriaging ? "re-triaging…" : "re-triage") {
-                    Task { await retriageThis() }
+                    confirmRetriage = true
                 }
                 .buttonStyle(.textAction).font(Typo.micro)
                 .disabled(retriaging)
@@ -1065,7 +1076,9 @@ struct ThreadViewer: View {
                     // the click before this layer sees it. The guard is what keeps
                     // that true if one ever stops doing so: dismissing a dialog must
                     // never also throw away the email behind it.
-                    guard confirmMode == nil, debugInfo == nil, !store.modalOverlayOpen else {
+                    guard confirmMode == nil, !confirmRetriage, debugInfo == nil,
+                        !store.modalOverlayOpen
+                    else {
                         return
                     }
                     // An unsent draft is not something a stray click beside the mail
@@ -1840,7 +1853,13 @@ struct ThreadViewer: View {
     private func retriageThis() async {
         guard let newest, !retriaging else { return }
         retriaging = true
-        defer { retriaging = false }
+        // The dialog stands, with its buttons dead, until the kick answers: the
+        // toast is the only report this action gets, and a card that vanished
+        // first would leave the click unaccounted for while the call is open.
+        defer {
+            retriaging = false
+            confirmRetriage = false
+        }
         do {
             let result = try await APIClient.shared.retriage(.message(newest.id))
             store.pushToast(
@@ -2402,6 +2421,43 @@ private struct UnsubConfirm: View {
                     Button(mode == .ask ? "Unsubscribe" : "Block sender", action: onConfirm)
                         .buttonStyle(.glassProminent)
                         .tint(mode == .ask ? Palette.accent : Palette.danger)
+                        .disabled(busy)
+                }
+            }
+        }
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "cancel", allowInInput: true) { onCancel() },
+            KeyBinding("Enter", "confirm", allowInInput: true) { onConfirm() },
+        ])
+    }
+}
+
+// MARK: - dev re-triage confirm
+
+/// The per-message twin of `RetriageConfirm`. Same shape as `UnsubConfirm`: own
+/// "modal" KeyContext so the thread's j/k/e/d/u are dead while it asks, Enter
+/// confirms, Esc cancels.
+private struct MessageRetriageConfirm: View {
+    let busy: Bool
+    let onConfirm: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        OverlayScrim(onDismiss: onCancel) {
+            ModalCard(width: 400) {
+                // NO SUBTEXT. One email, no wait, nothing to warn about: the
+                // question is the whole dialog, exactly as it is for `u`.
+                Text("Re-triage this email?")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Palette.ink)
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button("Cancel", action: onCancel)
+                        .buttonStyle(.glass).disabled(busy)
+                    Button("Re-triage", action: onConfirm)
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.accent)
                         .disabled(busy)
                 }
             }
