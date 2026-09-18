@@ -78,6 +78,17 @@ pub const ADMIN_COOKIE_NAME: &str = "passband_admin";
 /// because this constant grew.
 pub const ADMIN_COOKIE_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 
+/// The reconnect progress cookie: an opaque token naming one row of
+/// `reconnect_views`, and nothing else. Its own name because it outlives the
+/// ten-minute hop the signup cookie marks, and `Path=/reconnect` because the
+/// status page is the only route that reads it.
+pub const RECONNECT_COOKIE_NAME: &str = "pb_reconnect";
+
+/// How long a browser can keep reading its reconnect's progress. The same day
+/// the server-side view lives, for the reason the signup pair match: one
+/// outliving the other is a page that cannot answer but can still be asked.
+pub const RECONNECT_COOKIE_TTL_SECS: i64 = 24 * 60 * 60;
+
 /// The `aud` every admin claim carries and no other claim in this crate does.
 /// The marker is what makes the two claim types different DOCUMENTS under one
 /// key, rather than two shapes that happen to have different fields.
@@ -337,6 +348,16 @@ pub fn clear_admin_cookie(secure: bool) -> String {
     format!("{ADMIN_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict{secure}")
 }
 
+/// The `Set-Cookie` value that lets a browser follow its reconnect. `HttpOnly`,
+/// `SameSite=Lax` and `Secure`-when-https for the signup cookie's reasons;
+/// scoped to `/reconnect` so it rides on nothing else.
+pub fn set_reconnect_cookie(value: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{RECONNECT_COOKIE_NAME}={value}; Path=/reconnect; Max-Age={RECONNECT_COOKIE_TTL_SECS}; HttpOnly; SameSite=Lax{secure}"
+    )
+}
+
 /// Pull our cookie out of a `Cookie` header. Hand-parsed rather than pulled in
 /// as a dependency: the header is a `;`-separated list of `name=value`, and the
 /// value we care about is base64url and a dot, so there is nothing to unquote.
@@ -348,6 +369,11 @@ pub fn from_header(header: &str) -> Option<&str> {
 /// browser, both errands), so each is looked up by its own name.
 pub fn admin_from_header(header: &str) -> Option<&str> {
     named_cookie(header, ADMIN_COOKIE_NAME)
+}
+
+/// The same, for the reconnect progress cookie.
+pub fn reconnect_from_header(header: &str) -> Option<&str> {
+    named_cookie(header, RECONNECT_COOKIE_NAME)
 }
 
 fn named_cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {

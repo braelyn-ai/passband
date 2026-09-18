@@ -229,14 +229,6 @@ const RECONNECT_NO_TENANT_HEADING: &str = "No Passband mailbox for that Google a
 const RECONNECT_NO_TENANT: &str = "Nothing is set up for the account you approved. If your Passband mailbox reads a \
      different Google account, start again and pick that one.";
 
-/// The reconnect worked. Deliberately says what happens NEXT rather than
-/// stopping at "done": mail does not reappear the instant the credential lands,
-/// and somebody who has been staring at an empty mailbox for days deserves to
-/// know that a few minutes of quiet is the expected shape of success.
-const RECONNECT_DONE_HEADING: &str = "Your mailbox is reconnected";
-const RECONNECT_DONE: &str = "Passband can read your mail again. Syncing starts within a few minutes, and anything that \
-     arrived while it was disconnected will be picked up. You can close this page.";
-
 /// The three answers `POST /waitlist` gives. JSON rather than a page: the only
 /// client is the site's own form, which shows its own copy in its own voice, so
 /// what crosses the wire is a machine reason and never a sentence.
@@ -1630,30 +1622,25 @@ async fn reconnect_install(state: &ControlState, code: String, pkce_verifier: St
     };
     drop(grant.token);
 
-    // INSTALL, on the REPLACE route: the signup route answers 409 for a live
-    // tenant, which is every tenant worth reconnecting. Until this call lands
-    // nothing has changed — the tenant is still running on its dead credential,
-    // which is the right thing to fail back to.
-    //
-    // THE POD RESTARTS. The credential's hash rides on the Deployment's pod
-    // template, so a new credential is a new template and Kubernetes recreates
-    // the pod; the warden waits for the rollout before answering. That is a
-    // brief interruption, and it is the correct trade here: the mailbox this
-    // runs against is one whose sync is already dead, so the pod being replaced
-    // is not doing anything worth protecting.
-    if let Err(e) = state
-        .warden()
-        .replace_credentials(&label, &grant.account_email, &ciphertext)
-        .await
+    let token = match random_token() {
+        Ok(token) => token,
+        Err(_) => return reconnect_unavailable(),
+    };
+    // Save before starting work. A browser disconnect cannot cancel the job,
+    // and a service restart resumes the same tenant-sealed ciphertext.
+    if let Err(e) =
+        crate::reconnect::enqueue(state, &token, &label, &grant.account_email, &ciphertext).await
     {
-        tracing::error!(error = %e, label = %label, "reconnect: installing the credential failed");
+        tracing::error!(error = %e, label = %label, "saving reconnect work failed");
         return reconnect_unavailable();
     }
-
-    // PRIVACY: the label, never the mailbox.
-    tracing::info!(label = %label, "reconnect complete");
-
-    pages::console_problem(StatusCode::OK, RECONNECT_DONE_HEADING, RECONNECT_DONE)
+    // Start the pass now rather than waiting for the ticker, and let its jobs
+    // run detached: this request is answered before any rollout begins.
+    let worker = state.clone();
+    tokio::spawn(async move {
+        drop(crate::reconnect::run_pending(&worker).await);
+    });
+    crate::reconnect::started(&token, !state.config().is_insecure())
 }
 
 async fn app_login(state: &ControlState, code: String, pkce_verifier: String) -> Response {

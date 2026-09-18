@@ -152,6 +152,8 @@ struct ReplaceCredentials {
     account_email: String,
     /// Age-armored ciphertext, exactly as on the signup route.
     cred_read_ciphertext: String,
+    /// Omitted by older clients, which still expect a pairing response.
+    pair: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +286,16 @@ pub async fn replace_credentials(
         Ok(req) => req,
         Err(detail) => return malformed(detail),
     };
+    if req.pair == Some(false) {
+        return match state
+            .warden()
+            .reconnect_credentials(&label, &req.account_email, &req.cred_read_ciphertext)
+            .await
+        {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
     match state
         .warden()
         .replace_credentials(&label, &req.account_email, &req.cred_read_ciphertext)
@@ -532,6 +544,33 @@ mod tests {
 
     fn credential_body(label: &str) -> String {
         serde_json::json!({ "cred_read_ciphertext": armored(label) }).to_string()
+    }
+
+    #[tokio::test]
+    async fn reconnect_can_confirm_rollout_without_a_pairing_response() {
+        let h = Harness::new();
+        h.warden
+            .create_tenant("alice", "alice@example.com")
+            .await
+            .unwrap();
+        h.warden
+            .set_credentials("alice", &armored("original"))
+            .await
+            .unwrap();
+        h.cluster.exec_fails();
+        let body = serde_json::json!({
+            "account_email": "alice@example.com",
+            "cred_read_ciphertext": armored("replacement"),
+            "pair": false,
+        })
+        .to_string();
+        let (status, body) = call(
+            &h,
+            authed("PUT", "/v1/tenants/alice/credentials/replace", &body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(body, Value::Null);
     }
 
     #[tokio::test]
