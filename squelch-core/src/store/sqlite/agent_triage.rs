@@ -1609,6 +1609,20 @@ fn apply_attention(
             }
         }
     }
+    // Evidence in another thread may update attention, but cannot choose a new
+    // representative for the target or replace its per-message classification.
+    let cross_thread = read_message(conn, account, fallback_message)?.thread_id != thread;
+    if cross_thread {
+        let previous: Option<(String, i64)> = conn.query_row(
+            "SELECT a.relevant_activity,a.message_id FROM agent_thread_attention a
+             JOIN messages m ON m.account_id=a.account_id AND m.id=a.message_id
+             WHERE a.account_id=?1 AND a.thread_id=?2 AND m.thread_id=?2 AND m.is_sent=0 AND m.is_spam=0",
+            params![account,thread], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional()?;
+        if previous.is_some() {
+            latest = previous;
+        }
+    }
     let (activity, id) = match latest {
         Some(activity) => activity,
         None => conn
@@ -1621,7 +1635,7 @@ fn apply_attention(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .unwrap_or((Utc::now().to_rfc3339(), fallback_message)),
+            .ok_or_else(|| CoreError::InvalidInput("attention target has no inbound message".into()))?,
     };
     let unresolved_since = if attention.actions.iter().any(|action| !action.resolved)
         || attention.state == crate::triage::decision::AttentionState::NeedsUser
@@ -1658,17 +1672,17 @@ fn list_items(
     let sql = if destination == "fye" {
         "SELECT
              m.id,m.thread_id,m.from_addr,m.subject,
-             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(a.relevant_activity),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,d.message_id
+             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(a.relevant_activity),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,a.decision_message_id
              FROM agent_thread_attention a JOIN messages m ON m.account_id=a.account_id AND
              m.id=a.message_id JOIN agent_message_decisions d ON d.account_id=m.account_id AND
-             d.message_id=a.decision_message_id LEFT JOIN triage t ON t.account_id=m.account_id AND
+             d.message_id=m.id LEFT JOIN triage t ON t.account_id=m.account_id AND
              t.message_id=m.id WHERE a.account_id=?1 AND ?3='fye' AND (a.show_in_fye=1 OR t.reminded_at
              IS NOT NULL) AND m.is_sent=0 AND m.is_spam=0 AND COALESCE(t.status,'new')!='done' AND
              (t.remind_at IS NULL OR t.remind_at<=?2)"
     } else {
         "SELECT
              m.id,m.thread_id,m.from_addr,m.subject,
-             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(m.received_at),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,d.message_id
+             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(m.received_at),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,COALESCE(a.decision_message_id,d.message_id)
              FROM agent_message_destinations p JOIN messages m ON m.account_id=p.account_id AND
              m.id=p.message_id JOIN agent_message_decisions d ON d.account_id=m.account_id AND
              d.message_id=m.id LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id
@@ -2168,6 +2182,80 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn related_evidence_preserves_target_representation_and_access_provenance() {
+        use crate::triage::decision::RelatedAttentionUpdate;
+        let store = fixture();
+        let (first, initial) = claim(&store, 1);
+        let mut bill = decision(1);
+        bill.kinds = vec![EmailKind::Bill];
+        bill.summary = "Electricity bill".into();
+        store
+            .commit_agent_decision(
+                &first,
+                &initial,
+                &bill,
+                std::slice::from_ref(&initial.message.source),
+            )
+            .unwrap();
+        let (job, receipt_context) = claim(&store, 2);
+        let target = store.agent_thread_context(1, "one").unwrap();
+        let mut receipt = decision(2);
+        receipt.kinds = vec![EmailKind::Receipt];
+        receipt.summary = "Payment receipt".into();
+        let mut attention = target.attention.unwrap();
+        attention.summary = "Payment received".into();
+        receipt.related_updates.push(RelatedAttentionUpdate {
+            thread_id: "one".into(),
+            expected_revision: target.revision.attention_revision,
+            attention,
+            evidence: vec![],
+        });
+        let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+        assert_eq!(
+            store
+                .commit_agent_decision(&job, &receipt_context, &receipt, &sources)
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        let items = store
+            .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+            .unwrap();
+        let target = items.iter().find(|item| item.thread_id == "one").unwrap();
+        assert_eq!(target.message_id, 1);
+        assert_eq!(target.decision.summary, "Electricity bill");
+        assert_eq!(target.decision.kinds, vec![EmailKind::Bill]);
+        assert_eq!(target.attention.summary, "Payment received");
+        assert_eq!(target.decision_source_message_id, 2);
+        store
+            .correct_agent_triage(
+                1,
+                2,
+                "external_access",
+                &serde_json::json!(true),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.external_agent_records(1, 10).unwrap().is_empty());
+        assert!(store.external_agent_reading(1, 10).unwrap().is_empty());
+        assert_eq!(
+            store
+                .agent_records(1, 10)
+                .unwrap()
+                .iter()
+                .find(|item| item.message_id == 1)
+                .unwrap()
+                .decision,
+            bill
         );
     }
 
