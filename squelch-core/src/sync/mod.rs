@@ -1195,12 +1195,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// credential stays broken.
     async fn refine_lane(&self, shutdown: &mut tokio::sync::watch::Receiver<bool>) {
         let interval = Duration::from_secs(self.config.triage.agent.worker_poll_secs);
+        let mut idle_rounds = 0u32;
         loop {
             if *shutdown.borrow() {
                 return;
             }
             if self.poll_healthy.load(Ordering::Relaxed) {
-                self.agent_triage_pass().await;
+                if self.agent_triage_pass().await {
+                    idle_rounds = 0;
+                } else {
+                    idle_rounds = idle_rounds.saturating_add(1).min(5);
+                }
 
                 // Per-round, so an embedder attached after startup catches up on
                 // rows ingested before it was ready, no restart needed.
@@ -1218,8 +1223,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // `notified()` returns at once. It also COALESCES — twenty pokes
             // during one long round are one extra round, not twenty.
             tokio::select! {
-                _ = self.refine_wake.notified() => {}
-                _ = tokio::time::sleep(interval) => {}
+                _ = self.refine_wake.notified() => { idle_rounds = 0; }
+                _ = tokio::time::sleep(interval.saturating_mul(1 << idle_rounds).min(Duration::from_secs(30))) => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { return; }
                 }
@@ -4802,6 +4807,56 @@ mod tests {
             !historical.foreground,
             "initial backfill must use the background sub-cap"
         );
+    }
+
+    #[tokio::test]
+    async fn expired_provider_circuit_admits_one_probe_and_recloses() {
+        let (store, account) = store_at_cursor(Some(100));
+        for index in 0..4 {
+            ingest_into(
+                &store,
+                account,
+                &fixture(
+                    account,
+                    &format!("probe-{index}"),
+                    "From: alice@example.com\r\nSubject: Hello\r\n\r\nA note",
+                    false,
+                ),
+                Utc::now(),
+            );
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/",
+            axum::routing::post(move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                async { StatusCode::SERVICE_UNAVAILABLE }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let llm = ResolvedLlm {
+            url: format!("http://{}/", listener.local_addr().unwrap()),
+            api_key: "test".into(),
+            provider: Stage2Provider::OpenAI,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut engine = engine(store, account, "http://127.0.0.1:1");
+        engine.stage2_llm = Some(llm);
+        engine.config.triage.agent.concurrency = 4;
+        engine
+            .agent_retry_after
+            .store(Utc::now().timestamp() - 1, Ordering::Relaxed);
+        assert!(engine.agent_triage_pass().await);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(engine.agent_retry_after.load(Ordering::Relaxed) > Utc::now().timestamp());
+        assert!(!engine.agent_triage_pass().await);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "cooldown must not wake the queue"
+        );
+        server.abort();
     }
 
     #[tokio::test]

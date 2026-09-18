@@ -9,6 +9,19 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+const CLAIM_JOB_SQL: &str = "SELECT j.id,j.message_id,j.trigger,j.attempts,j.arrival_eligible,j.kind,COALESCE(lane.foreground,0)
+             FROM agent_triage_jobs j INDEXED BY idx_agent_jobs_pending_claim JOIN messages candidate ON candidate.account_id=j.account_id AND candidate.id=j.message_id
+             LEFT JOIN agent_job_lanes lane ON lane.job_id=j.id
+             WHERE j.account_id=?1 AND j.state IN ('queued','leased') AND (j.kind=?2 OR (?2 IN ('investigation','initial_investigation') AND j.kind IN ('triage','access')))
+               AND (?2!='initial_investigation' OR j.trigger NOT LIKE 'revisit:%')
+               AND j.available_at<=?3 AND (j.state='queued' OR (j.state='leased' AND j.lease_until<=?3))
+               AND (j.kind NOT IN ('triage','access') OR NOT EXISTS(
+                   SELECT 1 FROM agent_triage_jobs active JOIN messages other ON other.account_id=active.account_id AND other.id=active.message_id
+                   WHERE active.account_id=j.account_id AND active.kind IN ('triage','access')
+                     AND active.state='leased' AND active.lease_until>?3 AND active.id!=j.id
+                     AND other.thread_id=candidate.thread_id))
+             ORDER BY COALESCE(lane.foreground,0) DESC,j.available_at,j.id LIMIT 1";
+
 fn json<T: serde::Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| CoreError::Other(e.into()))
 }
@@ -968,24 +981,23 @@ impl AgentTriageStore for SqliteStore {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let token: String = tx.query_row("SELECT lower(hex(randomblob(16)))", [], |r| r.get(0))?;
         let until = (now + Duration::seconds(lease_seconds)).to_rfc3339();
-        let row = tx.query_row(
-            "SELECT j.id,j.message_id,j.trigger,j.attempts,j.arrival_eligible,j.kind,COALESCE(lane.foreground,0)
-             FROM agent_triage_jobs j JOIN messages candidate ON candidate.account_id=j.account_id AND candidate.id=j.message_id
-             LEFT JOIN agent_job_lanes lane ON lane.job_id=j.id
-             WHERE j.account_id=?1 AND (j.kind=?2 OR (?2 IN ('investigation','initial_investigation') AND j.kind IN ('triage','access')))
-               AND (?2!='initial_investigation' OR j.trigger NOT LIKE 'revisit:%')
-               AND j.available_at<=?3 AND (j.state='queued' OR (j.state='leased' AND j.lease_until<=?3))
-               AND (j.kind NOT IN ('triage','access') OR NOT EXISTS(
-                   SELECT 1 FROM agent_triage_jobs active JOIN messages other ON other.account_id=active.account_id AND other.id=active.message_id
-                   WHERE active.account_id=j.account_id AND active.kind IN ('triage','access')
-                     AND active.state='leased' AND active.lease_until>?3 AND active.id!=j.id
-                     AND other.thread_id=candidate.thread_id))
-             ORDER BY COALESCE(lane.foreground,0) DESC,j.arrival_eligible DESC,
-               CASE WHEN j.trigger IN ('arrival','ingest') THEN 0 WHEN j.trigger='migration' THEN 2 ELSE 1 END,
-               j.available_at,j.id LIMIT 1",
-            params![account,kind,now.to_rfc3339()],
-            |r| Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,bool>(4)?,r.get::<_,String>(5)?,r.get::<_,bool>(6)?)),
-        ).optional()?;
+        let row = tx
+            .query_row(
+                CLAIM_JOB_SQL,
+                params![account, kind, now.to_rfc3339()],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, bool>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, bool>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((id, message_id, trigger, attempts, arrival_eligible, claimed_kind, foreground)) =
             row
         else {
@@ -2203,6 +2215,85 @@ mod tests {
                 .attention
                 .is_some()
         );
+    }
+
+    #[test]
+    fn background_claims_follow_age_instead_of_starving_migration() {
+        let store = fixture();
+        store
+            .enqueue_agent_triage(1, 1, "migration", false)
+            .unwrap();
+        store
+            .enqueue_agent_triage(1, 2, "manual:new", false)
+            .unwrap();
+        store.lock().unwrap().execute("UPDATE agent_triage_jobs SET available_at=CASE message_id WHEN 1 THEN '2026-01-01' ELSE '2026-01-02' END", []).unwrap();
+        let job = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.message_id, 1);
+    }
+
+    #[test]
+    fn claim_plan_excludes_two_hundred_thousand_completed_jobs() {
+        let store = std::sync::Arc::new(fixture());
+        store.lock().unwrap().execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<200000)
+            INSERT INTO agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,state,available_at)
+            SELECT 1,1,'triage','history',i,'completed','2026-01-01' FROM n;").unwrap();
+        store.lock().unwrap().execute_batch("WITH RECURSIVE n(i) AS (SELECT 100 UNION ALL SELECT i+1 FROM n WHERE i<1599)
+            INSERT INTO messages(id,account_id,gmail_msg_id,thread_id,from_addr,subject,received_at,snippet,body)
+            SELECT i,1,'migration-'||i,'migration-'||i,'sender@test','subject','2026-01-01','snippet','body' FROM n;
+            INSERT INTO agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,available_at)
+            SELECT 1,id,'triage','migration',1,'2026-01-01' FROM messages WHERE id>=100;").unwrap();
+        store.enqueue_agent_triage(1, 2, "arrival", true).unwrap();
+        let plan = {
+            let conn = store.lock().unwrap();
+            let mut query = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {CLAIM_JOB_SQL}"))
+                .unwrap();
+            query
+                .query_map(params![1, "investigation", Utc::now().to_rfc3339()], |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+        };
+        assert!(plan.contains("idx_agent_jobs_pending_claim"), "{plan}");
+        let reader_store = store.clone();
+        let reader = std::thread::spawn(move || {
+            for _ in 0..100 {
+                reader_store.agent_read_message(1, 1).unwrap();
+            }
+        });
+        let start = std::time::Instant::now();
+        let arrival = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            arrival.message_id, 2,
+            "arrival precedes the migration backlog"
+        );
+        store.complete_agent_job(&arrival).unwrap();
+        for _ in 0..99 {
+            let job = store
+                .claim_agent_job(1, "investigation", Utc::now(), 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.trigger, "migration");
+            store.complete_agent_job(&job).unwrap();
+        }
+        let elapsed = start.elapsed();
+        reader.join().unwrap();
+        eprintln!(
+            "200k completed jobs, 1,500 migrations, 100 claims + concurrent reads: {elapsed:?}; mean {:?}",
+            elapsed / 100
+        );
+        // A generous debug-build threshold still catches the reported 74–92ms
+        // per-claim history scan. EXPLAIN is the deterministic regression guard.
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]
