@@ -202,11 +202,36 @@ struct SenderIdentityTests {
             r("=?UTF-8?Q?Caf=C3=A9?= <hi@cafe.com>") == "Cafe",
             "an undecoded encoded-word is bytes, not a name")
         expect(r("acme.com <no-reply@acme.com>") == "Acme", "the domain as a name is the brand")
+        expect(
+            r("John =?UTF-8?Q?M=C3=BCller?= <john@acme.com>") == "John",
+            "an encoded-word anywhere in the name is dropped, the rest kept")
+        expect(
+            r("'sarah@acme.com' via Team <team@googlegroups.com>") == "Acme via Team",
+            "an address inside a name is labelled, not deleted")
+        expect(r("Sarah @ Acme <sarah@acme.com>") == "Sarah @ Acme", "a lone @ is punctuation")
+        expect(
+            r("Sarah Chen [sarah@acme.com] <sarah@acme.com>") == "Sarah Chen",
+            "a trailing bracketed address is dropped")
+
+        // Role mailboxes are functions, not people: never a fake employee.
+        expect(r("account-security@apple.com") == "Apple", "not Account Security")
+        expect(r("order-confirmation@amazon.com") == "Amazon", "not Order Confirmation")
+        expect(r("customer.service@chase.com") == "Chase", "not Customer Service")
+        expect(r("ship-confirm@amazon.com") == "Amazon", "not Ship Confirm")
+        expect(r("hr-team@acme.com") == "Acme", "not Hr Team")
+        expect(r("hr-team@gmail.com") == "hr-team", "and at a consumer host, the local as given")
+
+        // Hyphenated domains are names with hyphens in them, not typos.
+        expect(r("info@marks-and-spencer.co.uk") == "Marks-And-Spencer", "per hyphen token")
+        expect(r("jane@t-mobile.com") == "T-Mobile", "and the row's robot arm reads the same way:")
+        expect(SenderID.displayName("no-reply@t-mobile.com") == "T-Mobile", "T-Mobile, not T-mobile")
         expect(r("Bob") == "Bob", "and a sender with no address at all is what it says")
 
         for sender in [
             "sarah@acme.com", "bounce-1234-5678@em.brand.com", "x7k2q9@outlook.com",
             "notifications@github.com <noreply@github.com>", "\"\" <a@b.co>",
+            "'sarah@acme.com' via Team <team@googlegroups.com>",
+            "John =?UTF-8?Q?M=C3=BCller?= <john@acme.com>", "account-security@apple.com",
             "=?UTF-8?Q?x?= <a@b.co>", "sarah@acme.com <sarah@acme.com>",
         ] {
             expect(!r(sender).contains("@"), "never an address: \(sender)")

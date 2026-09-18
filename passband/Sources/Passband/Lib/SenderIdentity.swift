@@ -83,6 +83,14 @@ enum SenderID {
         parse(sender).addr.lowercased()
     }
 
+    /// The mailbox before the "@", with any "+tag" dropped. The ONE place this
+    /// is spelled: initials, the robot and brand verdicts and both name rules
+    /// all read the same local-part, and used to each extract it by hand.
+    static func localPart(_ addr: String) -> String {
+        let local = addr.split(separator: "@").first.map(String.init) ?? ""
+        return local.split(separator: "+").first.map(String.init) ?? local
+    }
+
     /// Split a comma-joined recipient list into its individual entries, each
     /// still in the "Name <addr>" shape `parse` expects.
     ///
@@ -121,8 +129,7 @@ enum SenderID {
     /// local-part alone.
     static func initials(_ sender: String) -> String {
         let p = parse(sender)
-        let local = (p.addr.split(separator: "@").first.map(String.init) ?? "")
-            .split(separator: "+").first.map(String.init) ?? ""
+        let local = localPart(p.addr)
 
         var source = p.name
         if source.isEmpty {
@@ -194,9 +201,7 @@ enum SenderID {
 
     /// True if the sender's local-part (pre-"+tag") is a known robot shape.
     static func isRobot(_ sender: String) -> Bool {
-        let addr = parse(sender).addr
-        let local = addr.split(separator: "@").first.map(String.init) ?? ""
-        let base = (local.split(separator: "+").first.map(String.init) ?? local).lowercased()
+        let base = localPart(parse(sender).addr).lowercased()
         if robotLocals.contains(base) { return true }
         // "no.reply.alerts" / "no_reply" / "billing-noreply" -> "...noreply..."
         let squashed = base.filter { $0.isLetter || $0.isNumber }
@@ -234,6 +239,30 @@ enum SenderID {
         guard let domain = faviconDomain(sender) else { return nil }
         let first = domain.split(separator: ".").first.map(String.init) ?? ""
         return first.isEmpty ? nil : first
+    }
+
+    /// The base label as a NAME: each hyphen-separated word capitalized, the
+    /// hyphens kept. "stripe" -> "Stripe", "t-mobile" -> "T-Mobile",
+    /// "marks-and-spencer" -> "Marks-And-Spencer". `capitalizingFirst` alone
+    /// gave "Marks-and-spencer", which reads as a typo.
+    static func brandLabel(_ sender: String) -> String? {
+        guard let base = baseLabel(sender) else { return nil }
+        return base.split(separator: "-", omittingEmptySubsequences: false)
+            .map { Fmt.capitalizingFirst(String($0)) }
+            .joined(separator: "-")
+    }
+
+    /// The label of a SERVICE sender, or nil for a human: a brand shows its
+    /// local-part as given ("eBay"), a robot mailbox its domain's label
+    /// ("Stripe"). The one arm both name rules share, so a row and a banner
+    /// agree about every service by construction.
+    private static func serviceLabel(_ sender: String) -> String? {
+        if isBrand(sender) {
+            let local = localPart(parse(sender).addr)
+            if !local.isEmpty { return local }
+        }
+        if isRobot(sender), let label = brandLabel(sender) { return label }
+        return nil
     }
 
     /// Consumer mail hosts, where a display name matching the host asserts
@@ -303,8 +332,7 @@ enum SenderID {
         let base = domain.split(separator: ".").first.map(String.init) ?? ""
         guard !base.isEmpty else { return false }
 
-        let local = (parsed.addr.split(separator: "@").first.map(String.init) ?? "")
-            .split(separator: "+").first.map(String.init) ?? ""
+        let local = localPart(parsed.addr)
         if !local.isEmpty, local.lowercased() == base { return true }
 
         guard !consumerHosts.contains(domain) else { return false }
@@ -315,24 +343,16 @@ enum SenderID {
         return name == nameTokens(base) || name == nameTokens(domain)
     }
 
-    /// The name to SHOW for a sender:
+    /// The name to SHOW for a sender, in a row:
     ///  1. A display name that differs from the raw address wins.
-    ///  2. A BRAND sender shows the local-part as given ("eBay").
-    ///  3. A ROBOT sender shows the capitalized base domain label ("Stripe").
-    ///  4. Otherwise the address as-is.
-    /// Never emits "x@x.com"-style redundancy.
+    ///  2. A service sender's label (`serviceLabel`): "eBay", "Stripe".
+    ///  3. Otherwise the address as-is.
+    /// Never emits "x@x.com"-style redundancy. A NOTIFICATION never takes
+    /// step 3; see `readableName`.
     static func displayName(_ sender: String) -> String {
         let p = parse(sender)
         if !p.name.isEmpty, p.name.lowercased() != p.addr.lowercased() { return p.name }
-        if isBrand(sender) {
-            let local = (p.addr.split(separator: "@").first.map(String.init) ?? "")
-                .split(separator: "+").first.map(String.init) ?? ""
-            if !local.isEmpty { return local }
-        }
-        if isRobot(sender), let base = baseLabel(sender) {
-            return Fmt.capitalizingFirst(base)
-        }
-        return p.addr
+        return serviceLabel(sender) ?? p.addr
     }
 
     // MARK: - notification names
@@ -348,52 +368,71 @@ enum SenderID {
     /// the same evidence in the same order and REFUSES the last step, saying
     /// the most specific readable thing it can instead:
     ///
-    ///  1. A display name that is a name: not an address, not an undecoded
-    ///     encoded-word, not a robot word ("No Reply", "Notifications").
-    ///     A display name that is the domain spelled out ("acme.com") is the
-    ///     brand and reads as one.
-    ///  2. A brand's local-part as given ("eBay").
-    ///  3. A robot mailbox's domain label ("Stripe").
-    ///  4. A dotted human local-part, humanized: sarah.chen@ -> "Sarah Chen".
-    ///  5. Anything else at a real domain: the domain's label ("Acme"). The
-    ///     summary under it says what the mail is about; the tap opens the
-    ///     thread with the exact address in it.
-    ///  6. A consumer mailbox with an opaque local-part (bboynton97@gmail.com):
-    ///     the local-part alone. The host names the provider, not the sender,
-    ///     so it is the one piece worth keeping and the "@gmail.com" is not.
+    ///  1. A display name that is a name (`usableName`): not a robot word
+    ///     ("No Reply", "Notifications"), with any undecoded encoded-word
+    ///     dropped and any address inside it replaced by what THAT address
+    ///     reads as. A display name that is the domain spelled out
+    ///     ("acme.com") is the brand and reads as one.
+    ///  2. Otherwise the address alone (`addressLabel`): a brand's local-part
+    ///     as given ("eBay"); a robot mailbox's domain label ("Stripe"); a
+    ///     dotted human local-part humanized (sarah.chen@ -> "Sarah Chen");
+    ///     anything else at a real domain, the domain's label ("Acme"); and
+    ///     at a consumer mailbox with an opaque local-part, the local-part
+    ///     alone ("bboynton97"), because "@gmail.com" names the provider and
+    ///     not the sender.
     static func readableName(_ sender: String) -> String {
         let p = parse(sender)
         // No address at all ("Bob"): whatever was given IS the name.
         guard p.addr.contains("@") else { return p.name }
-
         if let name = usableName(p.name, addr: p.addr) { return name }
+        return addressLabel(p.addr)
+    }
 
-        let local = (p.addr.split(separator: "@").first.map(String.init) ?? "")
-            .split(separator: "+").first.map(String.init) ?? ""
-        let domain = faviconDomain(sender)
-
-        if isBrand(sender), !local.isEmpty { return local }
-        if isRobot(sender), let base = baseLabel(sender) { return Fmt.capitalizingFirst(base) }
+    /// What a bare address reads as, when there is no name to go on.
+    private static func addressLabel(_ addr: String) -> String {
+        if let service = serviceLabel(addr) { return service }
+        let local = localPart(addr)
         if let human = humanizedLocal(local) { return human }
-        if let domain, !consumerHosts.contains(domain), let base = baseLabel(sender) {
-            return Fmt.capitalizingFirst(base)
+        let label = brandLabel(addr)
+        if let domain = faviconDomain(addr), !consumerHosts.contains(domain), let label {
+            return label
         }
-        return local.isEmpty ? p.name : local
+        return local.isEmpty ? (label ?? addr) : local
     }
 
     /// A display name that reads as a name, cleaned, or nil when it does not.
-    /// A parenthesized address after a real name ("Sarah Chen (sarah@acme.com)")
-    /// is dropped rather than disqualifying the name in front of it.
+    ///
+    /// Three cleanups, in this order. A trailing bracketed address is dropped
+    /// ("Sarah Chen (sarah@acme.com)" keeps the name in front of it). An
+    /// RFC 2047 encoded-word the daemon did not decode is dropped wherever it
+    /// sits, because "=?UTF-8?Q?M=C3=BCller?=" is bytes and not a name. And an
+    /// address left INSIDE the name is replaced by what that address reads
+    /// as, not deleted: Google Groups relays "'sarah@acme.com' via Team", and
+    /// deleting the word leaves "via Team", which names nobody. A lone "@"
+    /// ("Sarah @ Acme") is punctuation and stays.
     private static func usableName(_ raw: String, addr: String) -> String? {
-        var words = raw.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        words.removeAll { $0.contains("@") }
-        let name =
+        var name = raw.trimmingCharacters(in: .whitespaces)
+
+        // "(sarah@acme.com)" / "[sarah@acme.com]" / "<sarah@acme.com>" at the end.
+        for (open, close) in [("(", ")"), ("[", "]"), ("<", ">")] {
+            guard name.hasSuffix(close), let start = name.lastIndex(of: Character(open))
+            else { continue }
+            let inner = name[name.index(after: start)..<name.index(before: name.endIndex)]
+            if isAddressShaped(String(inner)) {
+                name = String(name[..<start]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        let words = name.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+            .filter { !$0.contains("=?") }
+            .map { word -> String in
+                let bare = word.trimmingCharacters(in: CharacterSet(charactersIn: "()[]<>\"'"))
+                return isAddressShaped(bare) ? addressLabel(bare) : word
+            }
+        name =
             words.joined(separator: " ")
             .trimmingCharacters(in: CharacterSet(charactersIn: "()[]<>\"' "))
         guard !name.isEmpty, name.contains(where: { $0.isLetter }) else { return nil }
-        // An encoded-word the daemon did not decode is bytes, not a name.
-        guard !name.hasPrefix("=?") else { return nil }
-        guard name.lowercased() != addr.lowercased() else { return nil }
 
         // A name that is only the robot word says nothing about WHO.
         let squashed = name.lowercased().filter { $0.isLetter || $0.isNumber }
@@ -404,23 +443,58 @@ enum SenderID {
         // The domain spelled out as the name is the brand: say it as one.
         if let host = addr.split(separator: "@").last.map({ String($0).lowercased() }),
             name.lowercased() == host || name.lowercased() == faviconDomain(addr),
-            let base = baseLabel(addr)
+            let label = brandLabel(addr)
         {
-            return Fmt.capitalizingFirst(base)
+            return label
         }
         return name
     }
 
+    /// "x@y.z": something on both sides of one "@", and a dot in the host.
+    /// A lone "@" or "@acme" is not an address.
+    private static func isAddressShaped(_ word: String) -> Bool {
+        let parts = word.split(separator: "@", omittingEmptySubsequences: false)
+        guard parts.count == 2, !parts[0].isEmpty, parts[1].contains(".") else { return false }
+        return !parts[1].hasPrefix(".") && !parts[1].hasSuffix(".")
+    }
+
+    /// Mailbox ROLE words. A local-part built from these is a function, not a
+    /// person, and humanizing it prints a fake employee in bold: "Account
+    /// Security", "Customer Service", "Hr Team". These are the ones that show
+    /// up joined by dots and dashes; the whole-local-part shapes are already
+    /// `robotLocals`, and both sets veto.
+    private static let roleWords: Set<String> = [
+        "account", "accounts", "security", "order", "orders", "confirm", "confirmation",
+        "confirmations", "customer", "customers", "service", "services", "ship", "shipping",
+        "shipment", "shipments", "team", "hr", "it", "ops", "sales", "press", "legal", "privacy",
+        "careers", "jobs", "recruiting", "talent", "payments", "payment", "billing", "invoice",
+        "member", "members", "membership", "welcome", "verify", "verification", "auth", "login",
+        "signin", "care", "success", "onboarding", "community", "events", "promo", "promotions",
+        "offers", "deals", "rewards", "loyalty", "notify", "system", "robot", "bot", "daemon",
+        "postmaster", "webmaster", "hostmaster", "abuse", "helpdesk", "servicedesk", "desk",
+        "ticket", "tickets", "bounce", "bounces", "return", "returns", "refund", "refunds",
+        "subscription", "subscriptions", "renewal", "renewals", "reminder", "reminders",
+        "notice", "notices", "announce", "announcement", "announcements", "status", "report",
+        "reports", "summary", "daily", "weekly", "monthly", "editor", "editorial", "store",
+        "shop", "app", "apps", "web", "mobile", "partner", "partners", "affiliate",
+        "affiliates", "finance", "accounting", "payroll", "benefits", "product", "engineering",
+        "dev", "devops", "reply", "no", "do", "not", "auto", "noreply",
+    ]
+
     /// "sarah.chen" / "sarah_chen" / "sarah-chen" -> "Sarah Chen". Two or three
-    /// all-letter tokens, or nothing: a digit, a lone token or a longer run is
-    /// an identifier, not a name, and guessing at it would print "Jsmith" in
-    /// bold. Only the shape a person types their own name in gets read as one.
+    /// all-letter tokens, none of them a mailbox role word, or nothing: a
+    /// digit, a lone token or a longer run is an identifier, not a name, and
+    /// guessing at it would print "Jsmith" in bold. Only the shape a person
+    /// types their own name in gets read as one.
     private static func humanizedLocal(_ local: String) -> String? {
-        let tokens = local.split(whereSeparator: { $0 == "." || $0 == "_" || $0 == "-" })
+        let tokens = local.lowercased()
+            .split(whereSeparator: { $0 == "." || $0 == "_" || $0 == "-" })
+            .map(String.init)
         guard (2...3).contains(tokens.count) else { return nil }
         guard tokens.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isLetter) }) else { return nil }
-        return tokens.map { $0.prefix(1).uppercased() + $0.dropFirst().lowercased() }
-            .joined(separator: " ")
+        guard !tokens.contains(where: { robotLocals.contains($0) || roleWords.contains($0) })
+        else { return nil }
+        return tokens.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
     }
 
     /// DuckDuckGo icon service URL for a base domain.

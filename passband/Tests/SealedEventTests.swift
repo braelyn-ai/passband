@@ -275,13 +275,16 @@ struct SealedEventTests {
             EventBanner.copy(for: dated).subtitle == "has a deadline",
             "a deadline event says there is one, not when it is")
         expect(EventBanner.copy(for: plain).subtitle == "", "surfaced mail has no second line")
+        // The chip the rows draw for this date, asserted absent BY ITS OWN
+        // TEXT rather than by a guess at its spelling.
+        guard let chip = Fmt.deadlineChip(past)?.text, !chip.isEmpty else {
+            return expect(false, "the fixture's date yields a chip the rows would draw")
+        }
         for e in [urgent, dated, plain] {
             let copy = EventBanner.copy(for: e)
             let everything = [copy.title, copy.subtitle, copy.body].joined(separator: " ")
-            expect(!everything.contains("2026"), "no year reaches a banner")
-            expect(
-                !everything.lowercased().contains("due") && !everything.contains("d "),
-                "nor a due chip in any spelling")
+            expect(!everything.contains(chip), "the chip \(chip) reaches no field of the banner")
+            expect(!everything.contains("2026"), "nor the date it was made from")
         }
     }
 
