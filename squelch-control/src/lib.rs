@@ -43,6 +43,7 @@ pub mod labels;
 pub mod oauth;
 pub mod pages;
 pub mod ratelimit;
+pub mod reconnect;
 pub mod resend;
 pub mod seal;
 pub mod sessions;
@@ -110,6 +111,7 @@ use axum::{
 pub fn router(state: ControlState) -> Router {
     let form = Router::new()
         .route("/", get(handlers::signup_form))
+        .route("/reconnect/status", get(reconnect::status))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::limit_page,

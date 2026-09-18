@@ -42,6 +42,7 @@ pub struct ControlState {
 }
 
 struct Inner {
+    reconnect_slots: Arc<tokio::sync::Semaphore>,
     config: Config,
     store: ControlStore,
     warden: Arc<dyn Warden>,
@@ -118,6 +119,9 @@ impl ControlState {
             .transpose()?;
         Ok(Self {
             inner: Arc::new(Inner {
+                reconnect_slots: Arc::new(tokio::sync::Semaphore::new(
+                    crate::reconnect::MAX_CONCURRENT,
+                )),
                 config,
                 store,
                 warden,
@@ -146,6 +150,13 @@ impl ControlState {
 
     pub fn store(&self) -> &ControlStore {
         &self.inner.store
+    }
+
+    /// One of [`crate::reconnect::MAX_CONCURRENT`] rollout slots, or `None`
+    /// when every one is taken. Never waits: a pass that finds no slot leaves
+    /// its rows for the next one.
+    pub(crate) fn reconnect_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.inner.reconnect_slots.clone().try_acquire_owned().ok()
     }
 
     pub fn warden(&self) -> &dyn Warden {

@@ -199,6 +199,11 @@ pub enum WardenError {
 struct ReplaceCredentialsRequest<'a> {
     account_email: &'a str,
     cred_read_ciphertext: &'a str,
+    /// Always `false` from this crate: a reconnect wants the rollout, not a
+    /// device pairing. Sent explicitly because a warden that predates the
+    /// field reads its absence as the old "mint a pairing" behaviour; see
+    /// `deploy/hosted/ROLLOUT.md` on shipping the warden first.
+    pair: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -466,19 +471,27 @@ pub trait Warden: Send + Sync {
         cred_read_ciphertext: &str,
     ) -> Result<Pairing, WardenError>;
 
-    /// REPLACE a live tenant's credential after its owner re-consented.
+    /// REPLACE a live tenant's credential after its owner re-consented, and
+    /// wait for the rollout that carries it. NO PAIRING: the owner's devices
+    /// are already paired, and a code nobody will type is a live credential
+    /// lying around.
     ///
     /// [`Warden::put_credentials`] answers 409 for an ACTIVE tenant, which is
     /// correct for signup and useless for a re-consent, so this is its own
     /// route with its own guard. `account_email` is matched on the warden's
     /// side against the tenant's identity Secret, so a 409 here means the
-    /// cluster does not agree that this mailbox owns this tenant.
-    async fn replace_credentials(
+    /// cluster does not agree that this mailbox owns this tenant - or that the
+    /// tenant is not running. `cred_read_ciphertext` MUST be age armor.
+    ///
+    /// Required rather than defaulted: a default that reached for a pairing
+    /// route and threw the code away would satisfy the signature and mint an
+    /// unused device credential on every reconnect.
+    async fn reconnect_credentials(
         &self,
         label: &str,
         account_email: &str,
         cred_read_ciphertext: &str,
-    ) -> Result<Pairing, WardenError>;
+    ) -> Result<(), WardenError>;
 
     /// Install or rotate the tenant's LLM-gateway virtual keys — triage
     /// (`api_key`) and assistant — in one call. `None` skips a slot rather
@@ -648,12 +661,12 @@ impl Warden for HttpWarden {
         }
     }
 
-    async fn replace_credentials(
+    async fn reconnect_credentials(
         &self,
         label: &str,
         account_email: &str,
         cred_read_ciphertext: &str,
-    ) -> Result<Pairing, WardenError> {
+    ) -> Result<(), WardenError> {
         crate::labels::validate(label).map_err(|_| WardenError::LabelRefused)?;
         // The same guard the signup route carries, for the same reason: this is
         // the line that fails loudly if a refactor ever hands it a plaintext
@@ -661,31 +674,29 @@ impl Warden for HttpWarden {
         if !cred_read_ciphertext.starts_with(crate::seal::ARMOR_HEADER) {
             return Err(WardenError::NotCiphertext);
         }
-
         let resp = self
             .http
             .put(self.url(&format!("/v1/tenants/{label}/credentials/replace")))
+            // A rollout, not a round trip: see RECONNECT_TIMEOUT.
+            .timeout(crate::config::RECONNECT_TIMEOUT)
             .bearer_auth(&self.token)
             .json(&ReplaceCredentialsRequest {
                 account_email,
                 cred_read_ciphertext,
+                pair: false,
             })
             .send()
             .await
             .map_err(|e| transport_error(e, label))?;
-
         match resp.status().as_u16() {
-            200 => {
-                let body = read_capped(resp, label).await?;
-                let pairing: Pairing =
-                    serde_json::from_slice(&body).map_err(|_| WardenError::BadPairing)?;
-                validate_pairing(&pairing)?;
-                Ok(pairing)
-            }
+            // 204 is the answer; 200 is an older warden that ignored `pair`
+            // and minted a pairing anyway. Both confirm the rollout, and the
+            // body of the second is a code nobody will type, so it is not read.
+            200 | 204 => Ok(()),
             401 | 403 => Err(WardenError::Unauthorized),
             404 => Err(WardenError::NotFound),
             // The cluster says this mailbox does not own this tenant, or the
-            // account is cancelled. Both are the same refusal on purpose.
+            // tenant is cancelled or not running. One refusal on purpose.
             409 => Err(WardenError::LabelTaken),
             422 => Err(WardenError::NotCiphertext),
             _ => Err(WardenError::Failed),
@@ -1710,17 +1721,27 @@ mod tests {
         assert!(seen.iter().all(|b| b == "Bearer token"));
     }
 
-    /// A warden that takes `delay` to answer either operator route, behind a
+    /// A warden that takes `delay` to answer rollout and read routes, behind a
     /// client that gives up after `budget`. `delay` is the only thing these
     /// tests care about, so the bodies are just enough to parse.
     async fn slow_warden(delay: Duration, budget: Duration) -> HttpWarden {
         use axum::{
             Json, Router,
-            routing::{get, post},
+            response::IntoResponse,
+            routing::{get, post, put},
         };
         use serde_json::json;
 
         let app = Router::new()
+            .route(
+                "/v1/tenants/{label}/credentials/replace",
+                put(move |Json(body): Json<serde_json::Value>| async move {
+                    tokio::time::sleep(delay).await;
+                    // What this crate sends is a reconnect, never a re-pair.
+                    assert_eq!(body["pair"], false);
+                    axum::http::StatusCode::NO_CONTENT.into_response()
+                }),
+            )
             .route(
                 "/v1/tenants/{label}/reconcile",
                 post(move || async move {
@@ -1756,6 +1777,18 @@ mod tests {
         let w = slow_warden(Duration::from_millis(600), Duration::from_millis(100)).await;
 
         assert_eq!(w.reconcile("ellie").await.unwrap().deployment, "recreated");
+        assert!(matches!(
+            w.drift("ellie").await,
+            Err(WardenError::TimedOut { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconnect_outlasts_the_budget_the_read_routes_keep() {
+        let w = slow_warden(Duration::from_millis(600), Duration::from_millis(100)).await;
+        w.reconnect_credentials("ellie", "ellie@example.com", crate::seal::ARMOR_HEADER)
+            .await
+            .unwrap();
         assert!(matches!(
             w.drift("ellie").await,
             Err(WardenError::TimedOut { .. })

@@ -27,6 +27,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 
+use crate::reconnect::ReconnectView;
 use crate::store::UserRow;
 
 /// The Content-Security-Policy every page carries. The single allowance is the
@@ -637,6 +638,85 @@ device in.</p>"#,
             minutes = minutes,
         ),
     )
+}
+
+/// The reconnect status page, one arm per [`ReconnectView`]. The states the
+/// worker can still move carry a `Refresh` header, so the page reloads with no
+/// script and without replaying the OAuth callback; the rest stop and offer
+/// the one next action that fits.
+///
+/// EXHAUSTIVE ON PURPOSE. This page's failure mode is a state that reads as
+/// "still working" forever, which is the bug the whole worker exists to end,
+/// and a `_` arm would let a new terminal state ship straight into it.
+pub fn reconnect_result(view: ReconnectView) -> Response {
+    let (heading, detail, link, button) = match view {
+        ReconnectView::Pending => (
+            "Reconnecting your mailbox…",
+            "We’re restarting your mailbox with your new Google connection. This can take a few minutes. You can close this page; reconnecting will continue.",
+            "/reconnect/status",
+            "Check progress",
+        ),
+        ReconnectView::Retrying => (
+            "Reconnecting is taking longer than usual",
+            "We’re still working on your connection and will keep trying automatically. You can close this page and return later.",
+            "/reconnect/status",
+            "Check progress",
+        ),
+        ReconnectView::Checking => (
+            "Checking your reconnection…",
+            "We’re checking the latest progress. This page will update automatically.",
+            "/reconnect/status",
+            "Check progress",
+        ),
+        ReconnectView::Complete => (
+            "You’re reconnected",
+            "Your mailbox is connected to Google again. Open Passband to see your mail as syncing resumes.",
+            "passband://open",
+            "Open Passband",
+        ),
+        // NEUTRAL ON PURPOSE. A refusal is the cluster disagreeing with this
+        // service about who owns the mailbox or whether it is running, and
+        // which of those it was is not the browser's to learn (the same rule
+        // the pre-check in `handlers` keeps). Nor is "use the right account"
+        // honest here: the account that reached this page is the one the
+        // store says owns the mailbox.
+        ReconnectView::Refused => (
+            "Your mailbox couldn’t be reconnected",
+            "Passband couldn’t reconnect this mailbox, and nothing changed. Open Passband to check on it; if it still needs reconnecting in a few minutes, start again from there.",
+            "passband://open",
+            "Open Passband",
+        ),
+        ReconnectView::GaveUp => (
+            "Reconnecting didn’t finish",
+            "We kept trying for a while but couldn’t confirm your new Google connection. Nothing needs undoing. Try again, or open Passband to see whether mail is arriving.",
+            "/reconnect",
+            "Try again",
+        ),
+        ReconnectView::Expired => (
+            "This reconnect page has expired",
+            "Open Passband to check your mailbox. If it needs reconnecting, start a new connection.",
+            "passband://open",
+            "Open Passband",
+        ),
+    };
+    let mut response = page(
+        StatusCode::OK,
+        heading,
+        &format!(
+            "<h1>{}</h1><p role=\"status\">{}</p><p><a class=\"button\" href=\"{}\">{}</a></p>",
+            escape_html(heading),
+            escape_html(detail),
+            escape_html(link),
+            escape_html(button),
+        ),
+    );
+    if view.refreshes() {
+        response.headers_mut().insert(
+            header::REFRESH,
+            header::HeaderValue::from_static("5; url=/reconnect/status"),
+        );
+    }
+    response
 }
 
 /// The page BOTH logins get when they are refused: the same shell as [`problem`]
