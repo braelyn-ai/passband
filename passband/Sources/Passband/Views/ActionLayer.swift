@@ -1,7 +1,8 @@
 // The global action surface, above every other layer: undo/notice toasts, the
 // unsubscribe-violation prompt, rule editor, process mode, the 2FA modal,
-// triage-fix palette, ⌘K ask bar, shortcuts overlay. The composer is NOT here
-// anymore — it is a layout pane (see ComposePane in MainShell), not an overlay.
+// triage-fix palette, ⌘K ask bar, shortcuts overlay, the re-triage confirm and
+// the re-triage run itself. The composer is NOT here anymore — it is a layout
+// pane (see ComposePane in MainShell), not an overlay.
 // Read views own the list keymap; this layer extends that same "list" context
 // with t and p. Modal-context keys live inside each overlay.
 
@@ -57,6 +58,11 @@ struct ActionLayer: View {
             // a modal that can end up UNDER something has to be dismissed twice
             // to be read once.
             if store.whatsNew.active { WhatsNewCard() }
+            // The question that leads to the modal below, and it sits directly
+            // under it for the same reason that one is last: what it is asking
+            // is whether to take the app away, and that cannot be answered from
+            // behind whatever else happened to be open.
+            if let days = store.retriageAsk { RetriageConfirm(days: days) }
             // LAST, and it outranks even the card above: that one is a greeting
             // the user can dismiss, this one is the app being unavailable while
             // a re-triage rewrites what every other overlay here is about.

@@ -932,12 +932,16 @@ private struct StatusStrip: View {
 // MARK: - dev re-triage button
 
 /// DEV-MODE re-triage: renders nothing unless the developerMode pref is on.
-/// Fires POST /client/retriage for the trailing 7 days and then hands the window
-/// to `RetriageModal`, which blocks the app until the queues drain — the run
-/// rewrites every tier on the board, so there is nothing here worth reading
-/// while it happens. `busy` is the STORE's run, not a local flag: the modal
-/// outlives this button (a re-triage kicked from the sitrep survives navigating
-/// away), so the only honest source for "already going" is the run itself.
+/// ASKS FIRST (`RetriageConfirm`), then fires POST /client/retriage for the
+/// trailing 7 days and hands the window to `RetriageModal`, which blocks the app
+/// until the queues drain — the run rewrites every tier on the board, so there is
+/// nothing here worth reading while it happens. The confirm exists because of
+/// where this chip sits: a text control in a chrome bar, next to the sync stamp
+/// you actually click, in front of a wait you cannot cancel (#210).
+///
+/// `busy` is the STORE's run, not a local flag: the modal outlives this button
+/// (a re-triage kicked from the sitrep survives navigating away), so the only
+/// honest source for "already going" is the run itself.
 struct RetriageButton: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
@@ -950,7 +954,7 @@ struct RetriageButton: View {
         if prefs.developerMode {
             Button {
                 guard !busy else { return }
-                Task { await store.startRetriage(days: Self.days) }
+                store.askRetriage(days: Self.days)
             } label: {
                 Label("re-triage 7d", systemImage: "arrow.trianglehead.2.clockwise")
                     .font(Typo.micro)
@@ -964,7 +968,7 @@ struct RetriageButton: View {
             .disabled(busy)
             .help(
                 "dev: reset LLM verdicts for the last \(Self.days) days and re-run triage "
-                    + "(rule-decided and sealed mail untouched)")
+                    + "(rule-decided and sealed mail untouched). Asks first.")
         }
     }
 }

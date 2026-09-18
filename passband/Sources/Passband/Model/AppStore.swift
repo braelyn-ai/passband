@@ -1820,7 +1820,7 @@ final class AppStore {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
             || groupEditor != nil
-            || !authQueue.isEmpty || retriage != nil
+            || !authQueue.isEmpty || retriage != nil || retriageAsk != nil
             || tour.wantsBlur || whatsNew.active
     }
 
@@ -1978,6 +1978,37 @@ final class AppStore {
     /// bands underneath whatever page you would otherwise be reading.
     var retriage: RetriageRun?
 
+    /// A trailing-days re-triage the human has ASKED for and not yet confirmed.
+    ///
+    /// Held HERE rather than in `RetriageButton` for two reasons. The button is a
+    /// text chip inside a masthead HStack, and an `OverlayScrim` mounted there
+    /// would be clipped to the width of the chip. And there are two copies of
+    /// that button (the sitrep's masthead, the emails bar), so a dialog owned by
+    /// one of them would be the wrong one half the time. Every other modal in
+    /// this app is a field on the store that `ActionLayer` draws; so is this.
+    var retriageAsk: Int?
+
+    /// Ask before the window goes away. The run is minutes long, blocks the whole
+    /// app and spends on the model, and the chip that starts it sits a few points
+    /// from the sync stamp: one confirm is the difference between a re-triage and
+    /// a misclick you have to sit through (#210).
+    func askRetriage(days: Int) {
+        guard retriage == nil else { return }
+        retriageAsk = days
+    }
+
+    func cancelRetriageAsk() {
+        retriageAsk = nil
+    }
+
+    /// Confirmed: drop the question first, so the blocking modal replaces the
+    /// dialog rather than stacking on top of one that is still asking.
+    func confirmRetriage() async {
+        guard let days = retriageAsk else { return }
+        retriageAsk = nil
+        await startRetriage(days: days)
+    }
+
     /// How often the modal asks the daemon where it is. A re-triage takes
     /// minutes and the poll is one indexed aggregate, so this is about how alive
     /// the counter should FEEL, not about cost.
@@ -1991,6 +2022,7 @@ final class AppStore {
     /// per-message re-triage from the fix palette, joins the same run).
     func startRetriage(days: Int) async {
         guard retriage == nil else { return }
+        retriageAsk = nil
         let e = epoch
         retriage = RetriageRun()
         do {

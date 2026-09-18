@@ -161,3 +161,53 @@ struct RetriageModal: View {
         }
     }
 }
+
+// MARK: - the door in front of it
+
+/// THE CONFIRM FOR THE MODAL ABOVE. `re-triage 7d` is a text chip in the
+/// masthead, a few points from the sync stamp and the cost line, and until now
+/// pressing it took the entire app away for minutes with no way back (#210).
+/// One dialog's worth of friction is the whole fix: the run is fine, it just
+/// must never start by accident.
+///
+/// ONE LINE OF SUBTEXT, and it is the wait: the cost of this button is the
+/// minutes it takes the window away for, and everything else a longer paragraph
+/// could say (the verdicts thrown out, the model spend, what a rule spares) is
+/// detail for somebody who already knows what the dev chip does. "At least"
+/// rather than a number, because there isn't one: the run is as long as the
+/// window's mail, and the daemon does not even say how many rows it reset until
+/// after the kick.
+struct RetriageConfirm: View {
+    @Environment(AppStore.self) private var store
+    let days: Int
+
+    var body: some View {
+        OverlayScrim(onDismiss: { store.cancelRetriageAsk() }) {
+            ModalCard(width: 400) {
+                Text("Re-triage the last \(days) days?")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(Palette.ink)
+                Text("Passband is unavailable until it finishes, at least a few minutes.")
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 8) {
+                    Spacer(minLength: 0)
+                    Button("Cancel") { store.cancelRetriageAsk() }
+                        .buttonStyle(.glass)
+                    Button("Re-triage \(days)d") { Task { await store.confirmRetriage() } }
+                        .buttonStyle(.glassProminent)
+                        .tint(Palette.warn)
+                }
+            }
+        }
+        .keyContext(.modal)
+        .keyBindings(.modal, [
+            KeyBinding("Escape", "cancel", allowInInput: true) { store.cancelRetriageAsk() },
+            KeyBinding("Enter", "re-triage", allowInInput: true) {
+                Task { await store.confirmRetriage() }
+            },
+        ])
+    }
+}
