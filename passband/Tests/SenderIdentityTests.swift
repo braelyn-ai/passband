@@ -25,6 +25,7 @@ struct SenderIdentityTests {
         theBoundaryHolds()
         theKnownRemainder()
         namesStayCorrect()
+        notificationsNeverShowAnAddress()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -158,6 +159,89 @@ struct SenderIdentityTests {
         // Initials come off the NAME, never the full address.
         expect(SenderID.initials("Sarah Chen <sarah@acme.com>") == "SC", "two words, two letters")
         expect(SenderID.initials("bboynton97@gmail.com") == "BB", "never the domain's letters")
+    }
+
+    /// `readableName` is what a banner's title is built from, and the one
+    /// promise it makes is the one `displayName` deliberately does not: no
+    /// address, ever. Each case below is a shape that has actually landed in a
+    /// notification title.
+    static func notificationsNeverShowAnAddress() {
+        let r = SenderID.readableName
+        expect(r("Sarah Chen <sarah@acme.com>") == "Sarah Chen", "a display name wins outright")
+        expect(r("Airbnb <express@airbnb.com>") == "Airbnb", "so does a brand's own name")
+        expect(r("ebay@ebay.com") == "ebay", "a brand with no name shows its local-part")
+        expect(r("no-reply@stripe.com") == "Stripe", "a robot mailbox shows its domain label")
+        expect(r("alerts@mail.chase.com") == "Chase", "through a mail subdomain")
+        expect(
+            r("bounce-1234-5678@em.brand.com") == "Brand",
+            "an ESP routing box is its domain, not its token")
+        expect(r("sarah.chen@acme.com") == "Sarah Chen", "a dotted local-part is a person's name")
+        expect(r("sarah_chen@gmail.com") == "Sarah Chen", "at a consumer host too")
+        expect(r("sarah@acme.com") == "Acme", "a lone word at a real domain shows the domain")
+        expect(r("jsmith@acme.com") == "Acme", "because Jsmith in bold is not a name")
+        expect(r("bboynton97@gmail.com") == "bboynton97", "an opaque gmail local stands alone")
+        expect(r("x7k2q9@outlook.com") == "x7k2q9", "the provider's name adds nothing")
+
+        // Display names that are not names.
+        expect(
+            r("No Reply <no-reply@accounts.google.com>") == "Google",
+            "a robot word as the display name is no display name")
+        expect(
+            r("Notifications <notifications@github.com>") == "Github",
+            "nor is a bare mailbox role")
+        expect(
+            r("GitHub Notifications <notifications@github.com>") == "GitHub Notifications",
+            "but a brand plus its role is fine")
+        expect(
+            r("notifications@github.com <noreply@github.com>") == "Github",
+            "an address used as a display name is not a name")
+        expect(
+            r("Sarah Chen (sarah@acme.com) <sarah@acme.com>") == "Sarah Chen",
+            "a name with its address in parentheses keeps the name")
+        expect(
+            r("=?UTF-8?Q?Caf=C3=A9?= <hi@cafe.com>") == "Cafe",
+            "an undecoded encoded-word is bytes, not a name")
+        expect(r("acme.com <no-reply@acme.com>") == "Acme", "the domain as a name is the brand")
+        expect(
+            r("John =?UTF-8?Q?M=C3=BCller?= <john@acme.com>") == "John",
+            "an encoded-word anywhere in the name is dropped, the rest kept")
+        expect(
+            r("'sarah@acme.com' via Team <team@googlegroups.com>") == "Acme via Team",
+            "an address inside a name is labelled, not deleted")
+        expect(r("Sarah @ Acme <sarah@acme.com>") == "Sarah @ Acme", "a lone @ is punctuation")
+        expect(
+            r("Sarah Chen [sarah@acme.com] <sarah@acme.com>") == "Sarah Chen",
+            "a trailing bracketed address is dropped")
+
+        // Role mailboxes are functions, not people: never a fake employee.
+        expect(r("account-security@apple.com") == "Apple", "not Account Security")
+        expect(r("order-confirmation@amazon.com") == "Amazon", "not Order Confirmation")
+        expect(r("customer.service@chase.com") == "Chase", "not Customer Service")
+        expect(r("ship-confirm@amazon.com") == "Amazon", "not Ship Confirm")
+        expect(r("hr-team@acme.com") == "Acme", "not Hr Team")
+        expect(r("hr-team@gmail.com") == "hr-team", "and at a consumer host, the local as given")
+
+        // Hyphenated domains are names with hyphens in them, not typos.
+        expect(r("info@marks-and-spencer.co.uk") == "Marks-And-Spencer", "per hyphen token")
+        expect(r("jane@t-mobile.com") == "T-Mobile", "and the row's robot arm reads the same way:")
+        expect(SenderID.displayName("no-reply@t-mobile.com") == "T-Mobile", "T-Mobile, not T-mobile")
+        expect(r("Bob") == "Bob", "and a sender with no address at all is what it says")
+
+        for sender in [
+            "sarah@acme.com", "bounce-1234-5678@em.brand.com", "x7k2q9@outlook.com",
+            "notifications@github.com <noreply@github.com>", "\"\" <a@b.co>",
+            "'sarah@acme.com' via Team <team@googlegroups.com>",
+            "John =?UTF-8?Q?M=C3=BCller?= <john@acme.com>", "account-security@apple.com",
+            "=?UTF-8?Q?x?= <a@b.co>", "sarah@acme.com <sarah@acme.com>",
+        ] {
+            expect(!r(sender).contains("@"), "never an address: \(sender)")
+            expect(!r(sender).isEmpty, "never blank: \(sender)")
+        }
+
+        // Rows are unchanged: the address is still the row's fallback.
+        expect(
+            SenderID.displayName("bounce-1234-5678@em.brand.com") == "bounce-1234-5678@em.brand.com",
+            "readableName is the banner's rule, not the row's")
     }
 
     // MARK: - harness

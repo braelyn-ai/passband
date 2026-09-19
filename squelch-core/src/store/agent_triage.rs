@@ -80,6 +80,22 @@ pub enum AgentCommitOutcome {
     Stale,
 }
 
+/// Explicit lifecycle and time window for Reading and Records inventories.
+#[derive(Debug, Clone)]
+pub struct AgentListQuery {
+    /// None explicitly requests all dates. Default is the preceding 30 days.
+    pub since: Option<DateTime<Utc>>,
+    pub include_done: bool,
+}
+impl Default for AgentListQuery {
+    fn default() -> Self {
+        Self {
+            since: Some(Utc::now() - chrono::Duration::days(30)),
+            include_done: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentListItem {
     pub message_id: i64,
@@ -140,6 +156,31 @@ pub trait AgentTriageStore: Send + Sync {
         account: AccountId,
         limit: usize,
     ) -> Result<Vec<AgentListItem>>;
+    fn agent_reading_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>>;
+    fn agent_records_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>>;
+    fn external_agent_reading_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>>;
+    fn external_agent_records_with_query(
+        &self,
+        account: AccountId,
+        limit: usize,
+        query: &AgentListQuery,
+    ) -> Result<Vec<AgentListItem>>;
+    fn agent_shipment_is_cleared(&self, account: AccountId, tracking_number: &str) -> Result<bool>;
     fn correct_agent_triage(
         &self,
         account: AccountId,

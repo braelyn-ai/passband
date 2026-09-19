@@ -348,12 +348,26 @@ calm history rather than an unread pile.
   lives in store state only and is dropped from the queue on dismiss; multiple
   arrivals queue **newest-first**.
 
-## Newsletters — the rule-onboarding surface (2026-07-09)
+## Reading — the rule-onboarding surface (2026-07-09, renamed 2026-09-17)
 
 A fifth Sitrep zone (after Aging, before the status strip;
-`src/lib/newsletters.ts` + `NewslettersZone` in `SitrepView.tsx`). It turns the
+`src/lib/newsletters.ts` + `NewslettersZone` in `SitrepView.tsx`, now
+`Lib/Reading.swift` + `ReadingZone` in `Views/SitrepZones.swift`). It turns the
 recurring noise pile into the place the product **teaches the rule (Minga) flow**
 — "choose what you want to see" — instead of nagging.
+
+**It was called Newsletters until 2026-09-17** (issue #212), and the
+qualification below is why the name had to go: nothing in it tests for a
+newsletter. It tests for bulk-mail shape and for a robot sender who writes
+twice a week, which is equally true of a product announcement, a forum digest,
+a status feed and a promo blast. The zone is named for what the reader does
+with the pile, not for a genre it never actually identified.
+
+**Agent-triage update:** Reading now comes from explicit model destination
+membership, including promotions. Clients group those results for presentation;
+they do not infer membership from sender patterns or old reason strings. The
+current feed defaults to unfinished mail from the last 30 days. The bullets below
+describe the historical rule-onboarding design, not the current qualification path.
 
 - **Data:** fetches `tier=noise` updates (`limit 200`) plus `listRules()`,
   filters to the last 7 days client-side (the wire `AttentionUpdate` carries no
@@ -377,7 +391,7 @@ recurring noise pile into the place the product **teaches the rule (Minga) flow*
   `*@domain` (favicon-normalized so mail subdomains collapse to the brand),
   disposition **filtered** preselected, want field autofocused — the Minga first
   choice being "stop showing me these, unless…". The zone's empty state is
-  "No newsletters this week."
+  "No recurring senders this week."
 - **Keyboard:** cards are focusable (`tabIndex`); `Enter` on a focused card opens
   the editor (edit or create), same as a click — folded in without disturbing the
   `sitrep` context's obligation `j/k`.

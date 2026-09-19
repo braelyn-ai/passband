@@ -301,12 +301,12 @@ struct UsageView: View {
             .frame(height: 150)
         } table: {
             DayTable(
-                columns: ["day", "share", "signal", "past due", "deadline", "noise"],
+                columns: ["day", "share", "signal", "past due", "deadline", "noise", "pending"],
                 rows: s.mail.reversed().map { d in
                     [
                         d.key, d.signalShare.map(UsageText.percent) ?? "—",
                         UsageText.count(d.signal), UsageText.count(d.pastDue),
-                        UsageText.count(d.deadline), UsageText.count(d.noise),
+                        UsageText.count(d.deadline), UsageText.count(d.noise), UsageText.count(d.pending),
                     ]
                 },
                 height: 150)
@@ -325,6 +325,7 @@ struct UsageView: View {
         } else {
             rows.append(.init("—", "no triaged mail", nil))
         }
+        if day.pending > 0 { rows.append(.init(UsageText.count(day.pending), "pending triage", nil)) }
         if let rolling = s.rollingShare(at: day.date) {
             rows.append(.init(UsageText.percent(rolling), "7-day share", Palette.ink.opacity(0.75)))
         }

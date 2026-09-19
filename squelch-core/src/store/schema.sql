@@ -897,17 +897,14 @@ CREATE TABLE IF NOT EXISTS events (
     message_id  INTEGER NOT NULL UNIQUE,
     thread_id   TEXT NOT NULL,
     kind        TEXT NOT NULL,         -- urgent | deadline | surfaced | opened
+    is_auth     INTEGER NOT NULL DEFAULT 0 CHECK(is_auth IN (0,1)),
     tier        TEXT NOT NULL,
     importance  INTEGER NOT NULL,
     sender      TEXT NOT NULL,
     one_line    TEXT NOT NULL,
     deadline    TEXT,                  -- RFC3339 snapshot, or NULL
-    -- WHICH AUTH SHAPE this row is about (otp | password_reset | magic_link |
-    -- login_alert | verification), NULL for every ordinary event. It exists so a
-    -- client can ROUTE the tap to the sealed reveal flow instead of a thread
-    -- fetch the human door 404s, and pick an icon. It is NOT A GATE: no query
-    -- reads it to decide what to serve, and none may — the serving rules are
-    -- `triage.sensitivity`, as they have always been.
+    -- Legacy subtype retained for replay compatibility. New events carry is_auth
+    -- independently of external-agent access and always open the exact email.
     sealed_kind TEXT,
     created_at  TEXT NOT NULL
 );
@@ -1051,6 +1048,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_reply
     ON drafts(account_id, reply_to_message_id) WHERE reply_to_message_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_drafts_new
     ON drafts(account_id) WHERE reply_to_message_id IS NULL;
+
+-- FILES STAGED FOR A SEND. The composer uploads each file the moment it is
+-- attached (POST /client/compose/attachments) and the row waits here, bytes
+-- and all, until a send names it by id or a draft claims it. HUMAN-DOOR DATA
+-- like `drafts`: never synced anywhere, never visible on /mcp.
+--
+-- LIFETIME is the draft's, or nothing's. `draft_id` is NULL from upload until
+-- the next draft save claims the row; a send consumes every row it names, a
+-- draft delete takes its rows with it, and an unclaimed row older than a day
+-- (a composer closed before its first autosave, a failed send, a crash) is
+-- swept on the next upload. The bytes are the whole point of the row, so
+-- unlike inbound `attachments` there is no metadata-only state: over the cap
+-- the upload is refused rather than recorded.
+--
+-- `content_id` is the `cid:` token an inline image is referenced by from the
+-- body. Minted client-side (a UUID) so the composer can write the reference
+-- into the markdown before the upload lands; validated, or minted here, when
+-- the client sent none.
+CREATE TABLE IF NOT EXISTS outbound_attachments (
+    id          INTEGER PRIMARY KEY,
+    account_id  INTEGER NOT NULL,
+    draft_id    INTEGER,              -- NULL until a draft save claims it
+    filename    TEXT NOT NULL,
+    mime        TEXT NOT NULL,
+    size_bytes  INTEGER NOT NULL,
+    content_id  TEXT NOT NULL,
+    data        BLOB NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbound_attachments_draft
+    ON outbound_attachments(account_id, draft_id);
 
 -- OUTBOUND READ TRACKING. One `send_trackers` row per tracked send: the minted
 -- token IS the pixel URL's path segment, so it is the only thing a recipient's
@@ -1433,3 +1462,33 @@ CREATE TABLE IF NOT EXISTS agent_thread_preferences (
     updated_at TEXT NOT NULL,
     PRIMARY KEY(account_id,thread_id)
 );
+
+-- Attention may be updated from a different conversation without borrowing that
+-- conversation's message identity, categories, summary, or typed records.
+CREATE TABLE IF NOT EXISTS agent_attention_sources (
+    account_id INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    source_message_id INTEGER NOT NULL,
+    source_revision INTEGER NOT NULL,
+    PRIMARY KEY(account_id,thread_id,source_message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_attention_source_reverse ON agent_attention_sources(account_id,source_message_id);
+CREATE INDEX IF NOT EXISTS idx_agent_decision_source_reverse ON agent_decision_sources(account_id,source_message_id);
+
+-- Repair beta related-thread projections without losing their evidence guard.
+-- Classification belongs to the target; the updating decision is provenance.
+INSERT OR IGNORE INTO agent_attention_sources(account_id,thread_id,source_message_id,source_revision)
+SELECT a.account_id,a.thread_id,d.source_message_id,d.source_revision
+FROM agent_thread_attention a JOIN agent_decision_sources d
+  ON d.account_id=a.account_id AND d.message_id=a.decision_message_id
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id=a.account_id
+                  AND m.id=a.decision_message_id AND m.thread_id=a.thread_id);
+INSERT OR IGNORE INTO agent_attention_sources(account_id,thread_id,source_message_id,source_revision)
+SELECT a.account_id,a.thread_id,a.decision_message_id,COALESCE(s.revision,0)
+FROM agent_thread_attention a
+LEFT JOIN agent_message_state s ON s.account_id=a.account_id AND s.message_id=a.decision_message_id
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id=a.account_id
+                  AND m.id=a.decision_message_id AND m.thread_id=a.thread_id);
+UPDATE agent_thread_attention SET decision_message_id=message_id
+WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.account_id=agent_thread_attention.account_id
+                  AND m.id=agent_thread_attention.decision_message_id AND m.thread_id=agent_thread_attention.thread_id);

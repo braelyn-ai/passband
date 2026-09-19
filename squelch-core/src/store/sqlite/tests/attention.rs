@@ -1672,6 +1672,7 @@ fn mail_activity_buckets_a_day_and_bounds_the_window() {
         rows,
         vec![
             MailActivityDay {
+                pending: 1,
                 day: "2026-08-10".into(),
                 // Everything inbound that is not spam: 3 triaged + 1 sealed
                 // + 1 untriaged. The sent reply is out, not in.
@@ -1686,6 +1687,7 @@ fn mail_activity_buckets_a_day_and_bounds_the_window() {
                 noise: 2,
             },
             MailActivityDay {
+                pending: 0,
                 day: "2026-08-11".into(),
                 received: 1,
                 sent: 0,
@@ -1708,5 +1710,78 @@ fn mail_activity_buckets_a_day_and_bounds_the_window() {
     assert!(
         none.is_empty(),
         "an empty window is an empty list, not zero rows"
+    );
+}
+
+#[test]
+fn activity_and_stats_project_current_agent_decisions_and_keep_pending_separate() {
+    use crate::store::agent_triage::AgentTriageStore;
+    use crate::triage::decision::{EmailKind, MessageDecision};
+    let (store, account) = store();
+    let now = Utc::now();
+    triaged(account, "pending-a", "thread-a")
+        .received_at(now)
+        .ingest(&store);
+    triaged(account, "pending-b", "thread-b")
+        .received_at(now)
+        .ingest(&store);
+    let stats = store
+        .stats(account, now - chrono::Duration::days(30))
+        .unwrap();
+    assert_eq!(stats.tier_counts.get("pending"), Some(&2));
+    assert_eq!(stats.tier_counts.get("noise").copied().unwrap_or(0), 0);
+    let job = store
+        .claim_agent_job(
+            account,
+            "investigation",
+            now + chrono::Duration::minutes(1),
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    let context = store.load_agent_context(&job).unwrap();
+    let mut decision = MessageDecision {
+        kinds: vec![EmailKind::Correspondence],
+        summary: "The agent summary".into(),
+        ..Default::default()
+    };
+    decision.attention.show_in_fye = true;
+    decision.attention.relevant_message_ids = vec![job.message_id];
+    store
+        .commit_agent_decision(
+            &job,
+            &context,
+            &decision,
+            std::slice::from_ref(&context.message.source),
+        )
+        .unwrap();
+    let stats = store
+        .stats(account, now - chrono::Duration::days(30))
+        .unwrap();
+    assert_eq!(stats.tier_counts.get("signal"), Some(&1));
+    assert_eq!(stats.tier_counts.get("pending"), Some(&1));
+    assert_eq!(stats.tier_counts.get("noise").copied().unwrap_or(0), 0);
+    let rows = store
+        .mail_activity(
+            account,
+            now - chrono::Duration::hours(1),
+            now + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    assert_eq!(rows.iter().map(|row| row.pending).sum::<u64>(), 1);
+    assert_eq!(rows.iter().map(|row| row.signal).sum::<u64>(), 1);
+    assert_eq!(rows.iter().map(|row| row.noise).sum::<u64>(), 0);
+    let legacy_tier: String = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT tier FROM triage WHERE message_id=?1",
+            [job.message_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        legacy_tier, "noise",
+        "projection must not need a legacy verdict write"
     );
 }

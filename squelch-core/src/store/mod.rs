@@ -342,15 +342,17 @@ pub struct NewAuditEntry {
 /// [`crate::triage::events`]; every field besides the ids is a denormalized
 /// snapshot of the verdict at emission time.
 ///
-/// Sealed mail produces one only through the KIND-DERIVED path (docs/NOTIFY.md
-/// §11.6): a fixed sentence chosen by `sealed_kind`, the sender address, and
-/// nothing the mail said. `one_line` on such a row is a constant, not a summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The model supplies safe notification text. `is_auth` controls client
+/// presentation independently from external-agent access restrictions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewEvent {
     pub account_id: AccountId,
     pub message_id: i64,
     pub thread_id: String,
     pub kind: EventKind,
+    /// Model assessment, carried explicitly rather than inferred from urgency.
+    #[serde(default)]
+    pub is_auth: bool,
     pub tier: Tier,
     pub importance: u8,
     pub sender: String,
@@ -570,6 +572,10 @@ pub struct Draft {
     pub bcc_addr: String,
     pub subject: String,
     pub body: String,
+    /// The files this draft has claimed, upload order. Metadata only — a
+    /// restore needs names and sizes to draw the tray, and the send re-reads
+    /// the bytes by id.
+    pub attachments: Vec<OutboundAttachmentMeta>,
     /// First save of this draft; an edit keeps it.
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -589,6 +595,30 @@ pub struct DraftFields<'a> {
     pub bcc_addr: &'a str,
     pub subject: &'a str,
     pub body: &'a str,
+}
+
+/// One file staged for a send, WITHOUT its bytes: what a draft listing and an
+/// upload's acknowledgement carry. The bytes are fetched only by the send
+/// itself and by the byte endpoint, through [`OutboundAttachment`].
+///
+/// HUMAN-DOOR ONLY, like [`Draft`]: produced for `/client/compose/attachments`
+/// and `/client/drafts`, and no agent-door read reaches the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachmentMeta {
+    pub id: i64,
+    pub filename: String,
+    pub mime: String,
+    pub size_bytes: i64,
+    /// The `cid:` token a body may reference this file by. Angle brackets are
+    /// NOT part of it; the MIME builder writes them.
+    pub content_id: String,
+}
+
+/// [`OutboundAttachmentMeta`] plus the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundAttachment {
+    pub meta: OutboundAttachmentMeta,
+    pub data: Vec<u8>,
 }
 
 /// One non-confident triage row queued for the Stage-2 LLM pass, with message
@@ -931,10 +961,9 @@ pub struct Stage2UsageDay {
 }
 
 /// One UTC day of the mailbox's own traffic, for the human door's activity
-/// report. `received` is everything that arrived that day, sealed mail
-/// included and spam never; the four tier counts partition the NON-SEALED part
-/// of it, so `received >= sealed + past_due + deadline + signal + noise` always
-/// holds, the slack being mail the triage pipeline has not reached yet.
+/// report. `received` includes auth mail but excludes provider spam. Tier fields
+/// are compatibility projections; `pending` is unclassified mail and `sealed`
+/// is an overlapping actionable-auth count, not a separate classification tier.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailActivityDay {
     /// UTC date key, `YYYY-MM-DD` — the usage ledger's key, so the two series
@@ -947,6 +976,8 @@ pub struct MailActivityDay {
     pub deadline: u64,
     pub signal: u64,
     pub noise: u64,
+    /// Received mail awaiting a current agent classification.
+    pub pending: u64,
 }
 
 /// One call's token counts, as the ledger records them: `input` is the UNCACHED

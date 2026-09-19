@@ -248,6 +248,15 @@ compatibility surface, not the new access authority.
 
 See [TRIAGE-OPERATIONS.md](TRIAGE-OPERATIONS.md) for the current execution contract.
 
+**Staged outbound attachments.** `outbound_attachments` holds composer files until
+a send consumes them or their owning draft is deleted. Unclaimed uploads are
+swept after a day by the next upload. These human-only routes never expose bytes
+on MCP, never audit file contents, and use `no-store`. Byte responses use the same
+content-type whitelist, `nosniff`, and attachment disposition as inbound files.
+The outbound guard scans text and message parts at send time; binary files are
+not scanned. Restricting external-agent access does not delete human drafts or
+their attachments.
+
 ## 4b. Provider spam
 
 **Invariant.** Mail the provider filed as spam is stored and readable on one
@@ -378,9 +387,14 @@ raw fetch found the write credential dead — a 403 telling the user to re-run
 `squelchd auth --write`, never the 502 that would blame Gmail), `failed:target`,
 `rejected:no_recipient`, `rejected:too_large` (the original exceeds
 `MAX_FORWARD_RAW_BYTES` = 20 MiB decoded, refused with a 413 before the four-to-five-x
-re-encode allocates), `failed:fetch_original` (the forwarded original could not be
-read back, so nothing was sent), `rejected:compose`, `failed:gmail`, `ok`,
-`ok:forward`):
+re-encode allocates — or the send's own staged attachments total more than 25 MB),
+`rejected:attachment_missing` (an `attachment_ids` entry names no staged file — swept,
+deleted, or another account's — so the whole send is refused rather than going out
+with fewer files than the tray showed), `rejected:attachment_cid_clash` (two staged
+files carry one `content_id`, so the body's reference would resolve to a coin flip),
+`failed:fetch_original` (the forwarded
+original could not be read back, so nothing was sent), `rejected:compose`,
+`failed:gmail`, `ok`, `ok:forward`):
 
 | `send.echo` detail | meaning |
 | --- | --- |

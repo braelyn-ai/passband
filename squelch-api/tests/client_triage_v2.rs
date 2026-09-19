@@ -295,3 +295,68 @@ async fn correction_deltas_preserve_other_destinations_and_reject_ambiguous_payl
         );
     }
 }
+
+#[tokio::test]
+async fn reading_and_records_support_explicit_history_and_done_filters() {
+    let h = harness(|_, _| {});
+    let recent = h
+        .store
+        .upsert_message(&msg(
+            h.acct,
+            "recent-inventory",
+            "recent-inventory",
+            "Recent",
+            "Body",
+        ))
+        .unwrap();
+    assess(&h.store, h.acct, recent, false);
+    h.store
+        .set_triage(
+            recent,
+            h.acct,
+            0,
+            squelch_core::types::Tier::Noise,
+            squelch_core::types::Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+    h.store
+        .set_attention_status(h.acct, recent, squelch_core::types::AttentionStatus::Done)
+        .unwrap();
+    let mut old = msg(h.acct, "old-inventory", "old-inventory", "Old", "Body");
+    old.received_at = Utc::now() - chrono::Duration::days(40);
+    let id = h.store.upsert_message(&old).unwrap();
+    assess(&h.store, h.acct, id, false);
+    for destination in ["reading", "records"] {
+        for (suffix, count) in [
+            ("", 0),
+            ("&all_time=true", 1),
+            ("&all_time=true&include_done=true", 2),
+            ("&include_done=true", 1),
+        ] {
+            let response = h
+                .app
+                .clone()
+                .oneshot(authed(
+                    "GET",
+                    &format!("/client/v2/feed?destination={destination}{suffix}"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["total_count"], count);
+        }
+    }
+    let response = h
+        .app
+        .oneshot(authed(
+            "GET",
+            "/client/v2/feed?destination=records&all_time=true&since=2020-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

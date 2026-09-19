@@ -172,6 +172,7 @@ impl Harness {
                 sender: SENDER.to_string(),
                 one_line: ONE_LINE.to_string(),
                 deadline: Some("2026-08-01T17:00:00Z".to_string()),
+                is_auth: false,
                 sealed_kind: None,
             })
             .unwrap()
@@ -691,6 +692,7 @@ async fn a_cold_start_joins_at_the_head() {
                     sender: SENDER.to_string(),
                     one_line: ONE_LINE.to_string(),
                     deadline: None,
+                    is_auth: false,
                     sealed_kind: None,
                 })
                 .unwrap()
@@ -772,6 +774,7 @@ async fn the_relay_bearer_is_presented_when_configured() {
             sender: SENDER.to_string(),
             one_line: ONE_LINE.to_string(),
             deadline: None,
+            is_auth: false,
             sealed_kind: None,
         })
         .unwrap()
@@ -821,6 +824,7 @@ async fn an_opened_queued_arrival_is_skipped_before_relay_dispatch() {
                 sender: SENDER.into(),
                 one_line: "Login alert".into(),
                 deadline: None,
+                is_auth: false,
                 sealed_kind: None,
             })
             .unwrap()

@@ -8,10 +8,8 @@ use super::*;
 /// `kind`/`tier` falls back to the least-alarming value rather than erroring:
 /// refusing to serve a stored row would stall a client's cursor at it forever.
 ///
-/// `sealed_kind` follows the same rule for the same reason, and lands on the
-/// same side: an unrecognized kind reads as `None`, i.e. an ordinary event. That
-/// costs a tap the reveal route and never the other way round, which is the
-/// direction that cannot leak.
+/// Legacy `sealed_kind` remains optional; new clients use the explicit `is_auth`
+/// snapshot for presentation and open the human message reader for every event.
 fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         id: r.get(0)?,
@@ -27,6 +25,7 @@ fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             .get::<_, Option<String>>(9)?
             .and_then(|s| SealedKind::parse(&s)),
         created_at: dt(r, 10)?,
+        is_auth: r.get(11)?,
     })
 }
 
@@ -54,8 +53,8 @@ impl SqliteStore {
             // cannot create a delayed interruption, even for auth.
             let n = conn.execute(
                 "INSERT OR IGNORE INTO events(account_id, message_id, thread_id, kind, tier,
-                     importance, sender, one_line, deadline, sealed_kind, created_at)
-                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11
+                     importance, sender, one_line, deadline, sealed_kind, created_at, is_auth)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12
                  FROM messages m LEFT JOIN triage t ON t.message_id=m.id AND t.account_id=m.account_id
                  WHERE m.account_id=?1 AND m.id=?2
                    AND (?4='opened' OR (m.is_sent=0 AND m.is_spam=0
@@ -73,6 +72,7 @@ impl SqliteStore {
                     ev.deadline,
                     ev.sealed_kind.map(|k| k.as_str()),
                     Utc::now().to_rfc3339(),
+                    ev.is_auth,
                 ],
             )?;
             if n == 0 {
@@ -131,7 +131,7 @@ impl SqliteStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
-                    deadline, sealed_kind, created_at
+                    deadline, sealed_kind, created_at, is_auth
              FROM events
              WHERE account_id = ?1 AND id > ?2
              ORDER BY id ASC
@@ -148,7 +148,7 @@ impl SqliteStore {
         let row = conn
             .query_row(
                 "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
-                        deadline, sealed_kind, created_at
+                        deadline, sealed_kind, created_at, is_auth
                  FROM events
                  WHERE account_id = ?1 AND id = ?2",
                 params![account_id, id],

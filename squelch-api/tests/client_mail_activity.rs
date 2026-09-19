@@ -147,6 +147,7 @@ async fn buckets_each_day_and_keeps_spam_and_sent_out_of_the_tiers() {
             "deadline": 0,
             "signal": 1,
             "noise": 2,
+            "pending": 0,
         })
     );
     assert_eq!(rows[1]["day"], day_key(0));

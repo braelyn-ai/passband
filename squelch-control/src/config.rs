@@ -56,7 +56,7 @@ pub const MAX_TRUSTED_PROXY_HOPS: usize = 8;
 pub const MIN_COOKIE_KEY_BYTES: usize = 32;
 
 /// Budget for the outbound calls that are one small round trip: the token
-/// exchange, the profile lookup, and every warden request EXCEPT reconcile.
+/// exchange, the profile lookup, and warden requests without a rollout override.
 /// An unbounded one would pin a request task for as long as the far end cared
 /// to hold it.
 ///
@@ -65,9 +65,17 @@ pub const MIN_COOKIE_KEY_BYTES: usize = 32;
 /// see [`RECONCILE_TIMEOUT`] for what happened the day it did not.
 pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Budget for `PUT /v1/tenants/{label}/credentials/replace`: a reconnect
+/// replaces a running pod and waits for its rollout and then its readiness,
+/// which is the same two `ready_timeout` waits a reconcile's recreate makes.
+/// So it is [`RECONCILE_TIMEOUT`], by definition rather than by coincidence:
+/// the reasoning there, including the hand-maintained invariant against the
+/// warden's `SQUELCH_WARDEN_READY_TIMEOUT_SECS`, is this constant's too.
+pub const RECONNECT_TIMEOUT: Duration = RECONCILE_TIMEOUT;
+
 /// Budget for `POST /v1/tenants/{label}/reconcile` alone, applied per request
 /// on top of [`OUTBOUND_TIMEOUT`]'s client. `drift` is a read and stays on the
-/// short one; this is the only call that writes to a cluster and waits.
+/// short one; reconnect has its own rollout budget above.
 ///
 /// WHAT IT HAS TO OUTLAST. A reconcile against a Deployment another field
 /// manager owns fields on cannot converge in place, because server-side apply

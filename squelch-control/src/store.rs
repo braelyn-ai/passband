@@ -34,6 +34,17 @@
 //! the ROW ID and a count, never an address and never the code that was mailed
 //! to one.
 //!
+//! THE OTHER EXCEPTION IS `reconnect_jobs`, which holds CIPHERTEXT - and only
+//! ciphertext, and only for a while. A reconnect seals the new refresh token to
+//! the tenant's own pod key before anything is stored, so what sits in this
+//! row is age armor that nothing on Railway can open; it is there so that a
+//! rollout the browser did not wait for, or a control process that restarted
+//! mid-call, can be finished from the row rather than by asking Google again.
+//! Every terminal outcome NULLs it, and the worker's attempt cap
+//! ([`crate::reconnect::MAX_ATTEMPTS`]) is what makes "for a while" a bound
+//! rather than a hope. The statement above still holds as written: there is
+//! nothing at rest here that opens a mailbox.
+//!
 //! `analytics_id` IS OPAQUE, AND STAYS THAT WAY BY NOT BEING PUT NEXT TO AN
 //! ADDRESS. It is the distinct_id PostHog knows a person by, which is the whole
 //! reason PostHog is never told an address at all. Beside a row id or a label it
@@ -118,7 +129,34 @@ const FIRST_PAIR_WINDOW_DAYS: i64 = 90;
 /// spellings of the same instant would then order wrongly and a live code would
 /// read as expired. `COLLATE "C"` is memcmp, which is the promise the format
 /// was designed against.
+///
+/// THE EXCEPTION IS THE TWO `reconnect_*` TABLES, whose stamps are `TIMESTAMPTZ`.
+/// Nothing in this crate ever binds a [`stamp`] against them: every comparison
+/// they take part in is written in SQL against `now()`, and their intervals
+/// (a lease, a backoff, a day) are SQL arithmetic too, so the string-ordering
+/// hazard above has nothing to bite. Keep it that way. A query that passes a
+/// [`stamp`] to one of these columns compares TEXT to TIMESTAMPTZ and will not
+/// prepare, which is at least loud.
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS reconnect_jobs (
+    id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    account_email TEXT NOT NULL,
+    ciphertext TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'complete', 'refused', 'gave_up')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_until TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS reconnect_pending_label
+    ON reconnect_jobs(label) WHERE status = 'pending';
+CREATE TABLE IF NOT EXISTS reconnect_views (
+    token_hash TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES reconnect_jobs(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT now() + interval '1 day'
+);
 CREATE TABLE IF NOT EXISTS tenants (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     label         TEXT NOT NULL,

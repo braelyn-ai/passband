@@ -93,6 +93,7 @@ pub fn notification_event(
         message_id: ctx.message_id,
         thread_id: ctx.thread_id.to_string(),
         kind,
+        is_auth,
         tier: Tier::Signal,
         importance: ctx.importance,
         sender: ctx.sender.to_string(),

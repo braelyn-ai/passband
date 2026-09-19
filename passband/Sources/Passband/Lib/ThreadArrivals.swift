@@ -84,3 +84,9 @@ enum MessageReadVisibility {
         return viewportHeight > 0 && minY <= focus && maxY > focus
     }
 }
+
+enum ThreadOpeningFocus {
+    static func index(messageIds: [Int], requested: Int?) -> Int {
+        requested.flatMap { messageIds.firstIndex(of: $0) } ?? max(0, messageIds.count - 1)
+    }
+}

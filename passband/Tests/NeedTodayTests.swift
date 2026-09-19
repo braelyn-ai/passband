@@ -72,6 +72,18 @@ struct NeedTodayTests {
         let decodedInventory = try JSONDecoder().decode(AttentionUpdate.self, from: JSONEncoder().encode(inventory))
         precondition(decodedInventory.displayDeadline == "2026-09-30", "Inventory date-only field survives decoding")
         precondition(Fmt.deadlineChip(decodedInventory.displayDeadline, now: lateDueDay, calendar: local)?.overdue == false)
-        print("ok: 23 agent feed, record, and capability checks passed")
+        precondition(ProcessQueue.pending(snapshot: rows, live: rows, handled: []).map(\.id) == [9, 2])
+        var changed = rows[1]
+        changed.one_line = "Updated obligation"
+        let queue = ProcessQueue.pending(snapshot: rows, live: [changed, rows[0]], handled: [9])
+        precondition(queue.count == 1 && queue[0].one_line == "Updated obligation")
+        changed.status = .done
+        precondition(ProcessQueue.pending(snapshot: rows, live: [changed], handled: []).isEmpty)
+        let bill = try JSONDecoder().decode(AgentRecordProposal.self, from: Data("""
+        {"kind":"bill","merchant":"Utility","amount":124.50,"currency":"USD","due":{"value":"2026-09-30"},"autopay":true}
+        """.utf8))
+        precondition(bill.amount == 124.50 && bill.currency == "USD" && bill.autopay == true)
+        precondition(bill.due?.value == "2026-09-30")
+        print("ok: 28 agent feed, process, record, and capability checks passed")
     }
 }

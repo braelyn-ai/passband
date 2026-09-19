@@ -1,4 +1,4 @@
-// Newsletter-thumb fill colour: sample the hero's pixels and reduce them to the
+// Reading-card thumb fill colour: sample the hero's pixels and reduce them to the
 // ONE colour the rest of the square is painted.
 //
 // Every failure path returns nil and the card keeps its neutral well; nothing

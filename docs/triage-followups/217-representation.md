@@ -6,8 +6,8 @@ bill classification, summary and records on the displayed card even though B's
 stored message decision had not changed.
 
 The FYE projection now reads classification from its representative message and
-returns the update's source separately as provenance. Both remain checked at the
-external access boundary. A cross-thread update preserves an existing valid
+keeps the update's evidence in `agent_attention_sources`, independently of the
+classification pointer. Both remain checked at the external access boundary. A cross-thread update preserves an existing valid
 target representative. If a thread contains only sent or spam messages, attention
 keeps a same-thread anchor and the inbound views filter it out; the related update
 does not abort the source message's commit. A missing target has no projection to
@@ -31,3 +31,9 @@ This is a prerequisite for the dedicated thread-refresh executor in #217. It doe
 not introduce that executor, debounce generations, dependent-source refresh,
 rule-save policy changes, or reply-chain cost measurements. Those acceptance
 items remain open. No semantic reply-means-done rule is introduced.
+
+The integration keeps #220's source revisions, dependency invalidation and
+transitive refresh behavior. The correction regressions compare the entire
+attention projection and its source graph before and after each toggle. Context
+regressions retained from #223 additionally cover Unicode sibling allocation and
+an exact limited initial-source selection; the current base owns their implementation.

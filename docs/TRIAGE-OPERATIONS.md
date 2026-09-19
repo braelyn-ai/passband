@@ -36,8 +36,21 @@ revisions. User done/snooze/corrections and completed actions remain authoritati
 Corrections survive content revision changes; thread-level FYE choices apply to
 every sibling. External read guards independently honor human restrictions even
 if an older assessment was incorrectly marked allowed.
-Sender rules are supplied as preferences and may be overridden with an evidenced
+Only matching sender rules are supplied as preferences and may be overridden with an evidenced
 exception. Memory has a read-only context interface; no memory editor ships.
+
+## Client projections
+
+Process and the TUI use the server's FYE ordering. Reading and Records default to
+unfinished items from the last 30 days. Their API routes accept `since` or
+`all_time=true`, plus `include_done=true`; `since` and `all_time` are mutually
+exclusive. MCP record tools request all time where their contract needs older facts.
+Usage counts pending triage separately, without writing semantic results back into
+legacy tier columns. Bill records expose amount, due date, and autopay.
+
+Authentication events persist `is_auth` independently of access restrictions, so
+foreground clients can present login alerts as well as actionable auth. Relay
+payloads still carry only the event ID; the authenticated client fetches content.
 
 ## Configuration
 

@@ -387,6 +387,58 @@ fn reingest_never_deletes_a_human_draft() {
 }
 
 #[test]
+fn access_restrictions_preserve_human_drafts_and_their_staged_files() {
+    use crate::store::agent_triage::AgentTriageStore;
+    // External access restrictions must not delete explicit human work.
+    let (store, acct) = store();
+    let normal = triaged(acct, "g1", "t1");
+    let parent = normal.ingest(&store);
+    let d = store
+        .upsert_draft(acct, Some(parent), DraftFields::default(), t(0))
+        .unwrap();
+    let file = store
+        .stage_outbound_attachment(acct, "a.pdf", "application/pdf", "cid-a", b"A", t(0))
+        .unwrap();
+    store
+        .claim_outbound_attachments(acct, d.id, &[file.id], t(0))
+        .unwrap();
+    normal.clone().sealed(SealedKind::Otp).ingest(&store);
+    assert!(
+        store.outbound_attachment(acct, file.id).unwrap().is_some(),
+        "re-ingest preserves the draft attachment"
+    );
+
+    // The hand-correction path, on a second message.
+    let other = triaged(acct, "g2", "t2").ingest(&store);
+    let d2 = store
+        .upsert_draft(acct, Some(other), DraftFields::default(), t(1))
+        .unwrap();
+    let file2 = store
+        .stage_outbound_attachment(acct, "b.pdf", "application/pdf", "cid-b", b"B", t(1))
+        .unwrap();
+    store
+        .claim_outbound_attachments(acct, d2.id, &[file2.id], t(1))
+        .unwrap();
+    store
+        .correct_agent_triage(
+            acct,
+            other,
+            "external_access",
+            &serde_json::json!(true),
+            t(2),
+        )
+        .unwrap();
+    assert_eq!(store.list_drafts(acct).unwrap().len(), 2);
+    assert!(
+        store.outbound_attachment(acct, file2.id).unwrap().is_some(),
+        "restricting external agents preserves the human attachment"
+    );
+    assert!(store.delete_draft(acct, d2.id).unwrap());
+    assert!(store.outbound_attachment(acct, file2.id).unwrap().is_none());
+    assert!(store.outbound_attachment(acct, file.id).unwrap().is_some());
+}
+
+#[test]
 fn account_email_reads_the_row_and_404s_unknown() {
     let (store, acct) = store();
     assert_eq!(store.account_email(acct).unwrap(), "me@example.com");

@@ -68,6 +68,7 @@ fn event_for(store: &SqliteStore, account_id: i64, label: i64) -> NewEvent {
         sender: "alice@example.com".to_string(),
         one_line: format!("line {label}"),
         deadline: None,
+        is_auth: false,
         sealed_kind: None,
     }
 }
@@ -528,4 +529,27 @@ async fn replay_skips_an_event_opened_before_dispatch_and_keeps_advancing() {
     let mut reader = open(&h, "/client/events?after=0").await;
     assert_eq!(reader.next().await.json()["id"], fresh);
     reader.expect_quiet().await;
+}
+
+#[tokio::test]
+async fn auth_flag_survives_event_fetch_and_stream_replay() {
+    let h = harness(|_, _| {});
+    let mut auth = event_for(&h.store, h.acct, 990);
+    auth.is_auth = true;
+    auth.sealed_kind = None;
+    let id = h.store.append_event(&auth).unwrap().unwrap();
+    let response = h
+        .app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/events/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["is_auth"], true);
+    let mut stream = open(&h, "/client/events?after=0").await;
+    let frame = stream.next().await;
+    assert_eq!(frame.json()["is_auth"], true);
+    assert_eq!(frame.json()["message_id"], auth.message_id);
 }

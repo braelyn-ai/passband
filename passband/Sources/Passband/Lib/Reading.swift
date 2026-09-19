@@ -3,13 +3,13 @@
 
 import Foundation
 
-/// A newsletter card: one recurring noise sender for the window.
-struct Newsletter: Identifiable, Hashable, Sendable {
+/// A Reading card groups agent-selected messages from one sender.
+struct ReadingSender: Identifiable, Hashable, Sendable {
     /// Grouping key = bare lowercased address.
     var address: String
     /// A representative raw sender string (for avatar + display name).
     var sender: String
-    /// Count of qualifying noise messages in the window.
+    /// Count of selected messages in the window.
     var count: Int
     /// Latest one_line in the window (the summary line).
     var summary: String
@@ -26,7 +26,7 @@ struct Newsletter: Identifiable, Hashable, Sendable {
     var id: String { address }
 }
 
-enum Newsletters {
+enum Reading {
     /// The adapter carries the server's real received timestamp here.
     private static func dateOf(_ update: AttentionUpdate) -> Double {
         Fmt.date(update.surfaced_at)?.timeIntervalSince1970 ?? 0
@@ -70,15 +70,15 @@ enum Newsletters {
     /// presentation only: no sender shape, category, score or repetition test.
     static func derive(
         updates: [AttentionUpdate], rules: [SenderRule], limit: Int = 24
-    ) -> [Newsletter] {
+    ) -> [ReadingSender] {
         let groups = Dictionary(grouping: updates) { SenderID.address($0.sender) }
-        return groups.compactMap { address, messages -> Newsletter? in
+        return groups.compactMap { address, messages -> ReadingSender? in
             let ordered = messages.sorted {
                 let lhs = dateOf($0), rhs = dateOf($1)
                 return lhs == rhs ? $0.id > $1.id : lhs > rhs
             }
             guard let latest = ordered.first else { return nil }
-            return Newsletter(
+            return ReadingSender(
                 address: address, sender: latest.senderString, count: ordered.count,
                 summary: latest.one_line, latest: dateOf(latest),
                 latestThreadId: latest.thread_id, items: ordered,
@@ -99,9 +99,9 @@ enum Newsletters {
     /// in which marking mail done looked like it had not worked. `resolvedIds`
     /// is already the app's record of "resolved, poll has not caught up", and
     /// undo clears it, so a restored message brings its card straight back.
-    static func prune(_ newsletters: [Newsletter], resolved: Set<Int>) -> [Newsletter] {
-        guard !resolved.isEmpty else { return newsletters }
-        return newsletters.compactMap { nl in
+    static func prune(_ senders: [ReadingSender], resolved: Set<Int>) -> [ReadingSender] {
+        guard !resolved.isEmpty else { return senders }
+        return senders.compactMap { nl in
             let live = nl.items.filter { !resolved.contains($0.id) }
             if live.count == nl.items.count { return nl }
             // Nothing left in the window: the card goes, rather than sitting

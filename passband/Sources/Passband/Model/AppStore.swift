@@ -180,8 +180,9 @@ struct SitrepZoneCache: Sendable {
     var shipments: [Shipment] = []
     var banking: [BankingRecord] = []
     var receipts: [Receipt] = []
-    var newsletters: [Newsletter] = []
+    var reading: [ReadingSender] = []
     var records: [AttentionUpdate] = []
+    var recordFacts: [Int: [AgentRecordProposal]] = [:]
     /// When the last full refresh COMPLETED. nil = never loaded.
     var loadedAt: Date?
 }
@@ -450,6 +451,20 @@ struct ComposeState: Sendable, Equatable {
     /// actually goes out is the original as Gmail holds it, pixels and all.
     /// Nothing else drifts — same message, same id, same files.
     var forwardedMessage: ClientMessage?
+    /// THE TRAY: every file attached to this composition, in the order it was
+    /// attached. Uploaded the moment it is dropped (see `ComposeAttach`), so
+    /// an entry may still be waiting on its daemon id. Which of these go
+    /// INLINE is not recorded here — the body says, by carrying the file's
+    /// `cid:` marker or not (see `ComposeMarkers`).
+    var attachments: [ComposeAttachment] = []
+
+    /// The daemon ids of every file that has finished staging: what a draft
+    /// save and a send name.
+    var stagedAttachmentIds: [Int] { attachments.compactMap(\.id) }
+
+    /// Whether any file is still on its way up. A send must wait for it — the
+    /// tray is the promise of what the mail carries.
+    var uploadsPending: Bool { attachments.contains { $0.uploading } }
 
     /// The three recipient headers as one editable value. The strings stay the
     /// stored form — they are what goes on the wire, verbatim — and this is the
@@ -516,16 +531,14 @@ struct RuleEditorRequest: Identifiable, Sendable {
     let id = UUID()
     var sender: String?
     var rule: SenderRule?
-    /// Preselect a disposition (the newsletters CTA preselects "filtered").
+    /// Preselect a disposition (the reading zone's CTA preselects "filtered").
     var disposition: Disposition?
     var want: String?
     /// Explicit match_pattern override; wins over deriving from `sender`.
     var pattern: String?
-    /// TAKES THE SAVE OVER. Set, the editor hands it the body it built and
-    /// stops there: no POST, no analytics, no rule. The onboarding tour is the
-    /// only caller — its rule is a demonstration, and a real write would both
-    /// invent a rule nobody asked for and 403 on a read-only daemon.
-    var intercept: (@MainActor @Sendable (CreateRuleBody) -> Void)?
+    /// The actual persisted result and submitted body, for consumers that need
+    /// to distinguish the saved behavior from the editor's initial suggestion.
+    var onResult: (@MainActor @Sendable (CreatedRule, CreateRuleBody) -> Void)?
     /// Called after a successful save so the opener re-fetches its list.
     var onSaved: (@MainActor @Sendable () -> Void)?
 }
@@ -802,6 +815,13 @@ final class AppStore {
             if !switching { Notifier.shared.drainPendingTap() }
         }
     }
+    private(set) var practiceTransitioning = false
+
+    /// Also enforced by account mutation entry points, not only menu items.
+    var accountActionsBlocked: Bool {
+        RehearsalMode.isEnabled || practiceTransitioning || tour.veil != nil
+    }
+    private static let practiceAccountError = "Finish the practice inbox before changing accounts."
 
     /// Whether `e` is still the live epoch — the post-await check every
     /// account-scoped writer outside this file makes.
@@ -811,7 +831,168 @@ final class AppStore {
 
     // MARK: - settings
 
+    // MARK: - practice inbox
+
+    /// Re-enter the real connection gate for a tester without deleting any
+    /// account, preference, or keychain entry.
+    func resetForConnectionRehearsal() async {
+        guard RehearsalMode.includesConnection else { return }
+        while switching { try? await Task.sleep(for: .milliseconds(25)) }
+        switching = true
+        practiceTransitioning = true
+        defer { switching = false; practiceTransitioning = false }
+        connStatus = .loading
+        epoch &+= 1
+        SitrepPoller.shared.stop()
+        AccountManager.shared.stopAllFeeds()
+        DraftSaver.shared.flush(.compose, compose)
+        DraftSaver.shared.flush(.inlineReply, inlineReply)
+        await DraftSaver.shared.settle()
+        epoch &+= 1
+        SitrepPoller.shared.stop()
+        RehearsalMode.setEnabled(false)
+        assistant.clear()
+        wipeAccountState()
+        wipeAccountCaches()
+        closeOverlaysForPractice()
+        await APIClient.shared.deconfigure()
+        settings = nil
+        connError = nil
+        connStatus = .disconnected
+    }
+
+    /// Put the practice inbox on screen IN PLACE: the same shell, fixture mail
+    /// behind the same transport. Shaped like `switchAccount` because it is
+    /// one — the account arriving just happens to be fictional — and every
+    /// answer still in flight for the live mailbox has to be disowned before
+    /// a fixture row can be allowed anywhere near the read model.
+    ///
+    /// Calling it while already practicing starts the fixtures over (Start
+    /// fresh). Preferences and credentials are not touched: the person
+    /// practicing is the person who will read the live inbox a minute later.
+    func enterPractice() async {
+        // Share the account mutation gate: a probe/keychain write already in
+        // progress must finish before the fixture transport can take over.
+        while switching {
+            if Task.isCancelled { return }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard !Task.isCancelled else { return }
+        switching = true
+        practiceTransitioning = true
+        defer { switching = false; practiceTransitioning = false }
+        // The live mailbox's own address, so the greeting keeps seeding from
+        // the real account rather than from the fixture's. On a first run the
+        // live poller has never pulled (practice claims the connection before
+        // it starts), so the stats are asked for once, here, while the client
+        // still points at the real daemon. Read BEFORE the wipe either way.
+        var accountEmail = RehearsalMode.isEnabled ? nil : sitrep.stats?.account_email
+        if accountEmail == nil, !RehearsalMode.isEnabled, connStatus == .connected {
+            accountEmail = (try? await APIClient.shared.getStats())?.account_email
+        }
+        guard !Task.isCancelled else { return }
+        let previousStatus = connStatus
+        epoch &+= 1
+        SitrepPoller.shared.stop()
+        // The feeds too, unlike a switch: a banner for real mail landing mid-
+        // lesson would point at a thread the practice board cannot open.
+        AccountManager.shared.stopAllFeeds()
+        connStatus = .loading
+        DraftSaver.shared.flush(.compose, compose)
+        DraftSaver.shared.flush(.inlineReply, inlineReply)
+        await DraftSaver.shared.settle()
+        // A cancel that landed during settlement: nothing has been swapped
+        // yet, so put the live board back the way a switch's restart does
+        // rather than leave a fixture world nobody asked for.
+        if Task.isCancelled {
+            connStatus = previousStatus
+            if previousStatus == .connected {
+                SitrepPoller.shared.start()
+                if !RehearsalMode.isEnabled { AccountManager.shared.startAllFeeds() }
+            }
+            return
+        }
+        // Work queued during draft settlement belongs to the departing world
+        // too. Fence again at the synchronous transport/read-model swap.
+        epoch &+= 1
+        SitrepPoller.shared.stop()
+        assistant.clear()
+        wipeAccountState()
+        wipeAccountCaches()
+        closeOverlaysForPractice()
+        RehearsalMode.setEnabled(true)
+        await RehearsalAPI.shared.reset(accountEmail: accountEmail)
+        settings = ConnectionSettings(serverURL: "https://rehearsal.invalid", apiToken: "practice")
+        connError = nil
+        connStatus = .connected
+    }
+
+    /// Fill the practice board before the guide points at it: bands, zones,
+    /// the calendar bodies the reader lesson opens, and the inbox page the
+    /// examples resolve through. Starts the poller, which a live-to-practice
+    /// entry otherwise never would (`connStatus` never moved).
+    func warmPractice() async {
+        guard RehearsalMode.isEnabled else { return }
+        let e = epoch
+        SitrepPoller.shared.start()
+        await SitrepPoller.shared.pull()
+        guard isCurrent(e) else { return }
+        await refreshZones(force: true)
+        guard isCurrent(e) else { return }
+        for threadID in zones.calendar.compactMap(\.thread_id) {
+            ThreadPrefetch.shared.prefetch(threadID, fresh: 15 * 60)
+        }
+        await refreshMail(.inbox, force: true)
+    }
+
+    /// Put the live account back. The fixture world is wiped under a bumped
+    /// epoch first, then the ordinary boot path re-reads the index and the
+    /// keychain — dropping to `.loading` on the way is what remounts the
+    /// shell clean and fires the `.connected` transition that starts the
+    /// poller and the feeds again.
+    func exitPractice() async {
+        while switching { try? await Task.sleep(for: .milliseconds(25)) }
+        guard RehearsalMode.isEnabled else { return }
+        switching = true
+        practiceTransitioning = true
+        defer { switching = false; practiceTransitioning = false }
+        connStatus = .loading
+        epoch &+= 1
+        SitrepPoller.shared.stop()
+        RehearsalMode.setEnabled(false)
+        assistant.clear()
+        wipeAccountState()
+        wipeAccountCaches()
+        closeOverlaysForPractice()
+        await APIClient.shared.deconfigure()
+        settings = nil
+        await loadSettings()
+        // By hand as well as by transition. The `.loading` frame above is what
+        // normally fires RootView's `.connected` observer, but a keychain read
+        // that returns before SwiftUI has rendered that frame collapses the
+        // two writes into `.connected → .connected` and nothing restarts —
+        // the summary would then wait for a first update that never comes.
+        // Both starts are idempotent, so the belt costs nothing when the
+        // braces held.
+        if connStatus == .connected {
+            SitrepPoller.shared.start()
+            AccountManager.shared.startAllFeeds()
+        }
+    }
+
+    private func closeOverlaysForPractice() {
+        toasts = []
+        processModeOpen = false
+        askBarOpen = false
+        shortcutsOpen = false
+        addAccountSheetOpen = false
+        shareSheetOpen = false
+        ruleEditor = nil
+        remindTarget = nil
+    }
+
     func loadSettings() async {
+        guard !RehearsalMode.isEnabled else { return }
         // The index says WHICH account's credentials to read, and repairs a
         // pre-multi-account install on the way through. Off the main actor for
         // the same reason the load below is.
@@ -820,6 +1001,7 @@ final class AppStore {
         // have been built — and read a pre-repair index — during boot.
         AccountManager.shared.adopt(index)
         guard let active = index.active else {
+            connError = nil
             connStatus = .disconnected
             return
         }
@@ -835,10 +1017,11 @@ final class AppStore {
 
             } else {
                 connStatus = .disconnected
+                connError = "Your saved mailbox connection is incomplete. Reconnect to open your inbox."
             }
         case .failure:
             connStatus = .disconnected
-            connError = "settings load failed"
+            connError = "Passband couldn’t unlock your saved mailbox connection. Try again or reconnect."
         }
     }
 
@@ -860,6 +1043,12 @@ final class AppStore {
             // next. Dropped instead; a link at the gate still fills the form.
             guard connStatus != .connected else { return }
         #endif
+        // DROPPED, not parked, while the practice inbox is up: a link held
+        // through a lesson would be applied the moment the live account came
+        // back — the Add Account sheet over the summary card — and by then
+        // its code is a stale claim from a browser tab the person has
+        // forgotten. Pairing from a link is a click away again afterwards.
+        guard !accountActionsBlocked else { return }
         pairLink = link
         if connStatus == .connected { addAccountSheetOpen = true }
     }
@@ -917,6 +1106,9 @@ final class AppStore {
     /// erase a label the account already had.
     @discardableResult
     func connect(serverURL: String, apiToken: String, label: String = "") async -> Bool {
+        guard !accountActionsBlocked, !switching else { return false }
+        switching = true
+        defer { switching = false }
         capabilityRecoveryTask?.cancel()
         capabilityRecoveryTask = nil
         connStatus = .connecting
@@ -1000,6 +1192,10 @@ final class AppStore {
     /// swap the live client — WITHOUT dropping connStatus out of "connected" on
     /// failure, so Settings stays mounted instead of bouncing to the Connect gate.
     func revalidate(serverURL: String, apiToken: String) async -> (ok: Bool, error: String?) {
+        guard !accountActionsBlocked else { return (false, Self.practiceAccountError) }
+        guard !switching else { return (false, "An account change is already in progress.") }
+        switching = true
+        defer { switching = false }
         let prev = settings
         do {
             try await APIClient.shared.probe(baseURL: serverURL, token: apiToken)
@@ -1082,6 +1278,10 @@ final class AppStore {
     func addAccount(serverURL: String, apiToken: String, label: String = "") async -> (
         ok: Bool, error: String?
     ) {
+        guard !accountActionsBlocked else { return (false, Self.practiceAccountError) }
+        guard !switching else { return (false, "An account change is already in progress.") }
+        switching = true
+        defer { switching = false }
         // ONE DAEMON IS ONE MAILBOX, so the same daemon twice is not two
         // accounts — it is every banner delivered twice and one mailbox's state
         // split across two records.
@@ -1103,18 +1303,8 @@ final class AppStore {
             return (false, "could not save to the keychain")
         }
         Analytics.capture("account_added")
-        // Adding an account is asking to use it. Through the ordinary switch,
-        // which flushes drafts, wipes every per-account cache and bumps the
-        // epoch — the new account is a whole new daemon, and none of the ids on
-        // screen mean anything there. Waited for AND held: a spin alone leaves
-        // a gap where a switch starting between the loop and the call makes
-        // `switchTo`'s guard silently decline, and "added but never shown"
-        // would read as a failed add. Loop and flag are both MainActor, so the
-        // handoff has no gap; `performSwitch` directly, because `switchTo`
-        // would bounce off the very gate held here.
-        while switching { try? await Task.sleep(for: .milliseconds(50)) }
-        switching = true
-        defer { switching = false }
+        // Hold the same gate from the credential probe through persistence
+        // and switching, so practice cannot intercept any part of the add.
         // The switch can fail its credential read-back (a denied access panel
         // on the slots just written). The account exists either way — saying
         // `ok` while the old mailbox stays on screen would read as a failed
@@ -1139,6 +1329,7 @@ final class AppStore {
     /// that was the last account. What is left for here is the world on screen,
     /// and only when it belonged to the account that just went.
     func removeAccount(_ id: UUID) async {
+        guard !accountActionsBlocked else { return }
         // Wait out any in-flight switch, then hold its gate for the duration:
         // a remove landing inside a switch's suspension windows would leave
         // the index, the configured client and the per-account-keyed stores
@@ -1146,6 +1337,7 @@ final class AppStore {
         // only meaningful once whoever was switching has finished doing so.
         // Both loop and flag are MainActor, so the handoff has no gap.
         while switching { try? await Task.sleep(for: .milliseconds(50)) }
+        guard !accountActionsBlocked else { return }
         switching = true
         defer { switching = false }
 
@@ -1203,7 +1395,7 @@ final class AppStore {
     func switchAccount(to record: AccountRecord) async {
         // (1) Never two at once — the two awaits below are both windows a
         //     second switch could start in.
-        guard !switching else { return }
+        guard !accountActionsBlocked, !switching else { return }
         switching = true
         // (10) Whichever path we leave by.
         defer { switching = false }
@@ -1420,6 +1612,7 @@ final class AppStore {
         ThreadPrefetch.shared.wipe()
         HeroCache.shared.wipe()
         AttachmentThumbs.shared.wipe()
+        ComposeAttach.wipe()
         // The staged preview files, for the same reason and with more teeth: a
         // survivor here is another account's attachment served from this
         // account's id, straight into a preview.
@@ -1463,6 +1656,7 @@ final class AppStore {
     }
 
     func setView(_ view: MainView, viaPointer: Bool = false) {
+        guard !RehearsalMode.isEnabled || view == .sitrep else { return }
         // Navigating ANYWHERE dismisses an open thread viewer: the rail is visible
         // beside it, so a click there means "leave this email", not "change the
         // page underneath the overlay". Through closeThread() so the reader's
@@ -1685,7 +1879,10 @@ final class AppStore {
         guard verdict.refetch else { return }
         openThreadRefreshToken &+= 1
         guard verdict.announce else { return }
-        let name = SenderID.displayName(sender)
+        // The banner's rule, not the row's: this toast fires in exactly the
+        // case the system banner is suppressed (app frontmost, thread open),
+        // and the same arrival must not be announced under two names.
+        let name = SenderID.readableName(sender)
         pushToast(name.isEmpty ? "new message in this thread" : "new message from \(name)")
     }
 
@@ -1703,7 +1900,7 @@ final class AppStore {
         askBarOpen || shortcutsOpen || processModeOpen
             || triageFix != nil || remindTarget != nil || ruleEditor != nil
             || groupEditor != nil
-            || !authQueue.isEmpty || retriage != nil
+            || !authQueue.isEmpty || retriage != nil || retriageAsk != nil
             || tour.wantsBlur || whatsNew.active
     }
 
@@ -1746,7 +1943,7 @@ final class AppStore {
     /// nil rows = that endpoint failed and its zone keeps what it had.
     private enum ZoneAnswer: Sendable {
         case shipments([Shipment]?)
-        case newsletters([Newsletter]?)
+        case reading([ReadingSender]?)
         case records(AgentFeed?)
     }
 
@@ -1764,7 +1961,7 @@ final class AppStore {
             group.addTask {
                 .shipments(try? await APIClient.shared.getShipments(includeDelivered: true))
             }
-            group.addTask { .newsletters(await NewsletterFeed.load()) }
+            group.addTask { .reading(await ReadingFeed.load()) }
             group.addTask {
                 .records(try? await APIClient.shared.getFeed(destination: "records", limit: 1000))
             }
@@ -1775,22 +1972,24 @@ final class AppStore {
                 }
                 switch answer {
                 case .shipments(let rows?): zones.shipments = rows
-                case .newsletters(let rows?): zones.newsletters = rows
+                case .reading(let rows?): zones.reading = rows
                 case .records(let feed?):
                     zones.records = feed.items.map(\.readingRow)
+                    zones.recordFacts = Dictionary(feed.items.map { ($0.message_id, $0.decision.records ?? []) },
+                        uniquingKeysWith: { _, latest in latest })
                     zones.receipts = feed.receipts
                     zones.banking = feed.banking
                     zones.calendar = feed.calendar
-                case .shipments, .newsletters, .records: break
+                case .shipments, .reading, .records: break
                 }
             }
         }
         guard e == epoch else { return }
         zones.loadedAt = Date()
 
-        HeroCache.shared.preload(zones.newsletters.map(\.latestThreadId))
+        HeroCache.shared.preload(zones.reading.map(\.latestThreadId))
         warmZoneThreads()
-        // The newsletter half of the launch image warm's input; the bands are the
+        // The reading half of the launch image warm's input; the bands are the
         // other half, and it starts once both have landed.
         ImageWarmer.shared.noteZonesLanded()
     }
@@ -1858,6 +2057,37 @@ final class AppStore {
     /// bands underneath whatever page you would otherwise be reading.
     var retriage: RetriageRun?
 
+    /// A trailing-days re-triage the human has ASKED for and not yet confirmed.
+    ///
+    /// Held HERE rather than in `RetriageButton` for two reasons. The button is a
+    /// text chip inside a masthead HStack, and an `OverlayScrim` mounted there
+    /// would be clipped to the width of the chip. And there are two copies of
+    /// that button (the sitrep's masthead, the emails bar), so a dialog owned by
+    /// one of them would be the wrong one half the time. Every other modal in
+    /// this app is a field on the store that `ActionLayer` draws; so is this.
+    var retriageAsk: Int?
+
+    /// Ask before the window goes away. The run is minutes long, blocks the whole
+    /// app and spends on the model, and the chip that starts it sits a few points
+    /// from the sync stamp: one confirm is the difference between a re-triage and
+    /// a misclick you have to sit through (#210).
+    func askRetriage(days: Int) {
+        guard retriage == nil else { return }
+        retriageAsk = days
+    }
+
+    func cancelRetriageAsk() {
+        retriageAsk = nil
+    }
+
+    /// Confirmed: drop the question first, so the blocking modal replaces the
+    /// dialog rather than stacking on top of one that is still asking.
+    func confirmRetriage() async {
+        guard let days = retriageAsk else { return }
+        retriageAsk = nil
+        await startRetriage(days: days)
+    }
+
     /// How often the modal asks the daemon where it is. A re-triage takes
     /// minutes and the poll is one indexed aggregate, so this is about how alive
     /// the counter should FEEL, not about cost.
@@ -1871,6 +2101,7 @@ final class AppStore {
     /// per-message re-triage from the fix palette, joins the same run).
     func startRetriage(days: Int) async {
         guard retriage == nil else { return }
+        retriageAsk = nil
         let e = epoch
         retriage = RetriageRun()
         do {
@@ -2620,7 +2851,10 @@ final class AppStore {
         guard var next = compose, next.replyToMessageId == nil, next.forwardOfMessageId == nil,
             next.draftId == nil,
             next.to.isEmpty, next.cc.isEmpty, next.bcc.isEmpty, next.subject.isEmpty,
-            Prefs.shared.isBodyUntouched(next.body)
+            Prefs.shared.isBodyUntouched(next.body),
+            // A file dropped in the meantime is composing too: overwriting the
+            // tray with the draft's would orphan its upload and cut its marker.
+            next.attachments.isEmpty
         else { return }
         next.to = draft.to
         // Nil is a daemon too old to carry them, not an emptied field — leave
@@ -2631,6 +2865,8 @@ final class AppStore {
         next.bcc = draft.bcc ?? next.bcc
         next.subject = draft.subject
         next.body = draft.body
+        // The files the draft claimed, already staged — no upload to wait on.
+        next.attachments = (draft.attachments ?? []).map(ComposeAttachment.init)
         next.draftId = draft.id
         compose = next
         await resolveDraftGroup()
@@ -2703,7 +2939,7 @@ final class AppStore {
         guard e == epoch else { return }
         // Untouched, not empty — the seeded signature must not block the restore.
         guard var next = inlineReply, next.replyToMessageId == messageId, next.draftId == nil,
-            Prefs.shared.isBodyUntouched(next.body)
+            Prefs.shared.isBodyUntouched(next.body), next.attachments.isEmpty
         else { return }
         next.body = draft.body
         // Only a draft that actually recorded a copy list gets to state one:
@@ -2715,6 +2951,7 @@ final class AppStore {
             next.to = draft.to.isEmpty ? next.to : draft.to
             next.recipientsStated = true
         }
+        next.attachments = (draft.attachments ?? []).map(ComposeAttachment.init)
         next.draftId = draft.id
         inlineReply = next
     }
@@ -2807,6 +3044,13 @@ final class AppStore {
     /// of "we do not know" is no.
     var forwardingAvailable: Bool { sitrep.stats?.forwarding == true }
 
+    /// Whether the composers may offer to attach files. Same shape and same
+    /// reason as `forwardingAvailable`: a daemon that does not know
+    /// `attachment_ids` ignores the key and mails the words without the
+    /// files, answering 200 — so the affordance is withheld rather than
+    /// offered as a lie. nil (no stats yet) counts as no.
+    var composeAttachmentsAvailable: Bool { sitrep.stats?.compose_attachments == true }
+
     // MARK: - read tracking
 
     /// Whether a composer may offer the pixel at all. A daemon with no tracking
@@ -2840,7 +3084,40 @@ final class AppStore {
     func openRemind(_ target: RemindTarget) { remindTarget = target }
     func closeRemind() { remindTarget = nil }
 
-    func openRuleEditor(_ request: RuleEditorRequest) { ruleEditor = request }
+    func openRuleEditor(_ request: RuleEditorRequest) {
+        var request = request
+        if RehearsalMode.isEnabled, tour.active, tour.practiceStep == .rule,
+           request.sender?.lowercased() == TourController.practiceRuleSender {
+            request.disposition = request.disposition ?? .squelch
+            request.want = request.want ?? "I don’t need to see routine terms of service updates."
+            let originalResult = request.onResult
+            let run = tour.practiceRunID
+            let savedEpoch = epoch
+            request.onResult = { [weak self] result, body in
+                guard let self, self.epoch == savedEpoch else { return }
+                originalResult?(result, body)
+                Task { @MainActor [weak self] in
+                    guard let self, self.epoch == savedEpoch else { return }
+                    let muted = await RehearsalAPI.shared.suppresses(messageID: 11, viaRuleID: result.rule_id)
+                    guard self.epoch == savedEpoch, self.tour.practiceRunID == run else { return }
+                    self.tour.notePracticeRuleSaved(run: run, muted: muted)
+                }
+            }
+        }
+        if RehearsalMode.isEnabled {
+            let onSaved = request.onSaved
+            let savedEpoch = epoch
+            request.onSaved = { [weak self] in
+                guard let self, self.epoch == savedEpoch else { return }
+                onSaved?()
+                Task { @MainActor [weak self] in
+                    guard let self, self.epoch == savedEpoch else { return }
+                    await SitrepPoller.shared.refreshAfterCorrection()
+                }
+            }
+        }
+        ruleEditor = request
+    }
     func closeRuleEditor() { ruleEditor = nil }
 
     func openGroupEditor(_ request: GroupEditorRequest) { groupEditor = request }
@@ -2856,6 +3133,8 @@ final class AppStore {
     ) {
         let entry = PendingUndo(kind: kind, messageId: messageId, label: label, revert: revert)
         undos.append(entry)
+        // Let the guided undo lesson wait for the learner.
+        if RehearsalMode.isEnabled && tour.active && messageId == 1 && tour.practiceStep == .done { return }
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.undoTTL))
             self?.undos.removeAll { $0.id == entry.id }

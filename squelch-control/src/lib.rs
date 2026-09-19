@@ -33,6 +33,7 @@
 
 pub mod activation;
 pub mod admin;
+mod appearance;
 pub mod bifrost;
 pub mod config;
 pub mod cookie;
@@ -43,6 +44,7 @@ pub mod labels;
 pub mod oauth;
 pub mod pages;
 pub mod ratelimit;
+pub mod reconnect;
 pub mod resend;
 pub mod seal;
 pub mod sessions;
@@ -110,6 +112,7 @@ use axum::{
 pub fn router(state: ControlState) -> Router {
     let form = Router::new()
         .route("/", get(handlers::signup_form))
+        .route("/reconnect/status", get(reconnect::status))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             ratelimit::limit_page,
@@ -164,12 +167,18 @@ pub fn router(state: ControlState) -> Router {
         ))
         .with_state(state.clone());
 
-    let app = Router::new()
-        .route("/healthz", get(handlers::healthz))
+    let accounts = Router::new()
         .merge(form)
         .merge(signup)
         .merge(console)
         .merge(callback)
+        .layer(middleware::from_fn_with_state(
+            !state.config().is_insecure(),
+            appearance::apply,
+        ));
+    let app = Router::new()
+        .route("/healthz", get(handlers::healthz))
+        .merge(accounts)
         .merge(tenant);
 
     if state.config().waitlist.is_none() {

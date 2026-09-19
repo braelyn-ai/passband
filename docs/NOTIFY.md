@@ -351,7 +351,7 @@ shape of every piece. Names here are the names in the code.
    THE ONE PLACE THE TWO LANES DIFFER, and they differ because §11.5 says they
    must: the deliberate lane exempts some categories from that floor
    (`stage1_llm::floor_exempt_category` — records, which the Banking rail owns,
-   and `marketing`, which the Newsletters zone owns and on which the floor's
+   and `marketing`, which the Reading zone owns and on which the floor's
    premise is false). This lane cannot make that call and must not learn to.
    Category is the deliberate lane's business, and buying the exemption here
    would mean either a second classification in front of the buzz or a
@@ -660,7 +660,7 @@ signal for it, and the client must treat it as one:
   poll: live account → the same `AuthArrival` ring/auto-reveal, background →
   `postAuth`.
 - iOS NSE: `sealed_kind != nil` renders the auth-shaped banner (title
-  `AuthCopy.label(kind) · account`, body `from <sender display name>`), sound
+  `AuthCopy.label(kind) · account`, body `from <SenderID.readableName>`), sound
   on, `passband.route = authRoute`, so the tap lands on the Auth list rather
   than a thread fetch.
 - The `Event` decoder gains `sealed_kind: SealedKind?`; `SealedKind` is

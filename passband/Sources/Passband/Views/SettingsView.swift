@@ -720,20 +720,19 @@ struct NotificationsSection: View {
     }
 }
 
-/// The first-run walkthrough, on demand. Replay leaves Settings for the sitrep,
-/// which four of the seven steps are about.
+/// Try the guided practice inbox again, then return to the live summary.
 struct TourSection: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
         SectionCard(label: "Tour") {
             InlineRow(key: "walkthrough") {
-                Button("replay the tour") { store.tour.replay(store: store) }
+                Button("try the practice inbox") { store.tour.replay(store: store) }
                     .buttonStyle(.glass)
                     .controlSize(.small)
             }
             SettingsHint(
-                "Seven steps over your own board: what triage filed, where records live, and how to teach it about a sender."
+                "Try example emails, explore the categories, and practice a sender rule before returning to your inbox."
             )
         }
     }

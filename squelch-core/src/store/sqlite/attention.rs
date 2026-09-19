@@ -3,6 +3,22 @@
 
 use super::*;
 
+// Legacy buckets remain wire-compatible, but new mail is projected from the
+// current agent decision. A neutral ingest row is pending, never classified noise.
+const CANONICAL_MAIL_CTE: &str = "WITH classified AS (
+    SELECT m.*, CASE
+      WHEN a.message_id IS NULL THEN COALESCE(t.tier,'pending')
+      WHEN d.message_id IS NULL THEN 'pending'
+      WHEN COALESCE(pref.show_in_fye,json_extract(att.attention_json,'$.show_in_fye'),0)=1 THEN 'signal'
+      ELSE 'noise' END AS display_tier
+    FROM messages m
+    LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id
+    LEFT JOIN agent_message_state a ON a.account_id=m.account_id AND a.message_id=m.id
+    LEFT JOIN agent_message_decisions d ON d.account_id=a.account_id AND d.message_id=a.message_id AND d.revision=a.revision
+    LEFT JOIN agent_thread_attention att ON att.account_id=m.account_id AND att.thread_id=m.thread_id
+    LEFT JOIN agent_thread_preferences pref ON pref.account_id=m.account_id AND pref.thread_id=m.thread_id
+)";
+
 /// Columns 0..=8 of the updates SELECT — the prefix `ranked_updates` and
 /// `attention_updates` share verbatim — into an [`Update`]. An unparseable tier
 /// falls back to the least-alarming value rather than failing the whole read.
@@ -737,13 +753,10 @@ impl SqliteStore {
             // model ever looking at them, and neither is listed by the noise
             // page, so counting them made the header's noise number a promise
             // the page could not keep.
-            let mut stmt = conn.prepare(
-                "SELECT t.tier, COUNT(*) FROM triage t
-                 JOIN messages m ON m.id = t.message_id
-                 WHERE t.account_id=?1
-                   AND m.is_sent = 0 AND m.is_spam = 0
-                 GROUP BY t.tier",
-            )?;
+            let mut stmt = conn.prepare(&format!(
+                "{CANONICAL_MAIL_CTE} SELECT display_tier, COUNT(*) FROM classified
+                 WHERE account_id=?1 AND is_sent=0 AND is_spam=0 GROUP BY display_tier"
+            ))?;
             let rows = stmt.query_map(params![account_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
             })?;
@@ -865,8 +878,8 @@ impl SqliteStore {
         until: DateTime<Utc>,
     ) -> Result<Vec<MailActivityDay>> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT substr(m.received_at, 1, 10) AS day,
+        let mut stmt = conn.prepare(&format!(
+            "{CANONICAL_MAIL_CTE} SELECT substr(m.received_at, 1, 10) AS day,
                     COALESCE(SUM(m.is_sent = 0), 0),
                     COALESCE(SUM(m.is_sent = 1), 0),
                     COALESCE(SUM(m.is_sent = 0 AND EXISTS(SELECT 1 FROM agent_message_state a
@@ -875,20 +888,20 @@ impl SqliteStore {
                         AND EXISTS(SELECT 1 FROM json_each(d.decision_json,'$.auth.kinds')
                           WHERE value IN ('otp','password_reset','sign_in_link','verification')))), 0),
                     COALESCE(SUM(m.is_sent = 0
-                                 AND t.tier = 'past_due'), 0),
+                                 AND m.display_tier = 'past_due'), 0),
                     COALESCE(SUM(m.is_sent = 0
-                                 AND t.tier = 'deadline'), 0),
+                                 AND m.display_tier = 'deadline'), 0),
                     COALESCE(SUM(m.is_sent = 0
-                                 AND t.tier = 'signal'), 0),
+                                 AND m.display_tier = 'signal'), 0),
                     COALESCE(SUM(m.is_sent = 0
-                                 AND t.tier = 'noise'), 0)
-             FROM messages m
-             LEFT JOIN triage t ON t.message_id = m.id
+                                 AND m.display_tier = 'noise'), 0),
+                    COALESCE(SUM(m.is_sent=0 AND m.display_tier='pending'),0)
+             FROM classified m
              WHERE m.account_id = ?1 AND m.is_spam = 0
                AND m.received_at >= ?2 AND m.received_at < ?3
              GROUP BY day
-             ORDER BY day",
-        )?;
+             ORDER BY day"
+        ))?;
         let count = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<u64> {
             Ok(r.get::<_, i64>(i)?.max(0) as u64)
         };
@@ -905,6 +918,7 @@ impl SqliteStore {
                         deadline: count(r, 5)?,
                         signal: count(r, 6)?,
                         noise: count(r, 7)?,
+                        pending: count(r, 8)?,
                     })
                 },
             )?

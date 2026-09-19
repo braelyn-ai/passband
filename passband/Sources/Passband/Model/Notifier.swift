@@ -126,6 +126,7 @@ final class Notifier {
             EventBanner.threadKey: event.thread_id,
             EventBanner.eventKey: event.id,
             EventBanner.messageKey: event.message_id,
+            EventBanner.authKey: event.isAuth,
             EventBanner.accountKey: account,
         ]
         if copy.sound { content.sound = Self.sound(for: Prefs.shared.notificationSound) }
@@ -234,10 +235,10 @@ final class Notifier {
     /// you are looking at the list it came from; a banner you just pressed a
     /// button for is the whole point.
     nonisolated static func presentation(
-        appActive: Bool, windowVisible: Bool, isTest: Bool = false
+        appActive: Bool, windowVisible: Bool, isTest: Bool = false, isAuth: Bool = false
     ) -> UNNotificationPresentationOptions {
-        if isTest { return [.banner, .sound, .list] }
-        return (appActive && windowVisible) ? [.list] : [.banner, .sound, .list]
+        EventBanner.shouldPresentForeground(appActive: appActive, windowVisible: windowVisible,
+            isTest: isTest, isAuth: isAuth) ? [.banner, .sound, .list] : [.list]
     }
 
     /// Where a tap lands once the right mailbox is on screen.
@@ -296,7 +297,7 @@ final class Notifier {
     /// daemon's v2 contract has been verified. Failed connections retain taps.
     func drainPendingTap() {
         let store = AppStore.shared
-        guard !deliveringTap, !store.switching,
+        guard !deliveringTap, !store.switching, !store.accountActionsBlocked,
             let tap = tapQueue.take(connected: store.connStatus == .connected)
         else { return }
         guard let account = tap.accountId ?? AccountManager.shared.activeId,
@@ -374,6 +375,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         _ center: UNUserNotificationCenter, willPresent notification: UNNotification
     ) async -> UNNotificationPresentationOptions {
         let route = notification.request.content.userInfo[EventBanner.routeKey] as? String
+        let isAuth = notification.request.content.userInfo[EventBanner.authKey] as? Bool ?? false
         let (active, visible) = await MainActor.run {
             #if os(macOS)
                 (NSApp.isActive, MainWindow.find()?.isVisible == true)
@@ -384,7 +386,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
             #endif
         }
         return Notifier.presentation(
-            appActive: active, windowVisible: visible, isTest: route == EventBanner.testRoute)
+            appActive: active, windowVisible: visible, isTest: route == EventBanner.testRoute, isAuth: isAuth)
     }
 
     func userNotificationCenter(
