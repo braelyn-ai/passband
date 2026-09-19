@@ -146,7 +146,10 @@ for inspection and manual re-triage. Observable output constraints get repair
 turns within the same investigation before consuming a new attempt. Provider
 configuration failures, transport failures, rate limits, and server errors
 instead leave work pending and retry after the shared outage cooldown;
-they do not consume the terminal-attempt allowance. A first-call configuration
+they do not consume the terminal-attempt allowance. After the cooldown, one
+investigation probes recovery; a successful response restores normal admission,
+and another outage extends the cooldown. Empty refine polling backs off up to
+30 seconds and an ingest wake resets the delay. A first-call configuration
 rejection refunds its budget reservation. Earlier paid calls remain charged.
 Whole-investigation and access-call deadlines are job-local failures: they consume
 retry attempts without pausing the account, and their uncertain spend is not
@@ -166,7 +169,10 @@ also refresh the existing last-success metric.
 The fast notification assessment also persists auth classification, score,
 reason, model, prompt version, and timestamp for the human inspector.
 Applied runs record prompt version, model, configuration, token usage, model-turn
-and tool-call counts, and source IDs. Raw provider failures are not persisted as
+and tool-call counts, and source IDs. Reported usage is retained for refusals,
+truncation and invalid output as well. Truncation returns to the bounded caller
+instead of silently making another paid transport call. Missing usage remains
+unknown; the existing ledger is not durable per-call monetary settlement. Raw provider failures are not persisted as
 diagnostics. The decision includes reasons, evidence locations, rule exceptions,
 and ranking inputs. No credentials should appear in summaries or notification
 text; the model is instructed to describe authentication without reproducing it.

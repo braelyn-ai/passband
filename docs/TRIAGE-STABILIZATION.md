@@ -75,11 +75,11 @@ The PR remains a draft for live-inbox quality and latency evaluation before roll
 
 ## Verification
 
-- `cargo test -p squelch-core -p squelch-api -p squelch-mcp -p squelchd -p squelch-tui --quiet`: **1,889 passed, 0 failed, 0 ignored**.
+- `cargo test -p squelch-core -p squelch-api -p squelch-mcp -p squelchd -p squelch-tui --quiet`: **1,899 passed, 0 failed, 0 ignored**.
 - Strict Clippy passed for those five packages with `--all-targets -- -D warnings`.
 - `cargo check --workspace` passed; Cargo retains the existing future-compatibility warning for `num-bigint-dig`.
 - Full Swift test script passed: 37 suites, including capability recovery, notification/tap behavior, canonical feeds, reader focus, and rehearsal isolation.
-- Desktop build passed: 158 sources, version 0.0.7, build 1024.
+- Desktop build passed: 158 sources, version 0.0.7, build 1042.
 - iOS generic simulator build passed for the app and notification extension (code signing disabled).
 - Formatting and `git diff --check` passed.
 
@@ -93,3 +93,18 @@ FYE corrections; and coalesced trigger bursts preserving retry state.
 No live-inbox evaluation, production rollout, or simulator/device runtime session is
 included. Control-plane Postgres integration tests are outside the affected-package
 suite and require `SQUELCH_TEST_PG_URL`.
+
+## Follow-up integration
+
+#227, #226 and #228 are merged into this branch. The related-attention correction
+fixes preserve the independent attention source graph, including through human
+visibility toggles. Sent/spam-only targets cannot abort unrelated commits, and
+unclassified representatives remain visible as pending. #223 is superseded;
+its distinct Unicode allocation and limited source-selection tests are retained.
+Claims exclude completed history, background ordering follows availability/age,
+empty refine polling backs off, and expired circuits admit one recovery probe.
+
+The combined source tree was verified against the remote integration result
+`6ba5146`: all affected Rust suites, strict Clippy, 37 Swift suites, the macOS
+build and the generic iOS simulator build passed. Live-inbox quality/latency
+validation is still outstanding; these results do not replace that rollout gate.
