@@ -875,6 +875,23 @@ mod tests {
         }
     }
     #[test]
+    fn long_thread_retains_decisive_subject_content_within_encoded_limit() {
+        let body = format!("{}Payment is due tomorrow.", "x".repeat(23_900));
+        let mut value = json!({
+            "message": {"id": 1, "body": body},
+            "thread": (2..10).map(|id| json!({"id": id, "body": "é".repeat(6000)})).collect::<Vec<_>>()
+        });
+        let before = serde_json::to_vec(&value).unwrap().len();
+        bound_evidence_text(&mut value, 30_000);
+        assert_eq!(value["message"]["body"], body);
+        assert_eq!(value["thread"].as_array().unwrap().len(), 8);
+        let after = serde_json::to_vec(&value).unwrap().len();
+        assert!(after <= 30_000);
+        assert!(after > 29_000);
+        assert!(after < before / 3);
+    }
+
+    #[test]
     fn credentials_are_not_inferred_from_auth_category() {
         let mut decision = valid();
         decision.auth = AuthAssessment {

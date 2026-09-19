@@ -345,6 +345,15 @@ pub(super) fn correct_agent_triage_conn(
              VALUES(?1,?2,?3,?4) ON CONFLICT(account_id,thread_id) DO UPDATE SET
              show_in_fye=excluded.show_in_fye,revision=agent_thread_preferences.revision+1,updated_at=excluded.updated_at",
             params![account,thread,value.as_bool().unwrap(),now.to_rfc3339()])?;
+        // Visibility is a human preference, not new model evidence. Preserve the
+        // representative, provenance, actions and activity even before the
+        // representative has a classification or after it becomes spam.
+        conn.execute(
+            "UPDATE agent_thread_attention SET show_in_fye=?3,
+             attention_json=json_set(attention_json,'$.show_in_fye',json(?4)),
+             revision=revision+1 WHERE account_id=?1 AND thread_id=?2",
+            params![account, thread, value.as_bool().unwrap(), json(value)?],
+        )?;
     }
     let previous:Option<String>=conn.query_row("SELECT decision_json FROM agent_message_decisions WHERE account_id=?1 AND message_id=?2",
         params![account,message],
@@ -354,17 +363,6 @@ pub(super) fn correct_agent_triage_conn(
         apply_corrections(conn, account, message, &mut decision)?;
         conn.execute("UPDATE agent_message_decisions SET decision_json=?3 WHERE account_id=?1 AND message_id=?2",
         params![account,message,json(&decision)?])?;
-        if field == "show_in_fye" {
-            let m = read_message(conn, account, message)?;
-            let previous:Option<String>=conn.query_row("SELECT attention_json FROM agent_thread_attention WHERE account_id=?1 AND thread_id=?2",
-        params![account,m.thread_id],
-        |r|r.get(0)).optional()?;
-            if let Some(previous) = previous {
-                let mut attention: ThreadAttentionDecision = decode(&previous)?;
-                attention.show_in_fye = decision.attention.show_in_fye;
-                apply_attention(conn, account, &m.thread_id, message, &attention)?;
-            }
-        }
         if field == "destinations" {
             conn.execute(
                 "DELETE FROM agent_message_destinations WHERE account_id=?1 AND message_id=?2",
@@ -1774,30 +1772,42 @@ fn apply_attention(
             }
         }
     }
-    let (activity, id) = match latest {
-        Some(activity) => activity,
+    // Evidence in another thread may update attention, but cannot choose a new
+    // representative for the target or replace its per-message classification.
+    let cross_thread = read_message(conn, account, fallback_message)?.thread_id != thread;
+    if cross_thread {
+        let previous: Option<(String, i64)> = conn.query_row(
+            "SELECT a.relevant_activity,a.message_id FROM agent_thread_attention a
+             JOIN messages m ON m.account_id=a.account_id AND m.id=a.message_id
+             WHERE a.account_id=?1 AND a.thread_id=?2 AND m.thread_id=?2 AND m.is_sent=0 AND m.is_spam=0",
+            params![account,thread], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).optional()?;
+        if previous.is_some() {
+            latest = previous;
+        }
+    }
+    let representative = match latest {
+        Some(activity) => Some(activity),
         None => conn
             .query_row(
                 "SELECT strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(m.received_at),COALESCE(julianday(t.created_at),julianday(?3)),julianday(?3))) AS activity,m.id
              FROM messages m LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id
-             WHERE m.account_id=?1 AND m.thread_id=?2 AND m.is_sent=0 AND m.is_spam=0
-             ORDER BY activity DESC,m.id DESC LIMIT 1",
+             WHERE m.account_id=?1 AND m.thread_id=?2
+             ORDER BY (m.is_sent=0 AND m.is_spam=0) DESC,activity DESC,m.id DESC LIMIT 1",
                 params![account, thread,Utc::now().to_rfc3339()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .optional()?
-            .unwrap_or((Utc::now().to_rfc3339(), fallback_message)),
+            .optional()?,
     };
-    let decision_message = if read_message(conn, account, fallback_message)?.thread_id == thread {
-        fallback_message
-    } else {
-        if read_message(conn, account, id)?.thread_id != thread {
-            return Err(CoreError::InvalidInput(
-                "attention has no target-thread representative".into(),
-            ));
-        }
-        id
+    // Sent-only/spam-only threads retain a local anchor and their provenance;
+    // the view's sent/spam filters keep them off inbound surfaces. An absent
+    // target has no projection to update, and must not abort unrelated work.
+    let Some((activity, id)) = representative else {
+        return Ok(());
     };
+    // Classification belongs to the displayed representative. Evidence
+    // provenance is tracked independently in agent_attention_sources.
+    let decision_message = id;
     let unresolved_since = if attention.actions.iter().any(|action| !action.resolved)
         || attention.state == crate::triage::decision::AttentionState::NeedsUser
     {
@@ -1846,7 +1856,7 @@ fn list_items_with_query(
              strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(a.relevant_activity),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,a.decision_message_id
              FROM agent_thread_attention a JOIN messages m ON m.account_id=a.account_id AND
              m.id=a.message_id LEFT JOIN agent_message_decisions d ON d.account_id=m.account_id AND
-             d.message_id=a.decision_message_id LEFT JOIN triage t ON t.account_id=m.account_id AND
+             d.message_id=m.id LEFT JOIN triage t ON t.account_id=m.account_id AND
              t.message_id=m.id WHERE a.account_id=?1 AND ?3='fye' AND (a.show_in_fye=1 OR t.reminded_at
              IS NOT NULL) AND m.is_sent=0 AND m.is_spam=0 AND COALESCE(t.status,'new')!='done' AND
              (t.remind_at IS NULL OR t.remind_at<=?2) AND ?4 IS ?4 AND ?5 IS ?5"
@@ -1901,6 +1911,17 @@ fn list_items_with_query(
                 unresolved_since,
                 decision_source_message_id,
             )| {
+                // Pending classification must not hide valid thread attention,
+                // nor borrow kinds/records from an unrelated update's source.
+                let decision =
+                    d.as_deref()
+                        .map(decode)
+                        .transpose()?
+                        .unwrap_or_else(|| MessageDecision {
+                            summary: subject.clone(),
+                            reason: "Triage pending".into(),
+                            ..Default::default()
+                        });
                 Ok(AgentListItem {
                     message_id,
                     decision_source_message_id,
@@ -1908,7 +1929,7 @@ fn list_items_with_query(
                     from_addr,
                     subject,
                     received_at,
-                    decision: d.as_deref().map(decode).transpose()?.unwrap_or_default(),
+                    decision,
                     attention: a.as_deref().map(decode).transpose()?.unwrap_or_default(),
                     score: 0.0,
                     unresolved_since,
@@ -2364,6 +2385,341 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn related_evidence_preserves_target_representation_and_access_provenance() {
+        use crate::triage::decision::RelatedAttentionUpdate;
+        let store = fixture();
+        let (first, initial) = claim(&store, 1);
+        let mut bill = decision(1);
+        bill.kinds = vec![EmailKind::Bill];
+        bill.summary = "Electricity bill".into();
+        store
+            .commit_agent_decision(
+                &first,
+                &initial,
+                &bill,
+                std::slice::from_ref(&initial.message.source),
+            )
+            .unwrap();
+        let (job, receipt_context) = claim(&store, 2);
+        let target = store.agent_thread_context(1, "one").unwrap();
+        let mut receipt = decision(2);
+        receipt.kinds = vec![EmailKind::Receipt];
+        receipt.summary = "Payment receipt".into();
+        let mut attention = target.attention.unwrap();
+        attention.summary = "Payment received".into();
+        receipt.related_updates.push(RelatedAttentionUpdate {
+            thread_id: "one".into(),
+            expected_revision: target.revision.attention_revision,
+            attention,
+            evidence: vec![],
+        });
+        let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+        assert_eq!(
+            store
+                .commit_agent_decision(&job, &receipt_context, &receipt, &sources)
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        let items = store
+            .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+            .unwrap();
+        let target = items.iter().find(|item| item.thread_id == "one").unwrap();
+        assert_eq!(target.message_id, 1);
+        assert_eq!(target.decision.summary, "Electricity bill");
+        assert_eq!(target.decision.kinds, vec![EmailKind::Bill]);
+        assert_eq!(target.attention.summary, "Payment received");
+        assert_eq!(target.decision_source_message_id, 1);
+        assert_eq!(
+            attention_projection(&store, "one")["sources"],
+            serde_json::json!([[1, 1], [2, 1]])
+        );
+        store
+            .correct_agent_triage(
+                1,
+                2,
+                "external_access",
+                &serde_json::json!(true),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            store
+                .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.external_agent_records(1, 10).unwrap().is_empty());
+        assert!(store.external_agent_reading(1, 10).unwrap().is_empty());
+        assert_eq!(
+            store
+                .agent_records(1, 10)
+                .unwrap()
+                .iter()
+                .find(|item| item.message_id == 1)
+                .unwrap()
+                .decision,
+            bill
+        );
+    }
+
+    fn attention_projection(store: &SqliteStore, thread: &str) -> serde_json::Value {
+        let encoded: String = store.lock().unwrap().query_row(
+            "SELECT json_object('message_id',message_id,'decision_message_id',decision_message_id,
+             'relevant_activity',relevant_activity,'unresolved_since',unresolved_since,
+             'show_in_fye',json(CASE show_in_fye WHEN 1 THEN 'true' ELSE 'false' END),
+             'attention',json(attention_json),'revision',revision)
+             FROM agent_thread_attention WHERE account_id=1 AND thread_id=?1",
+            [thread], |row| row.get(0),
+        ).unwrap();
+        let mut projection: serde_json::Value = decode(&encoded).unwrap();
+        let conn = store.lock().unwrap();
+        let mut statement = conn.prepare("SELECT source_message_id,source_revision FROM agent_attention_sources WHERE account_id=1 AND thread_id=?1 ORDER BY source_message_id").unwrap();
+        let sources = statement
+            .query_map([thread], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        projection["sources"] = serde_json::json!(sources);
+        projection
+    }
+
+    #[test]
+    fn fye_toggle_preserves_related_provenance_even_without_message_classification() {
+        use crate::triage::decision::RelatedAttentionUpdate;
+        for classified in [false, true] {
+            let store = fixture();
+            if classified {
+                let (job, context) = claim(&store, 1);
+                store
+                    .commit_agent_decision(
+                        &job,
+                        &context,
+                        &decision(1),
+                        std::slice::from_ref(&context.message.source),
+                    )
+                    .unwrap();
+            }
+            let (job, context) = claim(&store, 2);
+            let target = store.agent_thread_context(1, "one").unwrap();
+            let mut verdict = decision(2);
+            let mut attention = decision(1).attention;
+            attention.summary = "Receipt-derived attention".into();
+            attention
+                .actions
+                .push(crate::triage::decision::AttentionAction {
+                    description: "Check payment".into(),
+                    ..Default::default()
+                });
+            verdict.related_updates.push(RelatedAttentionUpdate {
+                thread_id: "one".into(),
+                expected_revision: target.revision.attention_revision,
+                attention,
+                evidence: vec![],
+            });
+            let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+            assert_eq!(
+                store
+                    .commit_agent_decision(&job, &context, &verdict, &sources)
+                    .unwrap(),
+                AgentCommitOutcome::Applied
+            );
+            store
+                .correct_agent_triage(
+                    1,
+                    2,
+                    "external_access",
+                    &serde_json::json!(true),
+                    Utc::now(),
+                )
+                .unwrap();
+            for show in [false, true] {
+                let mut expected = attention_projection(&store, "one");
+                expected["show_in_fye"] = serde_json::json!(show);
+                expected["attention"]["show_in_fye"] = serde_json::json!(show);
+                expected["revision"] =
+                    serde_json::json!(expected["revision"].as_i64().unwrap() + 1);
+                store
+                    .correct_agent_triage(1, 1, "show_in_fye", &serde_json::json!(show), Utc::now())
+                    .unwrap();
+                assert_eq!(
+                    attention_projection(&store, "one"),
+                    expected,
+                    "classified={classified}"
+                );
+                assert!(
+                    store
+                        .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(store.external_agent_reading(1, 10).unwrap().is_empty());
+                assert!(store.external_agent_records(1, 10).unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn related_update_commits_with_sent_only_or_spam_only_target() {
+        use crate::triage::decision::RelatedAttentionUpdate;
+        for sent_only in [true, false] {
+            let store = fixture();
+            // The spam case represents a previously classified bill subsequently
+            // marked spam. The sent-only case has never had a classification.
+            if !sent_only {
+                let (job, context) = claim(&store, 1);
+                store
+                    .commit_agent_decision(
+                        &job,
+                        &context,
+                        &decision(1),
+                        std::slice::from_ref(&context.message.source),
+                    )
+                    .unwrap();
+            }
+            store
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE messages SET is_sent=?1,is_spam=?2 WHERE id=1",
+                    params![sent_only, !sent_only],
+                )
+                .unwrap();
+            let (job, context) = claim(&store, 2);
+            let target = store.agent_thread_context(1, "one").unwrap();
+            let mut verdict = decision(2);
+            verdict.related_updates.push(RelatedAttentionUpdate {
+                thread_id: "one".into(),
+                expected_revision: target.revision.attention_revision,
+                attention: decision(1).attention,
+                evidence: vec![],
+            });
+            let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+            assert_eq!(
+                store
+                    .commit_agent_decision(&job, &context, &verdict, &sources)
+                    .unwrap(),
+                AgentCommitOutcome::Applied
+            );
+            let projection = attention_projection(&store, "one");
+            assert_eq!(projection["message_id"], 1);
+            assert_eq!(projection["decision_message_id"], 1);
+            let state: String = store
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM agent_triage_jobs WHERE id=?1",
+                    [job.id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "completed");
+            for show in [false, true] {
+                store
+                    .correct_agent_triage(1, 1, "show_in_fye", &serde_json::json!(show), Utc::now())
+                    .unwrap();
+                assert_eq!(
+                    attention_projection(&store, "one")["decision_message_id"],
+                    1
+                );
+            }
+            assert!(
+                store
+                    .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                    .unwrap()
+                    .iter()
+                    .all(|item| item.thread_id != "one")
+            );
+            assert_eq!(store.agent_records(1, 10).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn unclassified_representative_stays_visible_without_borrowing_source_classification() {
+        use crate::triage::decision::RelatedAttentionUpdate;
+        for same_thread in [false, true] {
+            let store = fixture();
+            if same_thread {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE messages SET thread_id='one' WHERE id=2", [])
+                    .unwrap();
+            }
+            let (job, context) = claim(&store, 1);
+            let mut verdict = decision(1);
+            verdict.kinds = vec![EmailKind::Receipt];
+            verdict.summary = "Unrelated receipt classification".into();
+            let mut attention = decision(2).attention;
+            attention.summary = "Obligation needs attention".into();
+            if same_thread {
+                verdict.attention = attention;
+            } else {
+                verdict.related_updates.push(RelatedAttentionUpdate {
+                    thread_id: "two".into(),
+                    expected_revision: 0,
+                    attention,
+                    evidence: vec![],
+                });
+            }
+            let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+            assert_eq!(
+                store
+                    .commit_agent_decision(&job, &context, &verdict, &sources)
+                    .unwrap(),
+                AgentCommitOutcome::Applied
+            );
+            let fye = store
+                .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap();
+            let item = fye
+                .iter()
+                .find(|item| item.message_id == 2)
+                .expect("unclassified representative remains visible");
+            assert_eq!(item.decision.summary, "subject");
+            assert_eq!(item.decision.reason, "Triage pending");
+            assert!(item.decision.kinds.is_empty());
+            assert!(item.decision.records.is_empty());
+            assert_eq!(item.attention.summary, "Obligation needs attention");
+            assert_eq!(item.decision_source_message_id, 2);
+            assert!(
+                store
+                    .external_agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                    .unwrap()
+                    .is_empty(),
+                "pending representative access stays closed"
+            );
+
+            store
+                .enqueue_agent_triage(1, 2, "manual:classify", false)
+                .unwrap();
+            let job = store
+                .claim_agent_job(1, "investigation", Utc::now(), 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.message_id, 2);
+            let context = store.load_agent_context(&job).unwrap();
+            let mut bill = decision(2);
+            bill.kinds = vec![EmailKind::Bill];
+            bill.summary = "Target bill classification".into();
+            let sources = store.snapshot_agent_sources(1, &[1, 2]).unwrap();
+            assert_eq!(
+                store
+                    .commit_agent_decision(&job, &context, &bill, &sources)
+                    .unwrap(),
+                AgentCommitOutcome::Applied
+            );
+            let fye = store
+                .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap();
+            let item = fye.iter().find(|item| item.message_id == 2).unwrap();
+            assert_eq!(item.decision.summary, "Target bill classification");
+            assert_eq!(item.decision.kinds, vec![EmailKind::Bill]);
+        }
     }
 
     #[test]
