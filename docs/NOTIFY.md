@@ -660,7 +660,7 @@ signal for it, and the client must treat it as one:
   poll: live account → the same `AuthArrival` ring/auto-reveal, background →
   `postAuth`.
 - iOS NSE: `sealed_kind != nil` renders the auth-shaped banner (title
-  `AuthCopy.label(kind) · account`, body `from <sender display name>`), sound
+  `AuthCopy.label(kind) · account`, body `from <SenderID.readableName>`), sound
   on, `passband.route = authRoute`, so the tap lands on the Auth list rather
   than a thread fetch.
 - The `Event` decoder gains `sealed_kind: SealedKind?`; `SealedKind` is

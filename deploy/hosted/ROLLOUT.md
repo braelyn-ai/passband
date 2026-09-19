@@ -30,6 +30,15 @@ carrier ships on `kubectl apply`, so a change that spans both is out of sync for
 however long you leave between them. If they must move together, do the carrier
 promptly after the merge.
 
+When the change is a new field on a warden route, apply the warden FIRST and
+merge control after. The reconnect worker is the standing example: control
+sends `pair: false` on `PUT .../credentials/replace`, and a warden that predates
+the field ignores it, mints a device pairing nobody will type, and if that exec
+fails answers 500 *after* the credential has landed and rolled out. Control
+reads that as an unsettled attempt and retries it (bounded, but every retry
+mints another code) while the user's page says reconnecting is taking longer
+than usual and the mailbox is in fact fixed.
+
 ---
 
 ## 0. Preflight
