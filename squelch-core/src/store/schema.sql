@@ -1360,6 +1360,10 @@ CREATE INDEX IF NOT EXISTS idx_agent_jobs_claim ON agent_triage_jobs(kind,state,
 -- completed historical jobs on each idle worker poll.
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_account_ready ON agent_triage_jobs(account_id,state,kind,available_at);
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_active_message ON agent_triage_jobs(account_id,message_id,kind,lease_until) WHERE state='leased';
+-- Completed history never belongs in the worker's candidate scan.
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_pending_claim
+    ON agent_triage_jobs(account_id,available_at,id)
+    WHERE state IN ('queued','leased');
 CREATE TABLE IF NOT EXISTS agent_message_decisions (
     account_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,

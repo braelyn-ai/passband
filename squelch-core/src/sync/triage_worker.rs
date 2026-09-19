@@ -242,24 +242,30 @@ fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnap
 }
 
 impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C> {
-    pub(super) async fn agent_triage_pass(&self) {
+    pub(super) async fn agent_triage_pass(&self) -> bool {
         if Utc::now().timestamp() < self.agent_retry_after.load(Ordering::Relaxed) {
-            return;
+            return false;
         }
         let Some(llm) = &self.stage2_llm else {
-            return;
+            return false;
         };
         if let Err(error) = self.config.triage.validate() {
             eprintln!("squelch: invalid triage configuration: {error}");
-            return;
+            return false;
         }
         let day = Utc::now().format("%Y-%m-%d").to_string();
         let since = Utc::now() - ChronoDuration::days(self.config.sync.backfill_days as i64);
         if let Err(error) = self.store.initialize_agent_cutover(self.account_id, since) {
             eprintln!("squelch: triage cutover could not queue historical work: {error}");
-            return;
+            return false;
         }
-        let concurrency = self.config.triage.agent.concurrency;
+        let circuit_generation = self.agent_retry_after.load(Ordering::Relaxed);
+        // Half-open recovery admits one probe; queued work is not a probe storm.
+        let concurrency = if circuit_generation > 0 {
+            1
+        } else {
+            self.config.triage.agent.concurrency
+        };
         let mut jobs = Vec::new();
         let mut revisits = 0;
         for _ in 0..concurrency {
@@ -288,11 +294,13 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
             }
         }
+        let claimed = !jobs.is_empty();
         futures::future::join_all(
             jobs.into_iter()
                 .map(|job| self.process_agent_job(job, llm, &day)),
         )
         .await;
+        claimed
     }
 
     pub(super) async fn process_agent_job(&self, job: AgentJob, llm: &ResolvedLlm, day: &str) {
@@ -416,6 +424,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         };
         match run_agent(connection, &config, input, &reader).await {
             Ok(run) => {
+                let until = self.agent_retry_after.load(Ordering::Relaxed);
+                if until > 0 && until <= Utc::now().timestamp() {
+                    let _ = self.agent_retry_after.compare_exchange(
+                        until,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
                 context.run_metadata = serde_json::json!({
                     "prompt_version": crate::triage::agent::PROMPT_VERSION,
                     "schema_version": 1,
@@ -562,6 +579,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         .await
         {
             Ok(run) => {
+                let until = self.agent_retry_after.load(Ordering::Relaxed);
+                if until > 0 && until <= Utc::now().timestamp() {
+                    let _ = self.agent_retry_after.compare_exchange(
+                        until,
+                        0,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
+                }
                 let metadata = serde_json::json!({"prompt_version":crate::triage::access::PROMPT_VERSION,
                     "model":model,"model_calls":run.model_calls,"usage":run.usage,"assessment":run.decision});
                 for usage in run.usage {
