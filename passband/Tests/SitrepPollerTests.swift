@@ -77,6 +77,8 @@ struct UpdatesParams: Sendable { let band: Band; let limit: Int }
 struct AttentionUpdate: Equatable, Sendable {
     var id: Int; var thread_id: String; var senderString: String
 }
+struct Feed: Sendable { var items: [FeedItem] = []; var total_count: Int? = 0 }
+struct FeedItem: Sendable { var row: AttentionUpdate }
 struct Updates: Sendable { var items: [AttentionUpdate] = [] }
 struct Stats: Equatable, Sendable {
     var total: Int
@@ -94,6 +96,7 @@ struct SitrepData: Equatable {
     var open: [AttentionUpdate] = []
     var stats: Stats?
     var sealed: [Int] = []
+    var totalCount: Int?
 }
 struct OpenThreadSummary { var threadId: String; var newestMessageId: Int }
 enum ErrorKind { case unknown }
@@ -124,12 +127,14 @@ struct RefreshError { var message: String; var kind: ErrorKind }
     }
     func finish(_ id: Int) { pending.removeValue(forKey: id)!.resume(returning: Stats(total: id)) }
     func fail(_ id: Int) { pending.removeValue(forKey: id)!.resume(throwing: APIError(message: "old failure", kind: .unknown)) }
+    func getFeed(destination: String, limit: Int) async throws -> Feed { Feed() }
     func getUpdates(_ params: UpdatesParams) async throws -> Updates { Updates() }
     func listSealed() async throws -> [Int] { [] }
     func refreshMail() async throws {}
 }
 @MainActor enum Badge {
     static var refreshes = 0
+    static func set(_ count: Int) { refreshes += 1 }
     static func refresh(_ rows: [AttentionUpdate]) { refreshes += 1 }
 }
 @MainActor final class Prefs {

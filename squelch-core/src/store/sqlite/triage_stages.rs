@@ -328,164 +328,69 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Schedule new agent work without erasing the last usable decision or any
+    /// user state. Each request has its own identity, including repeated asks.
     pub(super) fn retriage_reset(
         &self,
         account_id: AccountId,
         message_id: Option<i64>,
         days: u32,
     ) -> Result<u64> {
-        let conn = self.lock()?;
-        let now = Utc::now();
-        let cutoff = (now - chrono::Duration::days(days as i64)).to_rfc3339();
-        // Scope: one message, or the trailing-days inbound window. Normal
-        // sensitivity only, and never a rule-decided ('rule'), human-corrected
-        // ('human') or sealed/sent ('n/a') marker — rules are authoritative, a
-        // human is more authoritative still, and sealed mail re-enters no queue.
-        // Re-running the model over a row someone fixed would undo their work and
-        // record feedback corrections that never stuck.
-        let scope_sql = match message_id {
-            Some(_) => "m.id = ?2",
-            None => "m.received_at >= ?2",
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let cutoff = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+        let ids = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM messages WHERE account_id=?1 AND
+                 ((?2 IS NOT NULL AND id=?2) OR
+                  (?2 IS NULL AND received_at>=?3 AND is_sent=0 AND is_spam=0))",
+            )?;
+            stmt.query_map(params![account_id, message_id, cutoff], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let scope_param: String = match message_id {
-            Some(id) => id.to_string(),
-            None => cutoff,
-        };
-        // The shipments trigger is NOT a model marker to clear: NULL means "no
-        // shipping signal at ingest", and blanking it would be indistinguishable
-        // from that. Only a row that EVER carried a signal is re-pended; a NULL
-        // stays NULL and re-enters nothing.
-        //
-        // AND THE STAMP THAT SAYS A HUMAN ASKED. Every LLM pass skips mail older
-        // than its age cutoff, so without this a re-triage of anything past the
-        // window requeues the row only to have the next tick mark it processed
-        // with no model call — a request answered by a no-op. The passes read it
-        // through `triage::retriage_forced`, which expires it after a day so the
-        // force covers this request and not the row's whole future.
-        let update = format!(
-            "UPDATE triage SET stage1_model_used = NULL, model_used = NULL,
-                    needs_stage2 = 0, extractor_model_used = NULL,
-                    retriage_at = ?3,
-                    ship_extract_model = CASE
-                        WHEN ship_extract_model IS NOT NULL THEN 'pending' ELSE NULL END
-             WHERE account_id = ?1
-               AND COALESCE(sensitivity, 'normal') = 'normal'
-               AND COALESCE(stage1_model_used, '') NOT IN ('rule', 'n/a', 'human')
-               AND message_id IN (
-                   SELECT m.id FROM messages m
-                   WHERE m.account_id = ?1 AND m.is_sent = 0 AND m.is_spam = 0 AND {scope_sql}
-               )"
-        );
-        let n = conn.execute(
-            &update,
-            rusqlite::params![account_id, scope_param, now.to_rfc3339()],
-        )?;
-        // The rows the UPDATE just reset (their Stage-1 marker is now NULL),
-        // reused by every specialist cleanup below.
-        let reset_scope = format!(
-            "SELECT t.message_id FROM triage t
-             JOIN messages m ON m.id = t.message_id
-             WHERE t.account_id = ?1 AND t.stage1_model_used IS NULL
-               AND m.is_sent = 0 AND m.is_spam = 0 AND {scope_sql}"
-        );
-        // Drop stale specialist rows; re-extraction recreates them, possibly
-        // under a different category verdict. MARKETING is here for the same
-        // reason banking is — it was missing, so re-triage left its rows behind
-        // pointing at a category the row no longer has.
-        for table in ["banking", "marketing"] {
-            let del = format!(
-                "DELETE FROM {table}
-                 WHERE account_id = ?1 AND message_id IN ({reset_scope})"
-            );
-            conn.execute(&del, rusqlite::params![account_id, scope_param])?;
+        for id in &ids {
+            super::agent_triage::enqueue_agent_triage_conn(
+                &tx,
+                account_id,
+                *id,
+                &format!("manual:{now}"),
+                false,
+            )?;
+            tx.execute(
+                "UPDATE triage SET retriage_at=?3 WHERE account_id=?1 AND message_id=?2",
+                params![account_id, id, now],
+            )?;
         }
-        // Staged orders too: they are keyed by the retailer's order reference,
-        // not by a tracking number, so unlike `shipments` they carry no
-        // carrier-poll state worth preserving and the re-run recreates them.
-        // `shipments` rows are deliberately NOT deleted here — identity-keyed and
-        // poll-bearing, they outlive any one email.
-        let del_orders = format!(
-            "DELETE FROM shipment_orders
-             WHERE account_id = ?1 AND last_message_id IN ({reset_scope})"
-        );
-        conn.execute(&del_orders, rusqlite::params![account_id, scope_param])?;
-        // AND THE NAMES THOSE MESSAGES MERELY DONATED, in both tables. The
-        // `shipments` row itself survives (identity-keyed, poll-bearing), but its
-        // `item_name` is mail-derived and three extractor paths write one onto a
-        // row a DIFFERENT message feeds — which is why `item_name_msg` records
-        // whose extraction supplied it. Without this, a re-extraction that finds
-        // no item name, or decides the mail was never a shipment, leaves the OLD
-        // name on the card forever: re-triage is supposed to redo the verdict,
-        // not preserve half of it. Scrubbing by provenance is exact, and matches
-        // what sealing already does in `feedback.rs` — only scoped to the reset
-        // set rather than to one message.
-        //
-        // `shipments` also loses its `item_name_source` marker (back to
-        // 'regex'), for the reason sealing does: a source that outlives its name
-        // would lock the row out of taking a regex name on the next email.
-        // `shipment_orders` has no such column — only the extractor writes it.
-        for (table, source_reset) in [
-            ("shipments", ", item_name_source = 'regex'"),
-            ("shipment_orders", ""),
-        ] {
-            let scrub = format!(
-                "UPDATE {table} SET item_name = '', item_name_msg = NULL{source_reset}
-                 WHERE account_id = ?1 AND item_name_msg IN ({reset_scope})"
-            );
-            conn.execute(&scrub, rusqlite::params![account_id, scope_param])?;
-        }
-        Ok(n as u64)
+        tx.commit()?;
+        Ok(ids.len() as u64)
     }
 
-    /// How far the live re-triage has got — see [`RetriageProgress`].
-    ///
-    /// PENDING IS THE TWO QUEUE PREDICATES, NOT A MARKER OF ITS OWN. A row is
-    /// still being worked exactly when `stage1_queue` or `stage2_queue` would
-    /// still hand it out, so the two spellings are kept side by side here and
-    /// any change to a queue's WHERE has to be answered in this one. Anything
-    /// else drifts: a "done = stage1_model_used IS NOT NULL" counter would
-    /// reach 100% while every escalated row was still waiting on Stage-2.
-    ///
-    /// The window matches [`crate::triage::retriage_forced`] rather than
-    /// restating 24 hours, and it is a `>=` on the stamp, which keeps a
-    /// FUTURE-dated stamp (clock skew) in the run exactly as that predicate does.
+    /// Progress follows durable jobs, including work reclaimed after restart.
+    /// A failed job is terminal; diagnostics preserve its failure separately.
     pub(super) fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
         let conn = self.lock()?;
-        let since = (Utc::now() - crate::triage::RETRIAGE_FORCE_WINDOW).to_rfc3339();
-        // Sealed and sent rows are excluded for the same reason the queues
-        // exclude them: they re-enter nothing, so counting one would leave the
-        // run permanently short of its own total. `retriage_reset` never stamps
-        // them, but a row SEALED AFTER its stamp was written would otherwise
-        // wedge the counter at 99%.
-        let (total, done, started_at) = conn.query_row(
-            "SELECT COUNT(*),
-                    COALESCE(SUM(
-                        CASE WHEN t.stage1_model_used IS NULL
-                                  OR (t.needs_stage2 = 1 AND t.model_used IS NULL)
-                             THEN 0 ELSE 1 END), 0),
-                    MIN(t.retriage_at)
-             FROM triage t
-             JOIN messages m ON m.id = t.message_id
-             WHERE t.account_id = ?1
-               AND t.retriage_at >= ?2
-               AND t.sensitivity = 'normal'
-               AND m.is_sent = 0 AND m.is_spam = 0",
+        let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+        let (total, done, started_at): (i64, i64, Option<String>) = conn.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN j.state IN ('completed','failed')
+                 THEN 1 ELSE 0 END),0),MIN(t.retriage_at)
+             FROM triage t JOIN agent_triage_jobs j
+               ON j.account_id=t.account_id AND j.message_id=t.message_id
+              AND j.trigger='manual:' || t.retriage_at
+              AND j.kind IN ('triage','access')
+             WHERE t.account_id=?1 AND t.retriage_at>=?2",
             params![account_id, since],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok(RetriageProgress {
             total,
             done,
             started_at: started_at
                 .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Utc)),
+                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                .map(|time| time.with_timezone(&Utc)),
         })
     }
 

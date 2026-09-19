@@ -117,6 +117,9 @@ struct RootView: View {
                 await store.loadSettings()
             }
         }
+        .onChange(of: store.accountActionsBlocked) { _, blocked in
+            if !blocked { Notifier.shared.drainPendingTap() }
+        }
         .onChange(of: store.connStatus) { _, status in
             if status == .connected {
                 store.tour.maybeStart()
@@ -124,7 +127,7 @@ struct RootView: View {
                 SitrepPoller.shared.start()
                 // EVERY account's ears, not just the live one's: the poller
                 // above follows whichever mailbox is on screen, while the event
-                // feeds (and, for the inactive accounts, the auth watches) are
+                // feeds are
                 // how the human hears about mail in the ones that are not.
                 // NOT while the practice inbox is up: the feeds are the real
                 // accounts', and a banner for real mail would point at a thread
@@ -242,9 +245,6 @@ private struct ShellWatchers: View {
                 // question, so flipping back to automatic can offer to run it
                 // again without the reader retyping anything.
                 if move == .stop { store.resetSearchLane(keepingVerdict: true) }
-            }
-            .onChange(of: store.sitrep.sealed) { _, sealed in
-                AuthArrival.shared.observe(sealed: sealed)
             }
             // Connection starts onboarding before the shell is revealed.
             // Refreshes can still resume a pending live summary.

@@ -566,8 +566,7 @@ struct EmailsView: View {
                 guard verdicted, let u = selected else { return }
                 store.openTriageFix(
                     TriageFixTarget(
-                        messageId: u.id, sender: u.sender, subject: u.one_line,
-                        tier: .some(u.tier.rawValue)))
+                        messageId: u.id, sender: u.sender, subject: u.one_line))
             },
             // Reply opens the email and composes in it, so it hands over the same
             // queue Enter does — done + next keeps working from inside the reader.

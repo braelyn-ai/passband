@@ -170,7 +170,7 @@ the registry remains the authority on dispatch semantics.
 | 2FA arrival detection | **done** | Persisted seen-set, 2-minute freshness window, silent first-run seeding |
 | Auth countdown rings | **done** | 60s sweep, resumes correctly mid-flight |
 | Favicon avatars (robot/brand only) | **done** | Human correspondents never resolved over the network; verdict cached across launches |
-| Reading-zone derivation | **done** | Pipeline `marketing` classification preferred; legacy heuristic only as a migration bridge |
+| Reading-zone derivation | **done** | Canonical agent Reading destination, grouped by sender; no client classification heuristic |
 | Tracker stripping | **done** | Conservative: tiny-declared, CSS-hidden, or a known endpoint from the deliberately short list |
 | Quoted-history collapse | **done** | Same heuristic for text (native) and HTML (injected script) |
 

@@ -27,8 +27,6 @@ fn handle_list(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') => {
             let _ = app.refresh();
         }
-        KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_threshold(5),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.adjust_threshold(-5),
         KeyCode::Char('t') => {
             if !app.selected_is_sealed() {
                 app.open_rule_editor();

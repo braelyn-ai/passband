@@ -39,6 +39,68 @@ fn map_decision(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<NotifyDecision
 }
 
 impl SqliteStore {
+    pub(super) fn record_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+        assessment: &crate::store::NotificationAssessment,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        let changed = conn.execute(
+            "INSERT INTO notification_assessments(account_id,message_id,lane,is_auth,
+                importance,one_line,reason,model,prompt_version,assessed_at)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10
+             FROM messages WHERE account_id=?1 AND id=?2",
+            params![
+                account_id,
+                message_id,
+                lane.as_str(),
+                assessment.is_auth,
+                assessment.importance,
+                crate::text::truncate_chars(&assessment.one_line, 160),
+                crate::text::truncate_chars(&assessment.reason, 500),
+                assessment.model,
+                assessment.prompt_version,
+                assessment.assessed_at.to_rfc3339()
+            ],
+        )?;
+        if changed == 0 {
+            return Err(CoreError::InvalidInput(
+                "notification assessment message unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn latest_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+    ) -> Result<Option<crate::store::NotificationAssessment>> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT is_auth,importance,one_line,reason,model,prompt_version,assessed_at
+             FROM notification_assessments WHERE account_id=?1 AND message_id=?2 AND lane=?3
+             ORDER BY id DESC LIMIT 1",
+                params![account_id, message_id, lane.as_str()],
+                |r| {
+                    Ok(crate::store::NotificationAssessment {
+                        is_auth: r.get(0)?,
+                        importance: r.get(1)?,
+                        one_line: r.get(2)?,
+                        reason: r.get(3)?,
+                        model: r.get(4)?,
+                        prompt_version: r.get(5)?,
+                        assessed_at: dt(r, 6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     pub(super) fn record_notify_decision(&self, decision: &NewNotifyDecision) -> Result<bool> {
         let conn = self.lock()?;
         // INSERT OR IGNORE on UNIQUE(message_id, lane): the FIRST answer a lane

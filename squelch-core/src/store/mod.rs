@@ -4,6 +4,7 @@
 //! its `Connection` in a `Mutex`; async callers wrap calls in
 //! `tokio::task::spawn_blocking`.
 
+pub mod agent_triage;
 pub mod recency;
 pub mod search_query;
 pub mod sqlite;
@@ -166,6 +167,9 @@ pub struct SenderEntry {
 /// message is never observable as normal mail (docs/SECURITY.md §4).
 #[derive(Debug, Clone)]
 pub struct TriagedMessage {
+    /// First classification from incremental sync may use reserved arrival
+    /// capacity. Historical backfill and repairs use background capacity.
+    pub foreground_triage: bool,
     pub message: NewMessage,
     /// Sent mail only: To/Cc addresses seeding the contacts table (the account's
     /// own address is filtered out at ingest). Contacts come exclusively from
@@ -338,15 +342,17 @@ pub struct NewAuditEntry {
 /// [`crate::triage::events`]; every field besides the ids is a denormalized
 /// snapshot of the verdict at emission time.
 ///
-/// Sealed mail produces one only through the KIND-DERIVED path (docs/NOTIFY.md
-/// §11.6): a fixed sentence chosen by `sealed_kind`, the sender address, and
-/// nothing the mail said. `one_line` on such a row is a constant, not a summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The model supplies safe notification text. `is_auth` controls client
+/// presentation independently from external-agent access restrictions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewEvent {
     pub account_id: AccountId,
     pub message_id: i64,
     pub thread_id: String,
     pub kind: EventKind,
+    /// Model assessment, carried explicitly rather than inferred from urgency.
+    #[serde(default)]
+    pub is_auth: bool,
     pub tier: Tier,
     pub importance: u8,
     pub sender: String,
@@ -402,6 +408,19 @@ pub struct NotifyDecisionRow {
     pub model_used: Option<String>,
     pub latency_ms: Option<u32>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Model reasoning for human diagnostics. Never exposed through the external agent door.
+/// Contains bounded, nonsecret summaries, not raw message text or credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationAssessment {
+    pub is_auth: bool,
+    pub importance: u8,
+    pub one_line: String,
+    pub reason: String,
+    pub model: String,
+    pub prompt_version: String,
+    pub assessed_at: DateTime<Utc>,
 }
 
 /// One registered APNs device.
@@ -734,7 +753,7 @@ pub struct Stage1Queued {
     pub sensitivity: Sensitivity,
     /// `triage.retriage_at`: when a human last asked for THIS row to be
     /// re-triaged, `None` when nobody ever has. Read through
-    /// [`crate::triage::retriage_forced`], which is what lets an explicit
+    /// the legacy re-triage window, which is what lets an explicit
     /// re-triage of old mail bypass the pass's stale skip.
     pub retriage_at: Option<DateTime<Utc>>,
     /// `triage.notify_eligible_at`; see [`TriagedMessage::notify_eligible_at`].
@@ -942,10 +961,9 @@ pub struct Stage2UsageDay {
 }
 
 /// One UTC day of the mailbox's own traffic, for the human door's activity
-/// report. `received` is everything that arrived that day, sealed mail
-/// included and spam never; the four tier counts partition the NON-SEALED part
-/// of it, so `received >= sealed + past_due + deadline + signal + noise` always
-/// holds, the slack being mail the triage pipeline has not reached yet.
+/// report. `received` includes auth mail but excludes provider spam. Tier fields
+/// are compatibility projections; `pending` is unclassified mail and `sealed`
+/// is an overlapping actionable-auth count, not a separate classification tier.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailActivityDay {
     /// UTC date key, `YYYY-MM-DD` — the usage ledger's key, so the two series
@@ -958,6 +976,8 @@ pub struct MailActivityDay {
     pub deadline: u64,
     pub signal: u64,
     pub noise: u64,
+    /// Received mail awaiting a current agent classification.
+    pub pending: u64,
 }
 
 /// One call's token counts, as the ledger records them: `input` is the UNCACHED
@@ -1058,7 +1078,7 @@ pub struct SentMissingRecipients {
 /// SECURITY: every method that can feed the MCP surface (`ranked_updates`,
 /// `thread_view`, `deadlines`) MUST exclude `sensitivity = 'sealed'` in the SQL
 /// itself. `sealed_messages` is the sole local-only escape hatch (TUI).
-pub trait Store: Send + Sync {
+pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// Insert or update a message (and its FTS body + derived contacts).
     /// Returns the local message id.
     fn upsert_message(&self, msg: &NewMessage) -> Result<i64>;
@@ -1443,14 +1463,10 @@ pub trait Store: Send + Sync {
         days: u32,
     ) -> Result<u64>;
 
-    /// THE LOCAL HALF OF "NOT SPAM": clear `messages.is_spam` on one message and
-    /// hand the row back to triage as newly-arrived mail — LLM markers reset, a
-    /// `retriage_at` force stamp so its age cannot stale-skip it, and the
-    /// attention lifecycle back to `new`. Sealed rows are refused. `false` when
-    /// nothing changed (unknown id, sealed, or not spam to begin with).
-    ///
-    /// The Gmail half is the caller's and runs first; see the `not_spam`
-    /// handler for why that order and not the other one.
+    /// Restore owned spam to human inventory and atomically enqueue push-silent
+    /// agent triage. Resets attention to new. Restricted auth can also be rescued.
+    /// Returns false for unknown, foreign-account, or already non-spam messages.
+    /// The caller restores the message in Gmail before changing local state.
     fn clear_spam(&self, account_id: AccountId, message_id: i64) -> Result<bool>;
 
     /// Mark an extract-queued row PROCESSED without writing a specialist row —
@@ -1781,6 +1797,10 @@ pub trait Store: Send + Sync {
     /// polling; that send is best-effort, no receivers is normal.
     fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>>;
 
+    /// Current explicit user state still permits delivering this logical event.
+    /// Dispatchers recheck after queue waits/retries and advance suppressed events.
+    fn notification_delivery_allowed(&self, account_id: AccountId, event_id: i64) -> Result<bool>;
+
     /// Whether this message already has an `events` row: "has the user already
     /// been notified about this one".
     ///
@@ -1814,6 +1834,24 @@ pub trait Store: Send + Sync {
     // lane), APPEND-ONLY, carrying no email-derived text. It is the labeled
     // corpus that decides whether the threshold or the model moves; a row that
     // could be rewritten would be evidence of nothing.
+
+    /// Append a bounded model assessment before recording its delivery outcome.
+    /// The account must own the message; failures must leave the durable job retryable.
+    fn record_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+        assessment: &NotificationAssessment,
+    ) -> Result<()>;
+
+    /// Human diagnostics only; assessment text must never enter external agent responses.
+    fn latest_notification_assessment(
+        &self,
+        account_id: AccountId,
+        message_id: i64,
+        lane: NotifyLane,
+    ) -> Result<Option<NotificationAssessment>>;
 
     /// Record one lane's decision about one message. `false` when a row for that
     /// (message, lane) already existed and this call was IGNORED.
@@ -1989,8 +2027,10 @@ pub trait Store: Send + Sync {
     // AUTH-MAIL SHREDDER (retention). Human-door-only; see the `shred_log` block
     // in schema.sql for the policy.
 
-    /// Auth mail (`triage.sensitivity = 'sealed'`) received at or before `cutoff`
-    /// and not already in `shred_log`, oldest first, capped at `limit`. Rows
+    /// Currently assessed actionable auth (restricted codes, resets, sign-in or
+    /// verification links) received at or before `cutoff`, not yet in `shred_log`.
+    /// Legacy sensitivity and login/security alerts do not qualify. Oldest first,
+    /// capped at `limit`. Rows
     /// without a `gmail_msg_id` are skipped — the trash call has nothing to
     /// address.
     fn shred_candidates(

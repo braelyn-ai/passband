@@ -509,8 +509,10 @@ final class AssistantSession {
         // The pin the question was asked under, handed to the run so no later
         // move can rewrite what this one is about.
         let pin = PinnedContext(
-            email: openEmail,
-            sanitizedSubject: openEmail?.summary?.subject.markerSafeLine(cap: Self.subjectCap),
+            // Human reader metadata may contain credentials in the subject.
+            // Pin only the opaque thread handle; tools fetch authorized text.
+            email: openEmail.map { OpenEmailContext(threadId: $0.threadId, summary: nil) },
+            sanitizedSubject: nil,
             switched: switched,
             hits: hits)
         activeAskEmail = openEmail
@@ -1223,9 +1225,9 @@ final class AssistantSession {
     /// them. Reduced to the two fields the lane can use: an id it passes back
     /// verbatim, and a subject the prompt builder sanitizes before framing it.
     private static func promptHits(_ hits: [SearchHit]) -> [SearchLanePrompt.Hit] {
-        hits.prefix(SearchLanePrompt.hitCap).map {
-            SearchLanePrompt.Hit(threadId: $0.thread_id, subject: $0.subject)
-        }
+        // Human search can show pending and restricted mail. The search agent
+        // must obtain its own results through the dedicated agent endpoint.
+        []
     }
 
     /// A failed end. Errors never throw out of `send` — they land in the

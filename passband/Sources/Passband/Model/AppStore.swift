@@ -181,6 +181,8 @@ struct SitrepZoneCache: Sendable {
     var banking: [BankingRecord] = []
     var receipts: [Receipt] = []
     var reading: [ReadingSender] = []
+    var records: [AttentionUpdate] = []
+    var recordFacts: [Int: [AgentRecordProposal]] = [:]
     /// When the last full refresh COMPLETED. nil = never loaded.
     var loadedAt: Date?
 }
@@ -501,11 +503,7 @@ struct TriageFixTarget: Sendable, Equatable {
     var messageId: Int
     var sender: String
     var subject: String
-    /// Current values for the "was" labels. Double optional: an outer nil means
-    /// the caller does not know, and that dimension is OMITTED rather than shown
-    /// as "unset" — which would claim a fact we never fetched.
-    var tier: String??
-    var category: String??
+
 }
 
 /// The email currently being scheduled by the `h` palette.
@@ -582,6 +580,8 @@ struct SitrepData: Sendable, Equatable {
     var open: [AttentionUpdate] = []
     var stats: StoreStats?
     var sealed: [SealedMeta] = []
+    /// Server aggregate, including attention beyond the displayed page.
+    var totalCount: Int?
 }
 
 @MainActor
@@ -590,8 +590,18 @@ final class AppStore {
     static let shared = AppStore()
 
     // MARK: settings slice
-    var connStatus: ConnStatus = .loading
-    var settings: ConnectionSettings?
+    var connStatus: ConnStatus = .loading {
+        didSet {
+            if connStatus == .connected { Notifier.shared.connectionBecameReady() }
+        }
+    }
+    var settings: ConnectionSettings? {
+        didSet {
+            capabilityRecoveryTask?.cancel()
+            capabilityRecoveryTask = nil
+        }
+    }
+    @ObservationIgnored private var capabilityRecoveryTask: Task<Void, Never>?
     var connError: String?
 
     /// A `passband://pair` link waiting to be acted on. ConnectView is its only
@@ -800,7 +810,11 @@ final class AppStore {
     /// suspends twice (the draft settle, the keychain read) and a second
     /// switch starting inside one of those windows would configure the client
     /// out from under the first.
-    private(set) var switching = false
+    private(set) var switching = false {
+        didSet {
+            if !switching { Notifier.shared.drainPendingTap() }
+        }
+    }
     private(set) var practiceTransitioning = false
 
     /// Also enforced by account mutation entry points, not only menu items.
@@ -999,25 +1013,8 @@ final class AppStore {
                 await APIClient.shared.configure(
                     baseURL: stored.serverURL, token: stored.apiToken)
                 settings = stored
-                connStatus = .connected
-                connError = nil
-                #if os(iOS)
-                    await PushRegistration.shared.registerAndSync()
-                #endif
-                // A link that arrived during boot (the app was LAUNCHED by one)
-                // races the keychain read and finds no Connect gate to land on.
-                // On the Mac it is not dropped for that: this install having an
-                // identity is precisely what makes the link an ADD rather than
-                // a re-pair, so it goes to the same sheet a link arriving a
-                // minute later would, parked for the sheet's ConnectView to
-                // read as it mounts. On the phone nothing presents that sheet,
-                // and a link left parked only goes stale — same policy as
-                // `receivePairLink`, it is dropped instead.
-                #if os(iOS)
-                    pairLink = nil
-                #else
-                    if pairLink != nil { addAccountSheetOpen = true }
-                #endif
+                recoverSavedConnection(stored, accountId: active.id)
+
             } else {
                 connStatus = .disconnected
                 connError = "Your saved mailbox connection is incomplete. Reconnect to open your inbox."
@@ -1056,7 +1053,48 @@ final class AppStore {
         if connStatus == .connected { addAccountSheetOpen = true }
     }
 
-    /// Test a candidate URL+token via /client/stats; on success persist + connect.
+    /// Keep a saved identity behind the loading gate during a temporary outage.
+    /// Each probe has bounded short retries; longer outages retry every 30s.
+    /// Credentials or account changes cancel this task and invalidate its result.
+    private func recoverSavedConnection(_ stored: ConnectionSettings, accountId: UUID) {
+        capabilityRecoveryTask?.cancel()
+        let recoveryEpoch = epoch
+        connStatus = .loading
+        capabilityRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                guard isCurrent(recoveryEpoch), AccountManager.shared.activeId == accountId else { return }
+                do {
+                    try await APIClient.shared.probe(baseURL: stored.serverURL, token: stored.apiToken)
+                    guard !Task.isCancelled, isCurrent(recoveryEpoch),
+                        AccountManager.shared.activeId == accountId else { return }
+                    connError = nil
+                    connStatus = .connected
+                    #if os(iOS)
+                        await PushRegistration.shared.registerAndSync()
+                        guard !Task.isCancelled, isCurrent(recoveryEpoch) else { return }
+                        pairLink = nil
+                    #else
+                        if pairLink != nil { addAccountSheetOpen = true }
+                    #endif
+                    return
+                } catch {
+                    guard !Task.isCancelled, isCurrent(recoveryEpoch),
+                        AccountManager.shared.activeId == accountId else { return }
+                    guard CapabilityProbeRetry.isTransient(error) else {
+                        connStatus = .error
+                        connError = Self.connectErrorText(error)
+                        return
+                    }
+                    connError = "Server temporarily unavailable. Retrying automatically…"
+                    do { try await Task.sleep(for: .seconds(30)) }
+                    catch { return }
+                }
+            }
+        }
+    }
+
+    /// Verify candidate credentials and triage capabilities, then persist and connect.
     ///
     /// THE GATE'S path, and the first account's: it moves `connStatus`, which
     /// is what swaps the Connect screen for the shell. Adding an account to an
@@ -1071,12 +1109,14 @@ final class AppStore {
         guard !accountActionsBlocked, !switching else { return false }
         switching = true
         defer { switching = false }
+        capabilityRecoveryTask?.cancel()
+        capabilityRecoveryTask = nil
         connStatus = .connecting
         connError = nil
         // Probe with a throwaway config so a bad token never gets persisted.
         await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
-            _ = try await APIClient.shared.getStats()  // 401 => bad token; network => bad url
+            try await APIClient.shared.requireAgentTriage()
             // Re-connecting to a daemon the index ALREADY NAMES — active or
             // not — keeps that record's id (and so its keychain slots and
             // scoped cursors); a daemon no record names mints a fresh one. The
@@ -1157,9 +1197,8 @@ final class AppStore {
         switching = true
         defer { switching = false }
         let prev = settings
-        await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
         do {
-            _ = try await APIClient.shared.getStats()
+            try await APIClient.shared.probe(baseURL: serverURL, token: apiToken)
             // Same account, new credentials — `activeOrNew` returns the live
             // record here, so this overwrites its slots rather than adding one.
             var account = AccountIndex.activeOrNew()
@@ -1176,11 +1215,13 @@ final class AppStore {
             // does not fire. A rotated token means the old connection is one
             // 401 away from a silent backoff loop, so it is replaced outright
             // — streams take their credentials at construction and keep them.
+            await APIClient.shared.configure(baseURL: serverURL, token: apiToken)
             AccountManager.shared.restartFeeds(account.id, with: fresh)
             settings = fresh
             #if os(iOS)
                 await PushRegistration.shared.registerAndSync()
             #endif
+            Notifier.shared.connectionBecameReady()
             return (true, nil)
         } catch {
             // Restore the prior working client — a fat-fingered token must not
@@ -1405,6 +1446,21 @@ final class AppStore {
             return false
         }
 
+        // Probe with the candidate credentials before changing the live client
+        // or any account state. Transient failures retry automatically; a
+        // failed switch leaves the working account and its drafts untouched.
+        do {
+            try await APIClient.shared.probe(baseURL: next.serverURL, token: next.apiToken)
+        } catch {
+            let why = Self.connectErrorText(error)
+            if currentWorldGone {
+                await tearDownToGate(error: why)
+            } else {
+                pushToast(why, .error)
+            }
+            return false
+        }
+
         // (3) From here, every answer still in flight belongs to the old
         //     account and every writer that captured the old epoch is inert.
         epoch &+= 1
@@ -1454,6 +1510,7 @@ final class AppStore {
         SitrepPoller.shared.start()
         Task { await refreshMail(.inbox) }
         Task { await refreshTrackingConfig() }
+        Notifier.shared.connectionBecameReady()
         return true
     }
 
@@ -1520,6 +1577,8 @@ final class AppStore {
         arrivals.reset(to: nil)
         threadQueue = []
         pendingReplyMessageId = nil
+        focusedMessageId = nil
+        focusedMessageView = nil
         compose = nil
         inlineReply = nil
         sideView = .none
@@ -1563,7 +1622,6 @@ final class AppStore {
         // compile, so no platform fence.
         WebFramePool.shared.wipeAll()
         ImageWarmer.shared.resetForSwitch()
-        AuthArrival.shared.resetForSwitch()
         // AuthDecisions.reload() is NOT here — see switchAccount step (8).
     }
 
@@ -1697,11 +1755,33 @@ final class AppStore {
 
     // MARK: - surfaces
 
+    /// The exact message requested by a notification or another direct link.
+    /// It may still be pending triage and never needs a feed row to open.
+    var focusedMessageId: Int?
+    var focusedMessageView: ClientThreadView?
+
+    func openMessage(_ messageId: Int) {
+        let openedEpoch = epoch
+        Task {
+            do {
+                let envelope = try await APIClient.shared.getMessage(messageId)
+                guard isCurrent(openedEpoch) else { return }
+                openThread(envelope.thread.thread_id, focusMessage: messageId)
+                // Direct targets may contain credentials. Keep them only in
+                // active reader state, never the reusable prefetch cache.
+                focusedMessageView = envelope.thread
+            } catch {
+                guard isCurrent(openedEpoch) else { return }
+                refreshError = RefreshError(message: errText(error, "Could not open this email"), kind: .unknown)
+            }
+        }
+    }
+
     /// Open the fullscreen reader. `replyTo` is the unified `r` verb: the message
     /// id the reader should open its inline composer on once the thread loads.
     func openThread(
         _ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil,
-        entering edge: ThreadEdge? = nil
+        entering edge: ThreadEdge? = nil, focusMessage: Int? = nil
     ) {
         // from_noise: an open from below the squelch line — someone digging for
         // mail the triage muted, which is the false-negative signal.
@@ -1711,15 +1791,10 @@ final class AppStore {
                 "via_reply": replyTo != nil,
                 "from_noise": activeView == .emails && mailMode == .noise,
             ])
-        // THE OPEN LEDGER (`triage.opened_at`), and this is the only place that
-        // writes it: opening the reader is the one moment a PERSON has looked
-        // at mail, and a warmed thread renders from the prefetch cache without
-        // the daemon hearing about it at all. Fire and forget, and deliberately
-        // not awaited: it is a statistic, and the reader must not wait on one.
-        //
-        // Same-thread reopens fire it too; the daemon stamps first-open-only,
-        // so the second one writes nothing.
-        Task { try? await APIClient.shared.markThreadOpened(threadId) }
+        // Opening is acknowledged by the reader once the exact message is
+        // displayed. Fetching or prefetching a sibling is not a read.
+        focusedMessageId = focusMessage
+        focusedMessageView = nil
         // A DIFFERENT thread drops the summary NOW rather than when the new one
         // lands: in that gap the reader is showing thread B while this still
         // described A, and the ask bar would pin B's id under A's subject and
@@ -1751,6 +1826,8 @@ final class AppStore {
     }
 
     func closeThread() {
+        focusedMessageId = nil
+        focusedMessageView = nil
         threadId = nil
         arrivals.reset(to: nil)
         threadQueue = []
@@ -1865,11 +1942,9 @@ final class AppStore {
     /// One zone's answer, tagged so completion order can drive the writes.
     /// nil rows = that endpoint failed and its zone keeps what it had.
     private enum ZoneAnswer: Sendable {
-        case calendar([CalendarUpdate]?)
         case shipments([Shipment]?)
-        case banking([BankingRecord]?)
-        case receipts([Receipt]?)
-        case reading([ReadingSender])
+        case reading([ReadingSender]?)
+        case records(AgentFeed?)
     }
 
     private func performZoneRefresh() async {
@@ -1883,28 +1958,29 @@ final class AppStore {
         // rows) leaves its own zone's last good rows rather than blanking the
         // column.
         await withTaskGroup(of: ZoneAnswer.self) { group in
-            group.addTask { .calendar(try? await APIClient.shared.getCalendar()) }
             group.addTask {
                 .shipments(try? await APIClient.shared.getShipments(includeDelivered: true))
             }
-            group.addTask { .banking(try? await APIClient.shared.getBanking()) }
-            group.addTask { .receipts(try? await APIClient.shared.getReceipts()) }
             group.addTask { .reading(await ReadingFeed.load()) }
+            group.addTask {
+                .records(try? await APIClient.shared.getFeed(destination: "records", limit: 1000))
+            }
             for await answer in group {
                 guard e == epoch else {
                     group.cancelAll()
                     return
                 }
                 switch answer {
-                case .calendar(let rows?): zones.calendar = rows
                 case .shipments(let rows?): zones.shipments = rows
-                case .banking(let rows?): zones.banking = rows
-                case .receipts(let rows?): zones.receipts = rows
-                case .reading(let rows):
-                    if !rows.isEmpty || zones.reading.isEmpty {
-                        zones.reading = rows
-                    }
-                case .calendar, .shipments, .banking, .receipts: break
+                case .reading(let rows?): zones.reading = rows
+                case .records(let feed?):
+                    zones.records = feed.items.map(\.readingRow)
+                    zones.recordFacts = Dictionary(feed.items.map { ($0.message_id, $0.decision.records ?? []) },
+                        uniquingKeysWith: { _, latest in latest })
+                    zones.receipts = feed.receipts
+                    zones.banking = feed.banking
+                    zones.calendar = feed.calendar
+                case .shipments, .reading, .records: break
                 }
             }
         }

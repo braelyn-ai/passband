@@ -1118,7 +1118,7 @@ mod tests {
             .await
             .unwrap();
         match outcome {
-            ExtractOutcome::Failed(kind) => {
+            ExtractOutcome::Failed(kind, _) => {
                 assert!(kind.contains("http_400"));
                 assert!(!kind.contains("secret"), "no message body leaked");
             }

@@ -81,7 +81,7 @@ struct SettingsSearchTests {
     static func phrasesBeatTheirParts() {
         first("read tracking", is: .readTracking)
         first("for your eyes", is: .ranking)
-        first("stage 2", is: .triageBudget)
+        first("triage investigation", is: .triageBudget)
         first("do not disturb", is: .notifications)
         // "api key" is the assistant's; "api token" is the daemon's. The two
         // live one word apart and mean entirely different secrets.

@@ -1,5 +1,5 @@
 //! Specialist extractions — shipments, receipts, banking, calendar and
-//! marketing — plus the receipt-to-open-bill auto-close.
+//! marketing. Record writes never decide attention or complete user actions.
 
 use super::*;
 
@@ -30,29 +30,6 @@ fn select_row_id(
 fn delivered_ts(status: crate::triage::ShipmentStatus, ts: &str) -> Option<String> {
     (status == crate::triage::ShipmentStatus::Delivered).then(|| ts.to_string())
 }
-
-/// `app_settings` key recording that the one-shot shipment re-detect
-/// ([`SqliteStore::shipments_redetect_cleanup`]) has run for an account. Written
-/// inside the same transaction as the pass's deletions, so "the flag is set" and
-/// "the deletions happened" are one fact.
-const SHIPMENTS_REDETECT_FLAG: &str = "shipments_redetect_v1";
-
-/// Do two optional money values agree TO THE CENT? Both `None` agrees; one
-/// `None` does not. Compared in integer cents rather than by `==`, because these
-/// are `f64` on both sides and a re-parse that produced the identical decimal
-/// must not read as a change worth writing.
-fn same_cents(a: Option<f64>, b: Option<f64>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => (x * 100.0).round() == (y * 100.0).round(),
-        _ => false,
-    }
-}
-
-/// `app_settings` key recording that the one-shot receipt re-parse
-/// ([`SqliteStore::receipts_reparse_cleanup`]) has run for an account. Written
-/// inside the same transaction as the corrections, exactly as above.
-const RECEIPTS_REPARSE_FLAG: &str = "receipts_reparse_v1";
 
 /// The MERCHANT NAMESPACE an order reference lives in: the registrable domain of
 /// the sender that supplied it, lowercased, or `""` when the address yields none.
@@ -364,132 +341,6 @@ pub(super) fn upsert_calendar_conn(
     select_row_id(conn, "calendar_updates", account_id, message_id)
 }
 
-/// RECEIPT -> OPEN-BILL AUTO-CLOSE: resolve the one OPEN bill (a `deadlines` row
-/// whose triage status != 'done') a just-ingested receipt plausibly settles,
-/// inside the caller's ingest transaction so both land atomically.
-///
-/// Matching is the pure logic in [`crate::triage::receipt_match`], biased to
-/// precision because a false auto-close hides an unpaid bill: merchant identity
-/// by registrable domain or normalized display name; amounts must agree within
-/// cents when both parse, and a parsed bill against an unparsed receipt refuses;
-/// recency windows anchored on the two `received_at`s. At most ONE bill closes
-/// per receipt, the EARLIEST-due match — recurring bills leave identical open
-/// months, and closing both would hide an unpaid one.
-///
-/// The close appends an `audit_log` row (actor="ingest",
-/// action="bill.auto_close") so the human door can answer "where did my bill
-/// go?". Idempotent: a re-ingest finds the bill already 'done'.
-pub(super) fn auto_close_bill_for_receipt_conn(
-    conn: &Connection,
-    account_id: AccountId,
-    receipt_message_id: i64,
-    from_addr: &str,
-    from_name: Option<&str>,
-    r: &crate::triage::ReceiptInfo,
-    received_at: DateTime<Utc>,
-) -> Result<Option<i64>> {
-    use crate::triage::receipt_match;
-
-    // Candidate OPEN bills: every deadline whose triage row is not yet done, the
-    // message join supplying biller identity + recency anchor. The open set is
-    // small, so the pure rules filter it in Rust.
-    let mut stmt = conn.prepare(
-        "SELECT d.message_id, d.amount, d.currency, d.due_at,
-                m.from_addr, m.from_name, m.received_at
-         FROM deadlines d
-         JOIN triage t ON t.message_id = d.message_id
-         JOIN messages m ON m.id = d.message_id
-         WHERE d.account_id = ?1
-           AND t.status != 'done'
-           AND t.sensitivity != 'sealed'
-           AND d.message_id != ?2",
-    )?;
-    let rows = stmt.query_map(params![account_id, receipt_message_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, Option<f64>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, String>(6)?,
-        ))
-    })?;
-
-    // Best match = the EARLIEST-due bill that passes every rule.
-    let mut best: Option<(i64, DateTime<Utc>, Option<f64>)> = None;
-    for row in rows {
-        let (bill_id, bill_amount, bill_currency, due_s, bill_addr, bill_name, bill_recv_s) = row?;
-
-        // Currency sanity (v0 is USD-only, but never compare across currencies).
-        if let (Some(rc), Some(bc)) = (r.currency.as_deref(), bill_currency.as_deref())
-            && rc != bc
-        {
-            continue;
-        }
-        // Merchant identity is mandatory.
-        if !receipt_match::merchant_matches(from_addr, from_name, &bill_addr, bill_name.as_deref())
-        {
-            continue;
-        }
-        // Amount rule picks the recency window (or refuses outright).
-        let Some(window_days) = receipt_match::amounts_permit_close(r.amount, bill_amount) else {
-            continue;
-        };
-        // Recency: the bill must PRECEDE the receipt (a payment follows its
-        // bill), within the rule's window.
-        let bill_recv = parse_dt(&bill_recv_s)?;
-        let age = received_at - bill_recv;
-        if age < chrono::Duration::zero() || age > chrono::Duration::days(window_days) {
-            continue;
-        }
-
-        let due_at = parse_dt(&due_s)?;
-        if best
-            .as_ref()
-            .is_none_or(|(_, best_due, _)| due_at < *best_due)
-        {
-            best = Some((bill_id, due_at, bill_amount));
-        }
-    }
-    let Some((bill_id, _, bill_amount)) = best else {
-        return Ok(None);
-    };
-
-    // 'done' stamps resolved_at, sealed is excluded, and the status guard makes
-    // a re-run a no-op.
-    let n = conn.execute(
-        "UPDATE triage
-         SET status = 'done', resolved_at = ?1
-         WHERE account_id = ?2 AND message_id = ?3
-           AND sensitivity != 'sealed' AND status != 'done'",
-        params![Utc::now().to_rfc3339(), account_id, bill_id],
-    )?;
-    if n == 0 {
-        return Ok(None); // raced/no-op — nothing closed, nothing to audit
-    }
-
-    // Record WHY in the audit log so the resolution is always explainable.
-    let fmt_amt = |a: Option<f64>| a.map_or("unparsed".to_string(), |v| format!("${v:.2}"));
-    conn.execute(
-        "INSERT INTO audit_log(account_id, ts, actor, action, target, detail)
-         VALUES(?1,?2,'ingest','bill.auto_close',?3,?4)",
-        params![
-            account_id,
-            Utc::now().to_rfc3339(),
-            bill_id.to_string(),
-            format!(
-                "receipt message {} from {} ({}) matched open bill (bill {})",
-                receipt_message_id,
-                from_addr,
-                fmt_amt(r.amount),
-                fmt_amt(bill_amount),
-            ),
-        ],
-    )?;
-    Ok(Some(bill_id))
-}
-
 /// The `(id, tracking_number)` of every shipment row THIS message CREATED — the
 /// ONLY rows a shipments-extractor apply is allowed to delete. Read before any
 /// write, so the upsert below can never delete the row it just wrote.
@@ -672,6 +523,35 @@ fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipmen
         last_polled_at: dt_opt(r, 13)?,
         poll_failures: r.get(14)?,
     })
+}
+
+fn list_shipments_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    include_delivered: bool,
+) -> Result<Vec<crate::types::Shipment>> {
+    // This is a human record listing; external access is enforced separately.
+    // `cleared_at` rides along as an extra column: the read-side policy below
+    // needs it, and the wire type deliberately does not carry it.
+    let mut sql =
+        format!("SELECT {SHIPMENT_COLUMNS}, s.cleared_at {SHIPMENT_FROM} WHERE s.account_id=?1");
+    if !include_delivered {
+        sql.push_str(" AND s.status != 'delivered'");
+    }
+    sql.push_str(" ORDER BY s.last_update DESC");
+    let mut stmt = conn.prepare(&sql)?;
+    let out = stmt
+        .query_map(params![account_id], |r| {
+            Ok((shipment_row(r)?, dt_opt(r, 15)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Only an explicit clear hides a record. Shape and age are evidence
+    // for the agent, not independent rules that erase its decision.
+    Ok(out
+        .into_iter()
+        .filter(|(shipment, cleared_at)| !cleared_at.is_some_and(|at| shipment.last_update <= at))
+        .map(|(s, _)| s)
+        .collect())
 }
 
 impl SqliteStore {
@@ -883,59 +763,26 @@ impl SqliteStore {
         &self,
         account_id: AccountId,
         include_delivered: bool,
-        policy: crate::config::ShipmentListPolicy,
+        _policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
         let conn = self.lock()?;
-        // No sealed rows: detection never runs on sealed mail, and sealing an
-        // already-extracted message deletes its shipment row (correct_triage).
-        // `cleared_at` rides along as an extra column: the read-side policy below
-        // needs it, and the wire type deliberately does not carry it.
-        let mut sql = format!(
-            "SELECT {SHIPMENT_COLUMNS}, s.cleared_at {SHIPMENT_FROM} WHERE s.account_id=?1"
-        );
-        if !include_delivered {
-            sql.push_str(" AND s.status != 'delivered'");
+        list_shipments_conn(&conn, account_id, include_delivered)
+    }
+
+    /// Read carrier facts and validate all contributing messages under one lock.
+    pub fn external_shipments(
+        &self,
+        account_id: AccountId,
+        include_delivered: bool,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        let conn = self.lock()?;
+        let mut allowed = Vec::new();
+        for shipment in list_shipments_conn(&conn, account_id, include_delivered)? {
+            if super::messages::external_shipment_allowed_conn(&conn, account_id, shipment.id)? {
+                allowed.push(shipment);
+            }
         }
-        sql.push_str(" ORDER BY s.last_update DESC");
-        let mut stmt = conn.prepare(&sql)?;
-        let out = stmt
-            .query_map(params![account_id], |r| {
-                Ok((shipment_row(r)?, dt_opt(r, 15)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        // EVERY HIDE IN HERE IS READ-SIDE, deliberately not a stored "hidden"
-        // flag: the rows stay live so a later repair pass can still fix them, so
-        // the poller keeps polling them (see `list_pollable_shipments`, which
-        // filters on NONE of this), and so each hide reverses itself the moment
-        // the package does something. One filter, one place.
-        let stale_before = (policy.stale_after_days > 0)
-            .then(|| Utc::now() - chrono::Duration::days(policy.stale_after_days as i64));
-        Ok(out
-            .into_iter()
-            .filter(|(s, cleared_at)| {
-                // 1. PHANTOM. A carrier that has rejected an ambiguous bare
-                //    digit-run `suppress_failed_ambiguous_at` times running is
-                //    telling us it was never a tracking number — but only the
-                //    ambiguous SHAPES can be phantoms, so a 1Z…/TBA…/IMpb row is
-                //    never hidden however badly it polls. One successful poll
-                //    zeroes the counter and the row is back. NOTE: a cap of 0
-                //    hides every ambiguous row, since `poll_failures` is never
-                //    negative; callers pass the carrier poller's retirement cap.
-                let phantom = s.poll_failures >= policy.suppress_failed_ambiguous_at
-                    && crate::triage::is_ambiguous_tracking_shape(&s.tracking_number);
-                // 2. STALE. `last_update` advances ONLY on a user-visible change
-                //    (status, eta, or the carrier's raw string), so this is
-                //    exactly "nothing has happened to this package in N days".
-                //    An update pulls it back inside the window on its own.
-                let stale = stale_before.is_some_and(|cutoff| s.last_update < cutoff);
-                // 3. CLEARED. The comparison IS the revival: hide only while the
-                //    row has not moved since the user cleared it. Nothing ever
-                //    resets `cleared_at`, and nothing needs to.
-                let cleared = cleared_at.is_some_and(|at| s.last_update <= at);
-                !(phantom || stale || cleared)
-            })
-            .map(|(s, _)| s)
-            .collect())
+        Ok(allowed)
     }
 
     /// Stamp the user's "stop showing me this" on one shipment. Unconditional so
@@ -956,266 +803,16 @@ impl SqliteStore {
         Ok(n > 0)
     }
 
-    /// One-shot repair: re-run the (tightened) detector over each shipment row's
-    /// FEEDER MESSAGE and delete the row when that message no longer yields that
-    /// tracking number — the phantom rows a looser detector minted from eBay item
-    /// ids and marketing digit-runs. Returns the number of rows deleted, and 0
-    /// once the pass has already run for this account.
-    ///
-    /// ATOMIC WITH ITS OWN DONE-FLAG. The deletions and the `app_settings` flag
-    /// that records them commit in ONE transaction, so the pass can never
-    /// complete unrecorded — with the flag written by the caller afterwards, a
-    /// crash or an unwritable settings row meant the whole thing ran AGAIN next
-    /// start, and by then the extractor had written rows the regex cannot
-    /// reproduce. The store owns both halves for that reason; callers just call.
-    ///
-    /// ONLY REGEX PHANTOMS ARE IN SCOPE. The keep test is "does the regex
-    /// detector still yield this number", which extractor-written rows fail BY
-    /// CONSTRUCTION — the model found what the regex could not. So a row with
-    /// carrier evidence (`carrier_status_raw` / `last_polled_at`) or extractor
-    /// evidence (`order_ref`) is never judged at all.
-    ///
-    /// A row whose `last_message_id` is NULL is LEFT ALONE too: there is no
-    /// evidence to re-judge it on (an older daemon wrote it, or only a carrier
-    /// poll has touched it), and deleting on absent evidence drops live packages.
-    ///
-    /// SECURITY: the detector never runs on sealed mail, so the join skips any
-    /// feeder whose triage row is not `sensitivity='normal'` — those rows keep
-    /// the structural guarantee they already have (sealing deletes the shipment).
-    pub(super) fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {
-        let mut conn = self.lock()?;
-        let done: Option<String> = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
-                params![account_id, SHIPMENTS_REDETECT_FLAG],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if done.as_deref() == Some("done") {
-            return Ok(0);
-        }
-
-        let tx = conn.transaction()?;
-        let rows: Vec<(i64, String, String, String, String)> = {
-            let mut stmt = tx.prepare(
-                "SELECT s.id, s.tracking_number, m.from_addr, m.subject, m.body
-                 FROM shipments s
-                 JOIN messages m
-                   ON m.id = s.last_message_id AND m.account_id = s.account_id
-                 LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
-                 WHERE s.account_id = ?1
-                   AND COALESCE(t.sensitivity, 'normal') = 'normal'
-                   AND s.carrier_status_raw IS NULL
-                   AND s.last_polled_at IS NULL
-                   AND s.order_ref IS NULL",
-            )?;
-            stmt.query_map(params![account_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-
-        let mut deleted = 0u64;
-        for (id, tracking_number, from_addr, subject, body) in rows {
-            // Keep ONLY when the same message still yields the SAME number: a
-            // different number means the row was minted from a candidate the
-            // tightened gates now reject, and the surviving number gets its own
-            // row from the next ingest of that mail.
-            let still_detected = crate::triage::detect_shipment(&from_addr, &subject, &body)
-                .is_some_and(|s| s.tracking_number == tracking_number);
-            if !still_detected {
-                deleted += tx.execute(
-                    "DELETE FROM shipments WHERE account_id=?1 AND id=?2",
-                    params![account_id, id],
-                )? as u64;
-            }
-        }
-
-        tx.execute(
-            "INSERT INTO app_settings(account_id, key, value)
-             VALUES(?1, ?2, 'done')
-             ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value",
-            params![account_id, SHIPMENTS_REDETECT_FLAG],
-        )?;
-        tx.commit()?;
-        Ok(deleted)
+    /// Kept for older maintenance callers. Re-triage schedules the agent; it
+    /// never re-detects or deletes records using legacy regular expressions.
+    pub(super) fn shipments_redetect_cleanup(&self, _account_id: AccountId) -> Result<u64> {
+        Ok(0)
     }
 
-    /// One-shot repair: re-run the (fixed) total extraction over each receipt
-    /// row's own message and correct the stored amount where the two disagree.
-    /// Returns the number of rows corrected, and 0 once the pass has already run
-    /// for this account.
-    ///
-    /// WHY THERE IS A PASS AT ALL. The amount patterns admitted a two-digit
-    /// fraction and nothing longer, so a sender printing an unrounded binary
-    /// float — Amazon ships `67.28999999999999 USD` as an order total — matched
-    /// nothing at the start of the number and matched beautifully in the MIDDLE
-    /// of it. The stored total became the fractional tail: five figures on a real
-    /// mailbox, one of them a $29 trillion Amazon order sitting on the receipts
-    /// card. Reparsing is the only way back, because the wrong number carries no
-    /// trace of the right one.
-    ///
-    /// AND IT IS NOT ONLY COSMETIC: [`auto_close_bill_for_receipt_conn`] settles
-    /// an open bill by comparing a receipt's amount against it, so a mis-parsed
-    /// total is a wrong answer in a second place that nobody is looking at.
-    ///
-    /// ATOMIC WITH ITS OWN DONE-FLAG, for the same reason as
-    /// [`SqliteStore::shipments_redetect_cleanup`]: the corrections and the flag
-    /// commit together, so the pass can never complete unrecorded.
-    ///
-    /// A NULL amount is a legal receipt state and is filled in when the parser
-    /// now finds a total, since that is the same regex change being applied. The
-    /// reverse never happens: a re-parse that finds NOTHING leaves the stored
-    /// amount standing rather than clearing it, because absent evidence is not
-    /// evidence of absence. Rows whose message is gone are skipped for the same
-    /// reason — there is nothing left to re-read.
-    ///
-    /// SECURITY: the detector never runs on sealed mail, so the join skips any
-    /// message whose triage row is not `sensitivity='normal'`.
-    pub(super) fn receipts_reparse_cleanup(&self, account_id: AccountId) -> Result<u64> {
-        let mut conn = self.lock()?;
-        let done: Option<String> = conn
-            .query_row(
-                "SELECT value FROM app_settings WHERE account_id = ?1 AND key = ?2",
-                params![account_id, RECEIPTS_REPARSE_FLAG],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if done.as_deref() == Some("done") {
-            return Ok(0);
-        }
-
-        let tx = conn.transaction()?;
-        // IDS FIRST, BODIES ONE AT A TIME. Selecting the bodies alongside the
-        // ids materialized every receipt's full message text into a single Vec:
-        // measured at ~160 MB for 4,000 receipts, and bodies are stored
-        // uncapped. A hosted tenant pod requests 384Mi and this crate has been
-        // global-OOM-killed on that box before, so the repair must not scale its
-        // peak memory with the mailbox. An id list does; a body list does not.
-        let ids: Vec<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT r.id
-                 FROM receipts r
-                 JOIN messages m
-                   ON m.id = r.message_id AND m.account_id = r.account_id
-                 LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
-                 WHERE r.account_id = ?1
-                   AND COALESCE(t.sensitivity, 'normal') = 'normal'
-                 ORDER BY r.id",
-            )?;
-            stmt.query_map(params![account_id], |r| r.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-
-        let mut corrected = 0u64;
-        for id in ids {
-            // The sensitivity guard is REPEATED here rather than trusted from
-            // the id query above, because this is the statement that actually
-            // reads a body: a detector must never run over sealed mail, and the
-            // check belongs where the read happens.
-            //
-            // AND IT IS LOAD-BEARING, not decoration. An earlier draft of this
-            // comment said the state was "unreachable through the store" once
-            // `feedback.rs` scrubbed receipts on seal. That is wrong, and two
-            // reviewers reproduced it: SEALING HAS TWO ENTRANCES. `correct_triage`
-            // is the one this crate scrubs; the other is a RE-INGEST, where the
-            // triage upsert refreshes `sensitivity` from fresh detection for any
-            // row a human did not seal by hand (see `messages.rs`), flipping
-            // normal to sealed while merely SKIPPING the specialist write rather
-            // than deleting what is already there. A receipt row on a sealed
-            // message is therefore reachable today, through the public ingest
-            // path, and legacy rows predate the scrub besides.
-            //
-            // So this clause is the thing stopping a repair pass from re-reading
-            // a sealed body. Do not remove it on the strength of the scrub.
-            type Row = (
-                Option<f64>,
-                String,
-                Option<String>,
-                i64,
-                String,
-                String,
-                String,
-            );
-            let row: Option<Row> = tx
-                .query_row(
-                    "SELECT r.amount, r.from_addr, r.from_name, r.message_id, r.received_at,
-                            m.subject, m.body
-                     FROM receipts r
-                     JOIN messages m
-                       ON m.id = r.message_id AND m.account_id = r.account_id
-                     LEFT JOIN triage t ON t.message_id = m.id AND t.account_id = m.account_id
-                     WHERE r.account_id = ?1 AND r.id = ?2
-                       AND COALESCE(t.sensitivity, 'normal') = 'normal'",
-                    params![account_id, id],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((stored, from_addr, from_name, message_id, received_raw, subject, body)) = row
-            else {
-                continue;
-            };
-            // NEVER CLEAR ON ABSENT EVIDENCE. A re-parse that finds no total is
-            // not testimony that the stored one is wrong - the body may have
-            // been re-ingested since, or hold a total this pass's patterns do
-            // not reach. Same rule the shipment re-detect follows for a row with
-            // no feeder message: a repair pass corrects what it can read and
-            // leaves alone what it cannot.
-            let Some(fresh) = crate::triage::recompute_total(&from_addr, &subject, &body) else {
-                continue;
-            };
-            if same_cents(stored, Some(fresh)) {
-                continue;
-            }
-            corrected += tx.execute(
-                "UPDATE receipts SET amount = ?3, currency = COALESCE(currency, 'USD')
-                 WHERE account_id = ?1 AND id = ?2",
-                params![account_id, id, fresh],
-            )? as u64;
-
-            // THE SECOND PLACE. A receipt settles an open bill by comparing its
-            // amount, so a total mis-parsed into the trillions failed
-            // `amounts_permit_close` and left the matching bill standing. Fixing
-            // the number without re-asking the question would leave that bill
-            // open forever, which is the more expensive half of the bug: a card
-            // reading wrong is visible, a bill that never closes is not.
-            // A receipt row whose stamp will not parse is not worth failing the
-            // whole repair over; the amount is already corrected either way.
-            let Ok(received_at) = DateTime::parse_from_rfc3339(&received_raw) else {
-                continue;
-            };
-            let _ = auto_close_bill_for_receipt_conn(
-                &tx,
-                account_id,
-                message_id,
-                &from_addr,
-                from_name.as_deref(),
-                &crate::triage::ReceiptInfo {
-                    amount: Some(fresh),
-                    currency: Some("USD".to_string()),
-                },
-                received_at.with_timezone(&Utc),
-            )?;
-        }
-
-        tx.execute(
-            "INSERT INTO app_settings(account_id, key, value)
-             VALUES(?1, ?2, 'done')
-             ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value",
-            params![account_id, RECEIPTS_REPARSE_FLAG],
-        )?;
-        tx.commit()?;
-        Ok(corrected)
+    /// Legacy repair is intentionally inert. Stored financial facts are revised
+    /// by an evidence-backed agent decision, not by reparsing their source text.
+    pub(super) fn receipts_reparse_cleanup(&self, _account_id: AccountId) -> Result<u64> {
+        Ok(0)
     }
 
     pub(super) fn list_pollable_shipments(
@@ -1375,8 +972,7 @@ impl SqliteStore {
 
     pub(super) fn list_receipts(&self, account_id: AccountId, days: u32) -> Result<Vec<Receipt>> {
         let conn = self.lock()?;
-        // No sealed filter needed: detection never runs on sealed mail, so the
-        // table holds no sealed rows by construction.
+        // Human records remain readable when their source is restricted to agents.
         let since = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
         let mut stmt = conn.prepare(
             "SELECT rc.id, rc.account_id, rc.message_id, m.thread_id, rc.from_addr,
@@ -1408,23 +1004,13 @@ impl SqliteStore {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let id = upsert_banking_conn(&tx, applied)?;
-        // Stamp the extractor marker (leaving the extract queue) and, for a
-        // RECORD (statement/alert), resolve the row to 'done' so it leaves the
-        // attention bands. The sensitivity='normal' guard keeps a sealed row from
-        // ever being mutated here.
-        let now_s = Utc::now().to_rfc3339();
+        // Extraction stores facts. It cannot complete a user's obligation.
         tx.execute(
-            "UPDATE triage SET
-                 extractor_model_used = ?3,
-                 status = CASE WHEN ?4 = 1 THEN 'done' ELSE status END,
-                 resolved_at = CASE WHEN ?4 = 1 THEN ?5 ELSE resolved_at END
-             WHERE message_id = ?1 AND account_id = ?2 AND sensitivity = 'normal'",
+            "UPDATE triage SET extractor_model_used=?3 WHERE message_id=?1 AND account_id=?2",
             params![
                 applied.message_id,
                 applied.account_id,
-                applied.extractor_model_used,
-                applied.auto_resolve as i64,
-                now_s,
+                applied.extractor_model_used
             ],
         )?;
         tx.commit()?;

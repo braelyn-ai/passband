@@ -97,4 +97,3 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         }
     }
 }
-

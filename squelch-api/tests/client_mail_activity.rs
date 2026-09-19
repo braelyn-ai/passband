@@ -80,6 +80,8 @@ async fn buckets_each_day_and_keeps_spam_and_sent_out_of_the_tiers() {
             Tier::Noise,
             Sensitivity::Normal,
         );
+        // Legacy sensitivity alone is no longer an auth assessment. It remains
+        // ordinary human inventory until the canonical model decision arrives.
         seed(
             store,
             acct,
@@ -140,11 +142,12 @@ async fn buckets_each_day_and_keeps_spam_and_sent_out_of_the_tiers() {
             "day": day_key(1),
             "received": 4,
             "sent": 1,
-            "sealed": 1,
+            "sealed": 0,
             "past_due": 1,
             "deadline": 0,
             "signal": 1,
-            "noise": 1,
+            "noise": 2,
+            "pending": 0,
         })
     );
     assert_eq!(rows[1]["day"], day_key(0));

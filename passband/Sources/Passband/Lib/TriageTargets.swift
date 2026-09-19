@@ -1,166 +1,102 @@
-// Correction targets for the triage-fix palette (`v`), and the prefix matcher
-// that turns what you type into one of them.
-//
-// Every `value` must exist in TriageAxis::allowed (squelch-core/src/types.rs) —
-// the server 400s anything else, and a feedback pair only means something if the
-// human's label is one the model could itself have produced. BANDS ARE NOT
-// LABELS: "For your eyes" is a server query over tiers, so band words map onto
-// the tiers that constitute it (see `lands`) rather than a value that would 400.
-
+// Explicit user corrections. Kinds describe mail; destinations and external
+// access are independent. Restricting agents never hides mail from its owner.
 import Foundation
 
 enum TriageAxis: String, Sendable, Hashable {
-    case tier, category, sensitivity
+    case kinds, destinations
+    case showInFye = "show_in_fye"
+    case externalAccess = "external_access"
 
-    /// "sensitivity" is the column name, not a word anyone thinks in — the chip
-    /// says what the axis MEANS.
-    var chipLabel: String { self == .sensitivity ? "auth" : rawValue }
+    var chipLabel: String {
+        switch self {
+        case .kinds: "kind"
+        case .destinations: "place"
+        case .showInFye: "attention"
+        case .externalAccess: "agents"
+        }
+    }
 }
 
-/// What a correction does to the row's current band membership, by the server's
-/// own predicates. The palette applies exactly this and no more — modelling a
-/// move the server does not make flickers when the forced refresh undoes it.
-enum CorrectionExit: Sendable {
-    /// Nothing moves: `/client/updates` buckets on tier, status and surfaced_at
-    /// only, so a category is not a band.
-    case stays
-    /// Leaves For-your-eyes only — `new`/`open` are defined by surfaced_at and
-    /// status, which a tier correction does not touch.
-    case standing
-    /// Leaves every band — the base predicate excludes `sensitivity = 'sealed'`.
-    case allBands
+/// List edits carry intent, so a pending or concurrently updated decision keeps
+/// unrelated kinds and destinations. Scalar corrections remain explicit values.
+struct TriageCorrectionRequest: Encodable {
+    var field: String
+    var value: Bool?
+    var add: [String]?
+    var remove: [String]?
+
+    init(_ target: TriageTarget) {
+        field = target.axis.rawValue
+        switch target.axis {
+        case .kinds, .destinations:
+            add = target.removes ? [] : [target.value]
+            remove = target.removes ? [target.value] : []
+        case .showInFye, .externalAccess:
+            value = target.value == "true"
+        }
+    }
 }
 
 struct TriageTarget: Identifiable, Hashable, Sendable {
     var axis: TriageAxis
-    /// The wire value. Must be in TriageAxis::allowed server-side.
     var value: String
-    /// What the human sees.
     var label: String
-    /// One line on when this is the right answer.
     var hint: String
-    /// Extra words that should match this target.
     var aliases: [String]
-    /// Words that SURFACE this target without naming it. Ranked below aliases on
-    /// purpose: "important" names `signal`, so Enter must keep writing `signal`
-    /// while the band's real tiers still appear under it.
     var nudges: [String] = []
+    var removes = false
 
-    var id: String { "\(axis.rawValue):\(value)" }
+    var id: String { "\(axis.rawValue):\(value):\(removes)" }
 
-    /// Which sitrep surface this value PUTS the mail on, by server predicate
-    /// rather than heuristic. nil = it places nothing, and the row stays silent
-    /// rather than implying a move.
-    var lands: String? {
-        switch (axis, value) {
-        // standing = a dated obligation OR live correspondence: tier IN
-        // ('past_due','deadline'), OR a thread the user has written in, OR a
-        // sender the user has written to (contacts.sent_count > 0) — all AND
-        // status != 'done', and never sealed or the user's own sent mail. Only
-        // the tier arm is reachable from a correction: the correspondence arms
-        // are facts about the thread, not values this palette can write.
-        case (.tier, "past_due"), (.tier, "deadline"): "For your eyes"
-        // Every band excludes sealed mail, and the Auth page IS that set.
-        case (.sensitivity, "sealed"): "Auth"
-        default: nil
-        }
-    }
-
-    /// See CorrectionExit — the inverse of `lands`, for the band it leaves.
-    var exit: CorrectionExit {
-        switch (axis, value) {
-        // A signal/noise correction does NOT exit standing: the band's
-        // correspondence arms are tier-independent, and nothing on the wire
-        // says which arm admitted a row. Optimistically removing one that
-        // stands on correspondence just makes it vanish and reappear a round
-        // trip later, so .stays is the only truthful mapping; a tier-arm row
-        // lingers one refresh instead.
-        case (.sensitivity, "sealed"): .allBands
-        default: .stays
-        }
+    /// List corrections preserve other kinds and overlapping destinations.
+    func correctedValues(_ current: [String]) -> [String] {
+        if removes { return current.filter { $0 != value } }
+        return current.contains(value) ? current : current + [value]
     }
 }
 
 enum TriageTargets {
-    static let all: [TriageTarget] = [
-        // --- categories: what KIND of mail this is ---------------------------
-        TriageTarget(
-            axis: .category, value: "invoice", label: "Invoice",
-            hint: "a bill you owe and have to pay",
-            aliases: ["bill", "billing", "invoice", "owe", "payment", "due"]),
-        TriageTarget(
-            axis: .category, value: "autopay_bill", label: "Autopay bill",
-            hint: "a bill that pays itself; a record, not a task",
-            aliases: ["autopay", "auto", "bill", "billing", "subscription", "recurring"]),
-        TriageTarget(
-            axis: .category, value: "banking_statement", label: "Bank statement",
-            hint: "a periodic statement — a record",
-            aliases: ["statement", "bank", "banking", "balance"]),
-        TriageTarget(
-            axis: .category, value: "transaction_alert", label: "Transaction alert",
-            hint: "a charge or activity notice",
-            aliases: ["transaction", "charge", "alert", "spend", "purchase"]),
-        TriageTarget(
-            axis: .category, value: "marketing", label: "Marketing",
-            hint: "a sale, offer, newsletter or promo blast",
-            aliases: [
-                "marketing", "newsletter", "promo", "promotional", "ad", "advertising", "sale",
-                "offer", "deal",
-            ]),
-        TriageTarget(
-            axis: .category, value: "general", label: "General",
-            hint: "none of the money categories",
-            aliases: ["general", "none", "other", "plain"]),
-
-        // --- auth: the sealed axis -------------------------------------------
-        // Not a category but `triage.sensitivity`, and the axis with real
-        // consequences: sealed mail is structurally absent from the agent door,
-        // so moving mail in RESTRICTS what an agent can see and moving it out
-        // EXPOSES it. See docs/SECURITY.md §4.
-        TriageTarget(
-            axis: .sensitivity, value: "sealed", label: "Auth",
-            hint: "a code, reset or sign-in alert; hides it from agents",
-            aliases: [
-                "auth", "sealed", "seal", "code", "otp", "2fa", "mfa", "login", "signin",
-                "verification", "password", "reset",
-            ]),
-        TriageTarget(
-            axis: .sensitivity, value: "normal", label: "Not auth",
-            hint: "wrongly sealed; unhides it from agents",
-            aliases: ["notauth", "unseal", "unsealed", "normal", "notsealed"]),
-
-        // --- tiers: how much it should DEMAND of you -------------------------
-        // Tier is what places mail: past_due and deadline ARE the For-your-eyes
-        // band, so the band words live on those two and on neither of the
-        // others — aliasing "for your eyes" onto `signal` would write a value
-        // definitionally not in that band.
-        TriageTarget(
-            axis: .tier, value: "past_due", label: "Past due",
-            hint: "a deadline that has already passed",
-            aliases: ["pastdue", "past", "overdue", "late"],
-            // Ranks below Deadline for the band words: both land in
-            // For-your-eyes, but "past due" also asserts the date has PASSED.
-            nudges: ["foryoureyes", "fye", "eyes", "important"]),
-        TriageTarget(
-            axis: .tier, value: "deadline", label: "Deadline",
-            hint: "has a date you must act by",
-            aliases: ["deadline", "due", "date", "foryoureyes", "fye", "eyes"],
-            nudges: ["important"]),
-        TriageTarget(
-            axis: .tier, value: "signal", label: "Signal",
-            hint: "worth your attention, no deadline",
-            // "important" stays the name of THIS tier: plenty of important mail
-            // has no date, and demoting it would make Enter write a deadline
-            // claim onto mail that has none.
-            aliases: ["signal", "important", "attention"]),
-        TriageTarget(
-            axis: .tier, value: "noise", label: "Noise",
-            hint: "should not have surfaced at all",
-            // The marketing words deliberately do NOT live here: conflating
-            // "this IS marketing" with "this should not have surfaced" teaches
-            // the dataset that every promo is unwanted.
-            aliases: ["noise", "junk", "ignore", "spam", "quiet"]),
+    private static let kindDefinitions: [(String, String, [String])] = [
+        ("correspondence", "Correspondence", ["personal", "conversation", "reply"]),
+        ("editorial", "Editorial", ["newsletter", "digest", "essay"]),
+        ("promotional", "Promotion", ["sale", "offer", "marketing", "ad"]),
+        ("bill", "Bill", ["invoice", "payment", "autopay"]),
+        ("receipt", "Receipt", ["purchase", "confirmation"]),
+        ("financial_update", "Financial update", ["statement", "banking", "transaction"]),
+        ("delivery", "Delivery", ["shipment", "shipping", "tracking"]),
+        ("event_reservation", "Event or reservation", ["calendar", "travel", "appointment"]),
+        ("account_service", "Account or service", ["support", "service"]),
+        ("authentication_security", "Authentication or security", ["auth", "login", "verification"]),
+        ("general", "General", ["other"]),
     ]
+
+    static let all: [TriageTarget] = [
+        TriageTarget(axis: .showInFye, value: "true", label: "For your eyes",
+            hint: "Show this thread in your attention list", aliases: ["fye", "eyes", "important", "attention"]),
+        TriageTarget(axis: .showInFye, value: "false", label: "Remove from For your eyes",
+            hint: "Keep the mail, remove it from your attention list", aliases: ["quiet", "noise", "ignore", "notimportant"]),
+        TriageTarget(axis: .destinations, value: "reading", label: "Add to Reading",
+            hint: "Keep any Records placement too", aliases: ["reading", "readlater"]),
+        TriageTarget(axis: .destinations, value: "reading", label: "Remove from Reading",
+            hint: "Keep other placements", aliases: ["notreading", "removereading"], removes: true),
+        TriageTarget(axis: .destinations, value: "records", label: "Add to Records",
+            hint: "Keep any Reading placement too", aliases: ["records", "record"]),
+        TriageTarget(axis: .destinations, value: "records", label: "Remove from Records",
+            hint: "Keep other placements", aliases: ["notrecords", "removerecords"], removes: true),
+        TriageTarget(axis: .externalAccess, value: "true", label: "Restrict agent access",
+            hint: "Contains a code, reset link, or sign-in credential; you can still read it",
+            aliases: ["sealed", "seal", "2fa", "otp", "code", "reset", "magiclink", "private"]),
+        TriageTarget(axis: .externalAccess, value: "false", label: "Allow agent access",
+            hint: "Contains no access-granting credential",
+            aliases: ["unseal", "allowed", "allowagent", "notsealed"]),
+    ] + kindDefinitions.flatMap { value, label, aliases in
+        [
+            TriageTarget(axis: .kinds, value: value, label: label,
+                hint: "Add this kind without changing where the mail appears", aliases: aliases),
+            TriageTarget(axis: .kinds, value: value, label: "Remove \(label.lowercased()) kind",
+                hint: "Keep the other kinds and placements", aliases: ["not" + value], removes: true),
+        ]
+    }
 
     /// Normalize for matching: lowercase, and underscores/spaces are the same.
     private static func norm(_ s: String) -> String {

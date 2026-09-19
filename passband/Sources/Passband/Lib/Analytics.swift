@@ -153,6 +153,10 @@ enum Analytics {
             "to", "bcc", "individual",
             // triage_corrected axes and wire values — the daemon's closed
             // TriageAxis::allowed vocabulary, mirrored in TriageTargets.
+            "kinds", "destinations", "show_in_fye", "external_access", "true", "false",
+            "reading", "records", "correspondence", "editorial", "promotional", "bill",
+            "receipt", "financial_update", "delivery", "event_reservation", "account_service",
+            "authentication_security",
             "tier", "category", "sensitivity",
             "past_due", "deadline", "signal", "noise",
             "invoice", "autopay_bill", "banking_statement", "transaction_alert",

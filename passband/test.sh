@@ -48,6 +48,8 @@ run_suite credential-probe \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Model/APIError.swift \
   Sources/Passband/Model/APIClient.swift \
+  Sources/Passband/Lib/TriageTargets.swift \
+  Sources/Passband/Assistant/JSONValue.swift \
   Tests/CredentialProbeTests.swift
 
 run_suite anthropic-stream \
@@ -345,3 +347,23 @@ run_suite tour-controller \
 run_suite recent-search-ring \
   Sources/Passband/Lib/RecentSearchRing.swift \
   Tests/RecentSearchRingTests.swift
+
+# Field-scoped corrections must preserve overlapping destinations and keep
+# authentication kinds separate from external access restrictions.
+run_suite triage-targets \
+  Sources/Passband/Lib/TriageTargets.swift \
+  Tests/TriageTargetsTests.swift
+
+run_suite capability-probe \
+  Sources/Passband/Model/APIError.swift \
+  Tests/CapabilityProbeTests.swift
+
+# Reading groups canonical membership without reconstructing triage from copy.
+run_suite reading \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Sources/Passband/Lib/Reading.swift \
+  Tests/ReadingTests.swift

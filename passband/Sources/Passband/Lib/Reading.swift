@@ -1,23 +1,15 @@
-// The Sitrep's reading zone — recurring noise-tier senders, and the
-// rule-onboarding CTA when no rule governs them yet.
-//
-// NOT ALL NEWSLETTERS, which is why the zone is not called that: a digest, a
-// product announcement, a forum roundup and a promo blast all land here on the
-// same qualification, and only some of them are anyone's newsletter.
-//
-// Qualification prefers a real `marketing` classification (GET
-// /client/marketing). The reason-string / recurring-robot fallback is a
-// migration bridge: it applies ONLY while nothing has been categorized yet.
+// Reading cards group the messages selected by the triage agent.
+// Sender preferences are shown as context, never used to filter this feed.
 
 import Foundation
 
-/// A reading card: one recurring noise sender for the window.
+/// A Reading card groups agent-selected messages from one sender.
 struct ReadingSender: Identifiable, Hashable, Sendable {
     /// Grouping key = bare lowercased address.
     var address: String
     /// A representative raw sender string (for avatar + display name).
     var sender: String
-    /// Count of qualifying noise messages in the window.
+    /// Count of selected messages in the window.
     var count: Int
     /// Latest one_line in the window (the summary line).
     var summary: String
@@ -35,31 +27,9 @@ struct ReadingSender: Identifiable, Hashable, Sendable {
 }
 
 enum Reading {
-    /// Exact rung-5 reason literals we key off (substring, case-insensitive).
-    private static let bulkReason = "unsubscribe footer"
-    private static let receiptReason = "order confirmation / receipt"
-
-    /// List-mail shape, whatever genre it is — the word "newsletter" is only one
-    /// of the several things the engine writes for it.
-    private static func isBulkReason(_ reason: String) -> Bool {
-        let r = reason.lowercased()
-        if r.contains(bulkReason) { return true }
-        return r.firstMatch(
-            of: /(?i)\b(unsubscribe|newsletter|bulk\/list|mailing list|marketing|promotional|digest)\b/
-        ) != nil
-    }
-
-    private static func isReceiptReason(_ reason: String) -> Bool {
-        let r = reason.lowercased()
-        if r.contains(receiptReason) { return true }
-        return r.firstMatch(
-            of: /(?i)\b(order confirmation|receipt|your order|shipment|shipped|tracking)\b/) != nil
-    }
-
-    /// Date proxy for a noise update (no received_at on the wire model).
-    private static func dateOf(_ u: AttentionUpdate) -> Double {
-        guard let d = Fmt.date(u.surfaced_at ?? u.resolved_at) else { return 0 }
-        return d.timeIntervalSince1970
+    /// The adapter carries the server's real received timestamp here.
+    private static func dateOf(_ update: AttentionUpdate) -> Double {
+        Fmt.date(update.surfaced_at)?.timeIntervalSince1970 ?? 0
     }
 
     /// Glob match for a rule's match_pattern ("*@acme.com") against a bare
@@ -96,94 +66,29 @@ enum Reading {
         }
     }
 
-    private static let weekSeconds: Double = 7 * 86400
-
-    /// Derive reading cards from a batch of noise-tier updates.
+    /// Group messages already selected for Reading by the agent. Grouping is
+    /// presentation only: no sender shape, category, score or repetition test.
     static func derive(
-        updates: [AttentionUpdate],
-        rules: [SenderRule],
-        marketingIds: Set<Int> = [],
-        since: Double? = nil,
-        limit: Int = 24,
-        now: Date = Date()
+        updates: [AttentionUpdate], rules: [SenderRule], limit: Int = 24
     ) -> [ReadingSender] {
-        let cutoff = since ?? (now.timeIntervalSince1970 - weekSeconds)
-
-        struct Bucket {
-            var sender: String
-            var total = 0
-            var bulkHits = 0
-            var receiptHits = 0
-            /// Messages of this sender the pipeline categorized `marketing`.
-            var marketingHits = 0
-            var robot: Bool
-            var latest: Double = 0
-            var summary = ""
-            var latestThreadId = ""
-            var items: [AttentionUpdate] = []
-        }
-        var byAddr: [String: Bucket] = [:]
-        var order: [String] = []
-
-        for u in updates {
-            // Excludes receipts: the server auto-resolves receipt-classified
-            // mail to status='done' at ingest, and a settled record is not
-            // recurring noise to onboard a rule for.
-            if u.status == .done { continue }
-            if dateOf(u) < cutoff { continue }
-            let address = SenderID.address(u.sender)
-            guard address.contains("@") else { continue }
-
-            if byAddr[address] == nil {
-                byAddr[address] = Bucket(
-                    sender: u.senderString,
-                    robot: SenderID.isRobot(u.sender) || SenderID.isBrand(u.sender))
-                order.append(address)
+        let groups = Dictionary(grouping: updates) { SenderID.address($0.sender) }
+        return groups.compactMap { address, messages -> ReadingSender? in
+            let ordered = messages.sorted {
+                let lhs = dateOf($0), rhs = dateOf($1)
+                return lhs == rhs ? $0.id > $1.id : lhs > rhs
             }
-            byAddr[address]!.total += 1
-            byAddr[address]!.items.append(u)
-            if marketingIds.contains(u.id) { byAddr[address]!.marketingHits += 1 }
-            if isBulkReason(u.reason) { byAddr[address]!.bulkHits += 1 }
-            if isReceiptReason(u.reason) { byAddr[address]!.receiptHits += 1 }
-            let d = dateOf(u)
-            if d >= byAddr[address]!.latest {
-                byAddr[address]!.latest = d
-                if !u.one_line.isEmpty { byAddr[address]!.summary = u.one_line }
-                byAddr[address]!.latestThreadId = u.thread_id
-            }
+            guard let latest = ordered.first else { return nil }
+            return ReadingSender(
+                address: address, sender: latest.senderString, count: ordered.count,
+                summary: latest.one_line, latest: dateOf(latest),
+                latestThreadId: latest.thread_id, items: ordered,
+                rule: rule(for: address, in: rules))
         }
-
-        var out: [ReadingSender] = []
-        for address in order {
-            guard let b = byAddr[address] else { continue }
-            // Exclude senders whose window is entirely receipts (order updates,
-            // not something anyone reads) with no list-mail signal at all.
-            let allReceipts = b.receiptHits > 0 && b.bulkHits == 0 && b.marketingHits == 0
-            if allReceipts { continue }
-
-            let qualifies =
-                marketingIds.isEmpty
-                ? (b.bulkHits > 0 || (b.robot && b.total >= 2))
-                : b.marketingHits > 0
-            guard qualifies else { continue }
-
-            out.append(
-                ReadingSender(
-                    address: address,
-                    sender: b.sender,
-                    count: b.total,
-                    summary: b.summary,
-                    latest: b.latest,
-                    latestThreadId: b.latestThreadId,
-                    items: b.items.sorted { dateOf($0) > dateOf($1) },
-                    rule: rule(for: address, in: rules)))
-        }
-
-        // Newest activity first; ties break on higher volume.
-        out.sort { a, b in a.latest != b.latest ? a.latest > b.latest : a.count > b.count }
-        return Array(out.prefix(limit))
+        .sorted { $0.latest == $1.latest ? $0.address < $1.address : $0.latest > $1.latest }
+        .prefix(limit).map { $0 }
     }
 
+    /// The `*@domain` pattern a newsletter CTA prefills into the rule editor.
     /// Drop already-resolved messages from a derived window, recomputing the
     /// fields taken from the newest survivor and removing any sender left with
     /// nothing at all.
@@ -196,13 +101,13 @@ enum Reading {
     /// undo clears it, so a restored message brings its card straight back.
     static func prune(_ senders: [ReadingSender], resolved: Set<Int>) -> [ReadingSender] {
         guard !resolved.isEmpty else { return senders }
-        return senders.compactMap { rs in
-            let live = rs.items.filter { !resolved.contains($0.id) }
-            if live.count == rs.items.count { return rs }
+        return senders.compactMap { nl in
+            let live = nl.items.filter { !resolved.contains($0.id) }
+            if live.count == nl.items.count { return nl }
             // Nothing left in the window: the card goes, rather than sitting
             // there at zero until the poll agrees.
             guard let newest = live.first else { return nil }
-            var out = rs
+            var out = nl
             out.items = live
             out.count = live.count
             // `derive` sorts items newest-first and takes these three from the
@@ -214,7 +119,6 @@ enum Reading {
         }
     }
 
-    /// The `*@domain` pattern a card's CTA prefills into the rule editor.
     static func domainPattern(_ address: String) -> String {
         let domain =
             SenderID.faviconDomain(address) ?? address.split(separator: "@").last.map(String.init)

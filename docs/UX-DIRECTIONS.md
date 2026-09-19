@@ -363,6 +363,12 @@ twice a week, which is equally true of a product announcement, a forum digest,
 a status feed and a promo blast. The zone is named for what the reader does
 with the pile, not for a genre it never actually identified.
 
+**Agent-triage update:** Reading now comes from explicit model destination
+membership, including promotions. Clients group those results for presentation;
+they do not infer membership from sender patterns or old reason strings. The
+current feed defaults to unfinished mail from the last 30 days. The bullets below
+describe the historical rule-onboarding design, not the current qualification path.
+
 - **Data:** fetches `tier=noise` updates (`limit 200`) plus `listRules()`,
   filters to the last 7 days client-side (the wire `AttentionUpdate` carries no
   `received_at`, so we date on `surfaced_at`), and groups by sender address.

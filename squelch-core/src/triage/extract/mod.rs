@@ -81,7 +81,7 @@ pub enum RowAction {
 /// specialist can never be added behind a guard that does not know about it.
 ///
 /// `now` is the pass clock, and it is here only for the re-triage force: a row a
-/// human asked for by hand within [`crate::triage::RETRIAGE_FORCE_WINDOW`] runs
+/// human asked for by hand within the legacy 24-hour window runs
 /// however old it is.
 pub fn route_extract_row(
     row: &ExtractQueued,
@@ -95,7 +95,11 @@ pub fn route_extract_row(
     if extract_sealed_guard(row).is_err() {
         return RowAction::Sealed;
     }
-    if row.received_at < stale_cutoff && !crate::triage::retriage_forced(row.retriage_at, now) {
+    if row.received_at < stale_cutoff
+        && row
+            .retriage_at
+            .is_none_or(|at| now - at >= chrono::Duration::hours(24))
+    {
         return RowAction::Stale;
     }
     // NOTHING TO READ IS NOT A QUESTION WORTH ASKING. An extractor pulls a

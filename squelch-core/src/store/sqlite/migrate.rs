@@ -106,6 +106,12 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // through this seam: schema.sql's `CREATE TABLE IF NOT EXISTS` is a no-op
     // against an `events` table that already exists.
     add_column_if_missing(conn, "events", "sealed_kind", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "events",
+        "is_auth",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(is_auth IN (0,1))",
+    )?;
 
     // Two-stage triage markers: `stage1_model_used` gates the Stage-1 LLM queue
     // (NULL == still needs Stage-1), `needs_stage2` is the escalation flag.

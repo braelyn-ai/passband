@@ -41,6 +41,10 @@ final class ThreadPrefetch {
         _ threadId: String, _ view: ClientThreadView, fresh: TimeInterval, gen: Int
     ) {
         guard gen == generation else { return }
+        guard view.cache_allowed == true else {
+            cache.removeValue(forKey: threadId)
+            return
+        }
         _ = cache.set(threadId, Entry(view: view, ts: Date(), fresh: fresh))
         warmBodies(view)
     }

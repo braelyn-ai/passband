@@ -47,6 +47,7 @@ struct UsageSeries: Equatable {
         var deadline = 0
         var signal = 0
         var noise = 0
+        var pending = 0
         var id: String { key }
 
         /// Received mail a verdict exists for: the ratio's denominator. Sealed
@@ -193,6 +194,7 @@ struct UsageSeries: Equatable {
                 day.deadline = r.deadline
                 day.signal = r.signal
                 day.noise = r.noise
+                day.pending = r.pending ?? 0
             }
             mailDays.append(day)
         }

@@ -112,6 +112,17 @@ async fn pump(
         for ev in batch {
             // Advance FIRST: an unencodable event must not stall the cursor.
             cursor = ev.id;
+            let s = store.clone();
+            let event_id = ev.id;
+            if !tokio::task::spawn_blocking(move || {
+                s.notification_delivery_allowed(account_id, event_id)
+            })
+            .await
+            .ok()?
+            .ok()?
+            {
+                continue;
+            }
             match frame(&ev) {
                 Some(f) => tx.send(Ok(f)).await.ok()?,
                 None => continue,

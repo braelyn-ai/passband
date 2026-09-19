@@ -27,6 +27,7 @@ enum Fmt {
 
     static func date(_ iso: String?) -> Date? {
         guard let iso, !iso.isEmpty else { return nil }
+        if iso.count == 10 { return calendarDay(iso) }
         dateCacheLock.lock()
         if let hit = dateCache.get(iso) {
             dateCacheLock.unlock()
@@ -49,8 +50,6 @@ enum Fmt {
         // guards the cache guards the formatters too.
         if let d = isoFractional.date(from: iso) { return d }
         if let d = isoPlain.date(from: iso) { return d }
-        // Bare "YYYY-MM-DD" (marketing expires_at).
-        if iso.count == 10, let d = isoPlain.date(from: iso + "T00:00:00Z") { return d }
         return nil
     }
 
@@ -141,12 +140,36 @@ enum Fmt {
     }
 
     /// Deadline chip text. Past-due shows the overdue span; upcoming a date.
-    static func deadlineChip(_ iso: String?, now: Date = Date()) -> DeadlineChip? {
+    static func deadlineChip(_ iso: String?, now: Date = Date(), calendar: Calendar = .current) -> DeadlineChip? {
+        if let iso, let day = calendarDay(iso, calendar: calendar) {
+            // A date-only obligation is due throughout that local calendar day.
+            let today = calendar.startOfDay(for: now)
+            let days = calendar.dateComponents([.day], from: day, to: today).day ?? 0
+            if days > 0 { return DeadlineChip(text: "\(days)d PAST DUE", overdue: true) }
+            if days == 0 { return DeadlineChip(text: "due today", overdue: false) }
+            let formatter = DateFormatter()
+            formatter.calendar = calendar
+            formatter.timeZone = calendar.timeZone
+            formatter.dateFormat = "MMM d"
+            let label = formatter.string(from: day)
+            return DeadlineChip(text: "due \(label)", overdue: false)
+        }
         guard let t = date(iso) else { return nil }
         if t.timeIntervalSince(now) < 0 {
             return DeadlineChip(text: "\(loudAge(iso, now: now)) PAST DUE", overdue: true)
         }
         return DeadlineChip(text: "due \(shortDate(iso))", overdue: false)
+    }
+
+    /// Parse a calendar fact without manufacturing a midnight-UTC instant.
+    static func calendarDay(_ value: String, calendar: Calendar = .current) -> Date? {
+        let pieces = value.split(separator: "-")
+        guard value.count == 10, pieces.count == 3,
+            let year = Int(pieces[0]), let month = Int(pieces[1]), let day = Int(pieces[2]),
+            let result = calendar.date(from: DateComponents(year: year, month: month, day: day))
+        else { return nil }
+        let actual = calendar.dateComponents([.year, .month, .day], from: result)
+        return actual.year == year && actual.month == month && actual.day == day ? result : nil
     }
 
     /// When a pending reminder comes back, at row scale: "in 40m", "in 3h",

@@ -29,6 +29,12 @@ struct SealedEventTests {
     static var checks = 0
 
     static func main() {
+        expect(EventBanner.shouldPresentForeground(appActive: true, windowVisible: true, isTest: false, isAuth: true), "Authentication pushes interrupt a foreground Mac")
+        expect(!EventBanner.shouldPresentForeground(appActive: true, windowVisible: true, isTest: false, isAuth: false), "Ordinary mail keeps foreground policy")
+        let auth = try! JSONDecoder().decode(Event.self, from: Data("""
+        {"id":99,"message_id":42,"thread_id":"auth","kind":"surfaced","tier":"signal","importance":0,"sender":"Security","one_line":"Login alert","created_at":"2026-09-17T12:00:00Z","is_auth":true}
+        """.utf8))
+        expect(auth.isAuth && EventBanner.copy(for: auth).sound, "Login alerts carry explicit auth and sound even at low importance")
         anOrdinaryEventDecodesWithNoSealedKey()
         aSealedEventCarriesItsKind()
         anUnheardOfKindKeepsItsRawString()
@@ -39,6 +45,30 @@ struct SealedEventTests {
         theAuthBannerStandsAloneWithNoAccountName()
         anUnnamedSenderStillSaysSomething()
         authBannersOfOneMailboxShareAGroup()
+        genericPushStillIdentifiesItsAccountAndEvent()
+        var taps = NotificationTapQueue<Int>()
+        let account = UUID()
+        taps.enqueue(91, accountId: account)
+        expect(taps.take(connected: false) == nil, "Cold-start tap waits for configured connection")
+        expect(taps.pending?.target == 91, "Connection failure does not lose the tap")
+        taps.enqueue(92, accountId: account)
+        let delivered = taps.take(connected: true)
+        expect(delivered?.target == 92 && delivered?.accountId == account, "Newest tap keeps its account through bootstrap")
+        expect(taps.take(connected: true) == nil, "Ready transition drains each tap once")
+        taps.enqueue(93, accountId: account)
+        let failed = taps.take(connected: true)!
+        taps.park(failed)
+        for _ in 0..<3 {
+            expect(taps.take(connected: true) == nil, "Failed switch is not retried by recursive completion drains")
+        }
+        taps.connectionBecameReady()
+        expect(taps.take(connected: true)?.target == 93, "Successful connection enables one new attempt")
+        taps.park(failed)
+        taps.enqueue(94, accountId: account)
+        expect(taps.take(connected: true)?.target == 94, "A newer explicit tap supersedes a parked failure")
+        taps.enqueue(95, accountId: account)
+        taps.park(failed)
+        expect(taps.take(connected: true)?.target == 95, "A tap arriving during the failed switch is not overwritten or blocked")
         theThreadBannerNeverTitlesAnAddress()
         theThreadBannerNeverCarriesADate()
 
@@ -295,4 +325,14 @@ struct SealedEventTests {
             print("  FAIL: \(what)")
         }
     }
+    static func genericPushStillIdentifiesItsAccountAndEvent() {
+        let account = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        let route = EventBanner.unresolvedPush("\(account.uuidString):42")
+        expect(route?.accountId == account, "generic push keeps its account")
+        expect(route?.eventId == 42, "generic push can resolve its exact event")
+        expect(EventBanner.unresolvedPush("42") == nil, "untagged event cannot guess an account")
+        expect(EventBanner.unresolvedPush("\(account.uuidString):-1") == nil, "invalid event is rejected")
+        expect(EventBanner.unresolvedPush("not-an-account:42") == nil, "invalid account is rejected")
+    }
+
 }

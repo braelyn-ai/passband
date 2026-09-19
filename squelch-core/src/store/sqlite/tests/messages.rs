@@ -4,6 +4,24 @@ use super::super::*;
 use super::support::*;
 use crate::types::{SealedKind, Sensitivity, Tier};
 
+/// Install an explicit model access assessment for a storage fixture. Legacy
+/// sensitivity is deliberately independent, so tests cannot accidentally use it
+/// as the new external permission boundary.
+pub(super) fn assess_external(store: &SqliteStore, account: AccountId, message: i64, access: &str) {
+    use crate::store::agent_triage::AgentTriageStore;
+    store
+        .enqueue_agent_triage(account, message, "test-access", false)
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_message_state SET access=?1 WHERE account_id=?2 AND message_id=?3",
+            params![access, account, message],
+        )
+        .unwrap();
+}
+
 #[test]
 fn thread_subject_seeks_thread_in_date_order_after_reopening_old_store() {
     let dir = std::env::temp_dir().join(format!("squelch-thread-index-{}", std::process::id()));
@@ -366,7 +384,7 @@ fn the_thread_view_says_which_messages_are_the_users_own() {
 }
 
 #[test]
-fn attachment_bytes_guards_sealed_overcap_and_unknown() {
+fn human_attachment_bytes_allow_restricted_parents_and_guard_size_and_ownership() {
     let (store, acct) = store();
 
     // Normal parent with a stored attachment and an over-cap (NULL data) one.
@@ -399,8 +417,7 @@ fn attachment_bytes_guards_sealed_overcap_and_unknown() {
     // Unknown id -> None (endpoint -> 404).
     assert!(store.attachment_bytes(acct, 999_999).unwrap().is_none());
 
-    // Sealed parent: attachment is stored, but attachment_bytes hides it
-    // (returns None, indistinguishable from unknown -> 404).
+    // Restricted external access does not prevent the human reading attachments.
     let sid = triaged(acct, "g2", "t2")
         .sealed(SealedKind::Otp)
         .seed(&store);
@@ -414,10 +431,11 @@ fn attachment_bytes_guards_sealed_overcap_and_unknown() {
             Some(b"secret"),
         )
         .unwrap();
-    assert!(
-        store.attachment_bytes(acct, sealed_att).unwrap().is_none(),
-        "sealed parent must hide its attachment bytes"
-    );
+    assess_external(&store, acct, sid, "restricted");
+    let attachment = store.attachment_bytes(acct, sealed_att).unwrap().unwrap();
+    assert_eq!(attachment.2.as_deref(), Some(&b"secret"[..]));
+    let other = store.ensure_account("other@example.com").unwrap();
+    assert!(store.attachment_bytes(other, sealed_att).unwrap().is_none());
 }
 
 #[test]
@@ -516,7 +534,7 @@ fn predating_triage_row_reads_back_as_none() {
 #[test]
 fn round_trips_a_message() {
     let (store, acct) = store();
-    triaged(acct, "g1", "t1")
+    let id = triaged(acct, "g1", "t1")
         .importance(80)
         .tier(Tier::Signal)
         .one_line("Lunch invite")
@@ -530,6 +548,7 @@ fn round_trips_a_message() {
     assert_eq!(updates[0].sender, "alice@example.com");
     assert_eq!(updates[0].tier, Tier::Signal);
 
+    assess_external(&store, acct, id, "allowed");
     let tv = store.thread_view(acct, "t1").unwrap();
     assert_eq!(tv.messages.len(), 1);
     assert_eq!(tv.subject, "Lunch?");
@@ -552,6 +571,10 @@ fn thread_id_for_message_resolves_normal_and_hides_sealed() {
         .sealed(SealedKind::Otp)
         .seed(&store);
 
+    assess_external(&store, acct, normal, "allowed");
+    assess_external(&store, acct, sealed, "restricted");
+    let pending = triaged(acct, "pending", "pending").seed(&store);
+    assert_eq!(store.thread_id_for_message(acct, pending).unwrap(), None);
     assert_eq!(
         store
             .thread_id_for_message(acct, normal)
@@ -568,18 +591,18 @@ fn thread_id_for_message_resolves_normal_and_hides_sealed() {
 }
 
 #[test]
-fn sealed_rows_absent_from_updates_but_present_in_sealed_messages() {
+fn restricted_mail_is_readable_by_humans_but_not_external_agents() {
     let (store, acct) = store();
 
     // A normal message.
-    triaged(acct, "g1", "t1")
+    let allowed = triaged(acct, "g1", "t1")
         .importance(80)
         .tier(Tier::Signal)
         .one_line("Lunch")
         .seed(&store);
 
     // A sealed OTP message in a different thread.
-    triaged(acct, "g2", "t2")
+    let restricted = triaged(acct, "g2", "t2")
         .subject("Your verification code")
         .from("noreply@bank.com")
         .importance(90)
@@ -588,12 +611,15 @@ fn sealed_rows_absent_from_updates_but_present_in_sealed_messages() {
         .reason("otp")
         .seed(&store);
 
-    // ranked_updates must NOT include the sealed row.
+    assess_external(&store, acct, allowed, "allowed");
+    assess_external(&store, acct, restricted, "restricted");
+    assert!(store.thread_view(acct, "t1").is_ok());
+    // Human ranked updates include both rows.
     let updates = store
         .ranked_updates(acct, Utc::now() - chrono::Duration::days(1), None)
         .unwrap();
-    assert_eq!(updates.len(), 1);
-    assert!(updates.iter().all(|u| u.thread_id != "t2"));
+    assert_eq!(updates.len(), 2);
+    assert!(updates.iter().any(|u| u.thread_id == "t2"));
 
     // thread_view on the sealed thread => NotFound.
     let err = store.thread_view(acct, "t2").unwrap_err();
@@ -603,13 +629,8 @@ fn sealed_rows_absent_from_updates_but_present_in_sealed_messages() {
     let err2 = store.thread_view(acct, "does-not-exist").unwrap_err();
     assert!(matches!(err2, CoreError::NotFound));
 
-    // The human-door html variant enforces the SAME guard: a sealed thread
-    // (and a nonexistent one) are both NotFound, so html never leaks a
-    // sealed thread either.
-    assert!(matches!(
-        store.thread_view_with_html(acct, "t2").unwrap_err(),
-        CoreError::NotFound
-    ));
+    // The human can open restricted mail immediately.
+    assert!(store.thread_view_with_html(acct, "t2").is_ok());
     assert!(matches!(
         store
             .thread_view_with_html(acct, "does-not-exist")
@@ -617,15 +638,13 @@ fn sealed_rows_absent_from_updates_but_present_in_sealed_messages() {
         CoreError::NotFound
     ));
 
-    // sealed_messages (local-only) DOES surface it.
-    let sealed = store.sealed_messages(acct).unwrap();
-    assert_eq!(sealed.len(), 1);
-    assert_eq!(sealed[0].thread_id, "t2");
-    assert_eq!(sealed[0].sealed_kind.as_deref(), Some("otp"));
+    // Merely restricting external access does not assert canonical auth kinds.
+    // The dedicated Auth listing requires the model's auth assessment.
+    assert!(store.sealed_messages(acct).unwrap().is_empty());
 }
 
 #[test]
-fn deadlines_exclude_sealed_source() {
+fn human_deadlines_include_restricted_source() {
     let (store, acct) = store();
     let mid = triaged(acct, "g1", "t1")
         .importance(50)
@@ -648,7 +667,7 @@ fn deadlines_exclude_sealed_source() {
     }
 
     let ds = store.deadlines(acct, Some(30)).unwrap();
-    assert!(ds.is_empty(), "sealed-source deadline must be hidden");
+    assert_eq!(ds.len(), 1, "human records remain readable");
 }
 
 #[test]
@@ -691,13 +710,13 @@ fn sealed_body_reveal_audit_and_stats() {
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0].action, "reveal_sealed");
 
-    // stats: 1 signal (t2), 1 sealed.
+    // Human inventory contains both; a legacy seal is not canonical auth.
     let stats = store
         .stats(acct, Utc::now() - chrono::Duration::days(30))
         .unwrap();
-    assert_eq!(stats.total, 1);
+    assert_eq!(stats.total, 2);
     assert_eq!(stats.tier_counts.get("signal").copied(), Some(1));
-    assert_eq!(stats.sealed, 1);
+    assert_eq!(stats.sealed, 0);
 }
 
 #[test]
@@ -1020,11 +1039,10 @@ fn sent_listing_shows_only_sent_mail_newest_first_with_recipients_and_opens() {
 }
 
 #[test]
-fn sent_listing_fails_closed_on_sealed_and_untriaged_rows() {
+fn human_sent_listing_includes_pending_and_restricted_rows() {
     let (store, acct) = store();
     let now = Utc::now();
 
-    // A sealed outbound copy: excluded, exactly as on every other listing.
     triaged(acct, "s-sealed", "t-sealed")
         .is_sent(true)
         .to_addrs("support@bank.com")
@@ -1032,18 +1050,12 @@ fn sent_listing_fails_closed_on_sealed_and_untriaged_rows() {
         .sealed(SealedKind::Otp)
         .seed(&store);
 
-    // A sent row with NO triage row at all (an interrupted ingest). The sealed
-    // guard FAILS CLOSED, so it is excluded rather than assumed harmless.
     triaged(acct, "s-orphan", "t-orphan")
         .is_sent(true)
         .to_addrs("alice@friends.com")
         .received_at(now)
         .upsert(&store);
 
-    // The user's own reply in a thread sealed by a SIBLING message: the reply
-    // itself commits as 'normal' (seal detection is per-message content), but
-    // `thread_view` 404s the whole thread, so the thread-level belt excludes
-    // the row rather than leak "Re: <sealed subject>" behind a dead click.
     triaged(acct, "g-seal-sibling", "t-mixed")
         .sealed(SealedKind::Otp)
         .received_at(now)
@@ -1054,10 +1066,9 @@ fn sent_listing_fails_closed_on_sealed_and_untriaged_rows() {
         .received_at(now)
         .seed(&store);
 
-    // The one well-formed row is all that surfaces.
-    let ok = sent(&store, acct, "s-ok", "alice@friends.com", now);
+    let _ok = sent(&store, acct, "s-ok", "alice@friends.com", now);
     let rows = store.sent_listing(acct, 50, 0).unwrap();
-    assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![ok]);
+    assert_eq!(rows.len(), 4, "all four sent copies remain human-readable");
 }
 
 #[test]
@@ -1186,4 +1197,238 @@ fn inbox_unread_counts_round_trip_and_overwrite_one_row() {
     // Per account: another mailbox's counts are not this one's.
     let other = store.ensure_account("other@example.com").unwrap();
     assert!(store.inbox_unread(other).unwrap().is_none());
+}
+
+#[test]
+fn external_access_handles_shared_source_cycles_and_restriction_changes() {
+    let (store, acct) = store();
+    let a = triaged(acct, "cycle-a", "cycle").seed(&store);
+    let b = triaged(acct, "cycle-b", "cycle").seed(&store);
+    assess_external(&store, acct, a, "allowed");
+    assess_external(&store, acct, b, "allowed");
+    {
+        let conn = store.lock().unwrap();
+        for (target, source) in [(a, b), (b, a)] {
+            conn.execute(
+                "INSERT INTO agent_decision_sources(account_id,message_id,source_message_id,source_revision)
+                 SELECT ?1,?2,?3,revision FROM agent_message_state WHERE account_id=?1 AND message_id=?3",
+                params![acct, target, source],
+            ).unwrap();
+        }
+    }
+    assert!(
+        store.thread_view(acct, "cycle").is_ok(),
+        "ordinary mutually consumed thread context stays readable"
+    );
+    assess_external(&store, acct, b, "restricted");
+    assert!(!store.external_thread_allowed(acct, "cycle").unwrap());
+    assess_external(&store, acct, b, "allowed");
+    assert!(store.external_thread_allowed(acct, "cycle").unwrap());
+    store.lock().unwrap().execute(
+        "UPDATE agent_message_state SET revision=revision+1 WHERE account_id=?1 AND message_id=?2",
+        params![acct, b],
+    ).unwrap();
+    assert!(
+        !store.external_thread_allowed(acct, "cycle").unwrap(),
+        "a stale consumed source blocks derived content"
+    );
+}
+
+#[test]
+fn model_access_assessment_replaces_legacy_auth_sealing() {
+    let (store, acct) = store();
+    let id = triaged(acct, "old-login", "login")
+        .sealed(SealedKind::LoginAlert)
+        .seed(&store);
+    assert!(
+        store.thread_view(acct, "login").is_err(),
+        "no new assessment yet"
+    );
+    assess_external(&store, acct, id, "allowed");
+    assert!(store.thread_view(acct, "login").is_ok());
+    assert_eq!(
+        store.thread_id_for_message(acct, id).unwrap().as_deref(),
+        Some("login")
+    );
+}
+
+#[test]
+fn external_shipments_require_all_field_provenance_to_be_allowed() {
+    let (store, acct) = store();
+    let origin = triaged(acct, "shipment", "shipment").seed(&store);
+    let name = triaged(acct, "name", "name").seed(&store);
+    assess_external(&store, acct, origin, "allowed");
+    assess_external(&store, acct, name, "restricted");
+    let id = store
+        .upsert_shipment(
+            acct,
+            origin,
+            &crate::triage::ShipmentInfo {
+                carrier: "ups".into(),
+                tracking_number: "1Z999AA10123456784".into(),
+                item_name: "Package".into(),
+                status: crate::triage::ShipmentStatus::Shipped,
+                tracking_url: None,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+    assert!(store.external_shipment_allowed(acct, id).unwrap());
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE shipments SET item_name_msg=?1 WHERE account_id=?2 AND id=?3",
+            params![name, acct, id],
+        )
+        .unwrap();
+    assert!(!store.external_shipment_allowed(acct, id).unwrap());
+    assess_external(&store, acct, name, "allowed");
+    assert!(store.external_shipment_allowed(acct, id).unwrap());
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE shipments SET created_by_message_id=NULL WHERE account_id=?1 AND id=?2",
+            params![acct, id],
+        )
+        .unwrap();
+    assert!(
+        !store.external_shipment_allowed(acct, id).unwrap(),
+        "missing legacy provenance is not permission"
+    );
+    assert!(!store.external_shipment_allowed(acct + 100, id).unwrap());
+}
+
+#[test]
+fn shredder_requires_current_actionable_auth_assessment() {
+    let (store, acct) = store();
+    let old = Utc::now() - chrono::Duration::days(10);
+    triaged(acct, "old-regex", "old-regex-thread")
+        .received_at(old)
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+    let actionable = triaged(acct, "auth", "auth-thread")
+        .received_at(old)
+        .seed(&store);
+    let login = triaged(acct, "login", "login-thread")
+        .received_at(old)
+        .seed(&store);
+    let stale = triaged(acct, "stale", "stale-thread")
+        .received_at(old)
+        .seed(&store);
+    let allowed = triaged(acct, "allowed", "allowed-thread")
+        .received_at(old)
+        .seed(&store);
+    for (id, kind, access) in [
+        (actionable, "otp", "restricted"),
+        (login, "login_alert", "restricted"),
+        (stale, "password_reset", "restricted"),
+        (allowed, "otp", "allowed"),
+    ] {
+        assess_external(&store, acct, id, access);
+        store.lock().unwrap().execute(
+            "INSERT INTO agent_message_decisions(account_id,message_id,revision,decision_json,decided_at)
+             SELECT account_id,message_id,revision,?3,?4 FROM agent_message_state WHERE account_id=?1 AND message_id=?2",
+            params![acct,id,serde_json::json!({"auth":{"kinds":[kind]}}).to_string(),Utc::now().to_rfc3339()],
+        ).unwrap();
+    }
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_message_state SET revision=revision+1 WHERE message_id=?1",
+            params![stale],
+        )
+        .unwrap();
+    let cutoff = Utc::now() - chrono::Duration::days(1);
+    let candidates = store.shred_candidates(acct, cutoff, 100).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].message_id, actionable);
+    assert_eq!(candidates[0].kind.as_deref(), Some("otp"));
+    assert_eq!(store.shred_pending_count(acct, cutoff).unwrap(), 1);
+    assert_eq!(store.shred_pending_count(acct + 1, cutoff).unwrap(), 0);
+    assert_eq!(
+        store
+            .stats(acct, old - chrono::Duration::days(1))
+            .unwrap()
+            .sealed,
+        1
+    );
+    store
+        .record_shred(acct, &candidates[0], Utc::now())
+        .unwrap();
+    assert_eq!(store.shred_pending_count(acct, cutoff).unwrap(), 0);
+}
+
+#[test]
+fn external_thread_read_demand_queues_bounded_legacy_access_work() {
+    let (store, acct) = store();
+    for i in 0..20 {
+        triaged(acct, &format!("ancestor-{i}"), "legacy-thread")
+            .received_at(Utc::now() - chrono::Duration::days(60))
+            .seed(&store);
+    }
+    let count = || -> i64 {
+        store.lock().unwrap().query_row(
+        "SELECT COUNT(*) FROM agent_triage_jobs WHERE account_id=?1 AND kind='access' AND trigger='source_access' AND arrival_eligible=0",
+        params![acct],|r|r.get(0)).unwrap()
+    };
+    assert_eq!(count(), 0);
+    for _ in 0..30 {
+        assert!(
+            !store
+                .external_thread_allowed(acct, "legacy-thread")
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .thread_view_with_html(acct, "legacy-thread")
+                .unwrap()
+                .messages
+                .len(),
+            20
+        );
+    }
+    assert_eq!(
+        count(),
+        0,
+        "human reads and cache probes never queue paid work"
+    );
+    assert!(store.thread_view(acct + 1, "legacy-thread").is_err());
+    assert_eq!(count(), 0);
+    for expected in [8, 16, 20, 20] {
+        assert!(store.thread_view(acct, "legacy-thread").is_err());
+        assert_eq!(count(), expected);
+    }
+    store.lock().unwrap().execute(
+        "UPDATE agent_triage_jobs SET state='failed',attempts=6 WHERE account_id=?1 AND kind='access'",
+        params![acct],
+    ).unwrap();
+    assert!(store.thread_view(acct, "legacy-thread").is_err());
+    let failures: i64=store.lock().unwrap().query_row(
+        "SELECT COUNT(*) FROM agent_triage_jobs WHERE account_id=?1 AND state='failed' AND attempts=6",
+        params![acct],|r|r.get(0),
+    ).unwrap();
+    assert_eq!(
+        failures, 20,
+        "read retries never reset an exhausted assessment"
+    );
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_message_state SET access='allowed' WHERE account_id=?1",
+            params![acct],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .thread_view(acct, "legacy-thread")
+            .unwrap()
+            .messages
+            .len(),
+        20
+    );
+    assert_eq!(count(), 20, "readable sources never requeue");
 }

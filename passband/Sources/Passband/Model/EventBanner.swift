@@ -26,6 +26,8 @@ enum EventBanner {
     /// string rather than as a UUID.
     static let threadKey = "passband.thread_id"
     static let eventKey = "passband.event_id"
+    static let messageKey = "passband.message_id"
+    static let authKey = "passband.is_auth"
     /// The posting account's uuid, as a string (userInfo has to survive being
     /// written to disk by the system and read back into a later launch).
     static let accountKey = "passband.account_id"
@@ -39,6 +41,20 @@ enum EventBanner {
     /// a tap on it is not a human opening their mail and must not be counted
     /// as one.
     static let testRoute = "test"
+
+    /// The relay's original push survives when device enrichment times out.
+    /// Keep its account-qualified event handle so a tap can resolve the email.
+    struct UnresolvedPush: Equatable, Sendable {
+        var accountId: UUID
+        var eventId: Int
+    }
+
+    static func unresolvedPush(_ raw: String?) -> UnresolvedPush? {
+        guard let raw, let colon = raw.lastIndex(of: ":"),
+            let account = UUID(uuidString: String(raw[..<colon])),
+            let event = Int(raw[raw.index(after: colon)...]), event > 0 else { return nil }
+        return UnresolvedPush(accountId: account, eventId: event)
+    }
 
     // MARK: - routing
 
@@ -54,7 +70,7 @@ enum EventBanner {
         /// carries no subject and its `created_at` is when triage emitted it,
         /// not when the mail arrived, so nothing about the banner may be built
         /// from it beyond the kind and the sender. `/client/sealed` is the
-        /// source of truth and `AuthSeenSet` is the one dedup.
+        /// source of truth for this legacy lookup route.
         case authSignal(SealedKind)
     }
 
@@ -68,6 +84,10 @@ enum EventBanner {
     static func routing(for event: Event) -> Routing {
         guard let kind = event.sealed_kind else { return .threadBanner }
         return .authSignal(kind)
+    }
+
+    static func shouldPresentForeground(appActive: Bool, windowVisible: Bool, isTest: Bool, isAuth: Bool) -> Bool {
+        isTest || isAuth || !(appActive && windowVisible)
     }
 
     // MARK: - content mapping
@@ -133,7 +153,7 @@ enum EventBanner {
             threadIdentifier: group,
             // Sound only for the time-bound kinds — a chime per surfaced email
             // is how a notification stream gets muted wholesale.
-            sound: event.kind != .surfaced)
+            sound: event.isAuth || event.kind != .surfaced)
     }
 
     /// The AUTH banner's copy: a mailbox has just been sent a login code (or a
@@ -188,5 +208,37 @@ enum EventBanner {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return Fmt.truncate(flat, max)
+    }
+}
+
+/// Keeps the most recent explicit tap until credentials and the account are ready.
+/// A tap arriving during bootstrap must not be rejected against an unloaded index.
+struct NotificationTapQueue<Target> {
+    struct Tap {
+        var target: Target
+        var accountId: UUID?
+    }
+    private(set) var pending: Tap?
+    private var parked = false
+
+    mutating func enqueue(_ target: Target, accountId: UUID?) {
+        pending = Tap(target: target, accountId: accountId)
+        parked = false
+    }
+
+    /// Failed switches wait for a successful connection or another explicit tap.
+    /// A newer tap that arrived during the switch is already a fresh request.
+    mutating func park(_ tap: Tap) {
+        guard pending == nil else { return }
+        pending = tap
+        parked = true
+    }
+
+    mutating func connectionBecameReady() { parked = false }
+
+    mutating func take(connected: Bool) -> Tap? {
+        guard connected, !parked else { return nil }
+        defer { pending = nil }
+        return pending
     }
 }

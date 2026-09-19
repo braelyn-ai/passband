@@ -328,11 +328,11 @@ async fn infer_unbounded(want_text: &str, llm: &RuleInferClient) -> (Disposition
     .await
     {
         Ok(LlmOutcome::Ok(disposition, usage)) => (disposition, usage),
-        Ok(LlmOutcome::Refused) => {
+        Ok(LlmOutcome::Refused(_)) => {
             eprintln!("squelch: rule disposition inference refused; defaulting to filtered");
             (Disposition::Filtered, None)
         }
-        Ok(LlmOutcome::Failed(kind)) => {
+        Ok(LlmOutcome::Failed(kind, _)) => {
             // `kind` is already redacted (status/error type only).
             eprintln!(
                 "squelch: rule disposition inference failed ({kind}); defaulting to filtered"

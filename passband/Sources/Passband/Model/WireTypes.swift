@@ -147,6 +147,8 @@ struct Event: Codable, Sendable, Identifiable, Hashable {
     /// answers it by going and asking `/client/sealed` — see
     /// `EventBanner.routing(for:)`.
     var sealed_kind: SealedKind?
+    var is_auth: Bool?
+    var isAuth: Bool { is_auth ?? false }
 }
 
 // MARK: - updates
@@ -170,6 +172,8 @@ struct AttentionUpdate: Codable, Sendable, Identifiable, Hashable {
     var one_line: String
     var reason: String
     var deadline: String?
+    var deadline_date: String?
+    var displayDeadline: String? { deadline ?? deadline_date }
     var matched_rule: Int?
     var field_reasons: FieldReasons?
     /// ABSENT on rows served by a pre-attachment daemon — treat as false.
@@ -337,6 +341,9 @@ struct ClientMessage: Codable, Sendable, Identifiable, Hashable, SenderStringCon
 
 /// core::types::ClientThreadView (GET /client/thread/{id}).
 struct ClientThreadView: Codable, Sendable, Hashable {
+    /// Reusable body caches require an explicit current server assessment.
+    /// Pending or restricted threads remain readable in the active reader.
+    var cache_allowed: Bool?
     var thread_id: String
     var subject: String
     var messages: [ClientMessage]
@@ -444,13 +451,13 @@ struct Receipt: Codable, Sendable, Identifiable, Hashable, SenderStringConvertib
 }
 
 enum CalendarKind: String, LenientRawEnum {
-    case invite, update, cancellation, response, reservation
+    case invite, update, cancellation, response, reservation, event
     static var unknownFallback: CalendarKind { .invite }
 
     /// Row tag for the non-default kinds; a plain invite needs no label.
     var tag: String? {
         switch self {
-        case .invite: nil
+        case .invite, .event: nil
         case .update: "updated"
         case .cancellation: "canceled"
         case .response: "rsvp"
@@ -471,7 +478,7 @@ struct CalendarUpdate: Codable, Sendable, Identifiable, Hashable {
 }
 
 enum BankingKind: String, LenientRawEnum {
-    case statement
+    case statement, update
     case transactionAlert = "transaction_alert"
     case autopay
     static var unknownFallback: BankingKind { .statement }
@@ -479,6 +486,7 @@ enum BankingKind: String, LenientRawEnum {
     var tag: String {
         switch self {
         case .statement: "statement"
+        case .update: "update"
         case .transactionAlert: "alert"
         case .autopay: "autopay"
         }
@@ -998,6 +1006,7 @@ struct MailActivityDay: Codable, Sendable, Hashable, Identifiable {
     var deadline: Int
     var signal: Int
     var noise: Int
+    var pending: Int?
     var id: String { day }
 }
 
@@ -1523,5 +1532,162 @@ struct UpdatesParams: Sendable {
         self.cursor = cursor
         self.remindersPending = remindersPending
         self.spamOnly = spamOnly
+    }
+}
+
+// MARK: - Agent triage v2
+
+/// Connection capability negotiation deliberately has no legacy triage fallback.
+struct TriageCapabilities: Decodable, Sendable {
+    var triage_version: Int
+    var server_ranked_fye: Bool
+    var reading: Bool
+    var pending_message_read: Bool
+
+    var isSupported: Bool {
+        triage_version == 2 && server_ranked_fye && reading && pending_message_read
+    }
+}
+
+/// The server owns membership and order. These fields are presentation facts;
+/// clients must never reconstruct placement from importance or email kind.
+struct AgentFeed: Codable, Sendable {
+    var total_count: Int?
+    var version: Int
+    var ranked_at: String
+    var items: [AgentFeedItem]
+}
+
+struct AgentFeedItem: Codable, Sendable {
+    var message_id: Int
+    var thread_id: String
+    var from_addr: String
+    var subject: String
+    var received_at: String
+    var decision: AgentMessageDecision
+    var attention: AgentAttention
+    var score: Double
+
+    /// Adapter for shared row/reader controls while those controls still use
+    /// AttentionUpdate. The neutral legacy tier is never used for membership.
+    var row: AttentionUpdate {
+        AttentionUpdate(
+            id: message_id, thread_id: thread_id, tier: .signal,
+            importance: Int((attention.factors.importance * 100).rounded()),
+            sender: from_addr,
+            one_line: attention.summary.isEmpty ? decision.summary : attention.summary,
+            reason: decision.reason,
+            deadline: attention.factors.attention_at?.value,
+            subject: subject, status: .new, surfaced_at: received_at)
+    }
+
+    var readingRow: AttentionUpdate {
+        var result = row
+        result.one_line = decision.summary
+        return result
+    }
+}
+
+struct AgentMessageDecision: Codable, Sendable {
+    var kinds: [String]
+    var destinations: [String]
+    var summary: String
+    var reason: String
+    var records: [AgentRecordProposal]?
+}
+
+/// Presentation consumes explicit record facts; it never infers kinds from copy.
+struct AgentRecordProposal: Codable, Sendable {
+    var kind: String
+    var merchant: String?
+    var amount: Double?
+    var currency: String?
+    var title: String?
+    var start: AgentSupportedTime?
+    var institution: String?
+    var description: String?
+    var due: AgentSupportedTime?
+    var autopay: Bool?
+}
+
+extension AgentFeed {
+    var receipts: [Receipt] {
+        items.flatMap { item in
+            (item.decision.records ?? []).enumerated().compactMap { index, record in
+                guard record.kind == "receipt" else { return nil }
+                return Receipt(id: item.message_id * 1000 + index, account_id: 0,
+                    message_id: item.message_id, thread_id: item.thread_id,
+                    from_addr: item.from_addr, from_name: record.merchant,
+                    amount: record.amount, currency: record.currency, received_at: item.received_at)
+            }
+        }
+    }
+
+    var calendar: [CalendarUpdate] {
+        items.flatMap { item in
+            (item.decision.records ?? []).enumerated().compactMap { index, record in
+                guard record.kind == "event" else { return nil }
+                return CalendarUpdate(id: item.message_id * 1000 + index,
+                    message_id: item.message_id, thread_id: item.thread_id, kind: .event,
+                    event_title: record.title, starts_at: record.start?.value,
+                    organizer: nil, received_at: item.received_at)
+            }
+        }
+    }
+
+    var banking: [BankingRecord] {
+        items.flatMap { item in
+            (item.decision.records ?? []).enumerated().compactMap { index, record in
+                guard record.kind == "financial_update" else { return nil }
+                return BankingRecord(id: item.message_id * 1000 + index,
+                    message_id: item.message_id, thread_id: item.thread_id,
+                    from_addr: item.from_addr, kind: .update, institution: record.institution,
+                    amount: nil, currency: nil, account_hint: nil, received_at: item.received_at)
+            }
+        }
+    }
+
+    var marketing: [MarketingOffer] {
+        items.filter { $0.decision.kinds.contains("promotional") }.map { item in
+            MarketingOffer(message_id: item.message_id, thread_id: item.thread_id,
+                sender: item.from_addr, subject: item.subject, brand: nil,
+                offer: item.decision.summary, discount: nil, code: nil, expires_at: nil,
+                received_at: item.received_at)
+        }
+    }
+}
+struct AgentAttention: Codable, Sendable {
+    var show_in_fye: Bool
+    var state: String
+    var summary: String
+    var factors: AgentAttentionFactors
+}
+struct AgentAttentionFactors: Codable, Sendable {
+    var urgency: Double
+    var action_need: Double
+    var personal_relevance: Double
+    var importance: Double
+    var attention_at: AgentSupportedTime?
+}
+struct AgentSupportedTime: Codable, Sendable {
+    var value: String
+    var timezone: String?
+}
+struct HumanMessageEnvelope: Codable, Sendable {
+    var message_id: Int
+    var thread: ClientThreadView
+}
+
+
+struct AgentTriageInspection: Decodable, Sendable {
+    var decision: AgentMessageDecision?
+
+    private enum CodingKeys: String, CodingKey { case decision }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        // An explicit null means pending. A missing key is an incompatible
+        // response, never permission to overwrite an unknown placement list.
+        decision = try values.decode(AgentMessageDecision?.self, forKey: .decision)
     }
 }

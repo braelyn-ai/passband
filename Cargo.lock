@@ -4896,6 +4896,7 @@ dependencies = [
  "chrono",
  "clap",
  "fastembed",
+ "futures",
  "getrandom 0.3.4",
  "hf-hub",
  "keyring",

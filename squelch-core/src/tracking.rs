@@ -305,6 +305,7 @@ impl OpensPoller {
             deadline: None,
             // An open receipt is about the user's OWN sent mail; nothing here is
             // sealed and nothing routes to the reveal flow.
+            is_auth: false,
             sealed_kind: None,
         };
         if let Err(e) = self.store.append_event(&ev) {

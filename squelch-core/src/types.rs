@@ -218,6 +218,9 @@ str_enum! {
 /// PRE-stamp value: `None` means "new since anyone last looked".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttentionUpdate {
+    /// An explicit calendar date with no invented instant or timezone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_date: Option<String>,
     #[serde(flatten)]
     pub update: Update,
     pub status: AttentionStatus,
@@ -667,18 +670,19 @@ str_enum! {
 }
 
 /// One durable notification event from the monotonic `events` log the delivery
-/// adapters read (SSE for the Mac app, APNs for iOS). Every field is a
-/// DENORMALIZED SNAPSHOT taken at emission time: a client must render the whole
-/// notification from this row alone (the iOS Notification Service Extension
-/// fetches one by id after an opaque push and has no second round-trip to
-/// spend). Sealed mail is represented here only as a KIND and a fixed sentence
-/// derived from it (docs/NOTIFY.md §11.6): no subject, no body, no code ever
-/// reaches this shape. See docs/SECURITY.md §4.
+/// adapters read (SSE for the Mac app, APNs for iOS). The human client fetches
+/// this notification snapshot after an opaque push.
+/// Model-authored text must omit credentials. `is_auth` identifies authentication
+/// alerts, including login/security notices that remain readable by external agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     /// Monotonic id — also the per-channel cursor clients page with (`after`).
     pub id: i64,
     pub kind: EventKind,
+    /// Model-assessed authentication, including informational login/security alerts.
+    /// This controls presentation only; it does not grant or restrict mail access.
+    #[serde(default)]
+    pub is_auth: bool,
     pub message_id: i64,
     pub thread_id: String,
     pub tier: Tier,
@@ -688,14 +692,8 @@ pub struct Event {
     /// Snapshotted deadline as stored RFC3339 text, passed through verbatim:
     /// display copy only, never something the delivery path computes with.
     pub deadline: Option<String>,
-    /// WHICH AUTH SHAPE this event is about, `None` for every ordinary event.
-    /// A client uses it to route the tap to the sealed reveal flow instead of a
-    /// thread fetch the human door 404s, and to pick an icon. NOT A GATE: no
-    /// query reads it to decide what to serve, and none may.
-    ///
-    /// `skip_serializing_if` is a WIRE-COMPATIBILITY promise, not a size saving:
-    /// every event that exists today omits the key entirely, so an old client
-    /// decoding a new daemon's replay sees exactly the bytes it has always seen.
+    /// Legacy auth subtype retained for older event rows. New notifications use
+    /// `is_auth`; every tap opens the exact email through the human reader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_kind: Option<SealedKind>,
     pub created_at: DateTime<Utc>,
@@ -704,14 +702,11 @@ pub struct Event {
 /// Per-tier / sealed / sync summary counts. Human-door-facing (squelch-api).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreStats {
-    /// Count of non-sealed messages per tier (past_due/deadline/signal/noise),
-    /// over RECEIVED, NON-SPAM mail only. Both exclusions are corrections: sent
-    /// mail and provider spam both land tier=noise without ever being triaged,
-    /// so counting them made the header's "noise" number — which is the door to
-    /// the noise page — describe a list several times larger than the page it
-    /// opens.
+    /// Compatibility buckets for received, non-spam mail. Agent decisions map to
+    /// signal (For your eyes) or noise; unclassified mail is counted as pending.
+    /// Historical rows without agent state retain their legacy tier.
     pub tier_counts: std::collections::BTreeMap<String, i64>,
-    /// Total non-sealed, triaged messages.
+    /// Total received, non-spam messages, including pending classification.
     pub total: i64,
     /// Count of sealed messages (metadata only).
     pub sealed: i64,
@@ -946,7 +941,7 @@ pub struct ShredStats {
 }
 
 /// How far a dev re-triage has got. The "run" is every row carrying a LIVE
-/// `retriage_at` stamp — the same [`crate::triage::retriage_forced`] window the
+/// `retriage_at` stamp — the same the legacy re-triage window window the
 /// passes themselves read, so this counts exactly the rows the force still
 /// covers. Two kicks inside the window are ONE run here, which is the honest
 /// answer: they are one pile of work to the queues.

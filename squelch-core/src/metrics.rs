@@ -249,6 +249,15 @@ impl NotifyDecision {
 
 /// What one row's trip through the Stage-2 escalation pass produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentVerdict {
+    Applied,
+    Stale,
+    Retryable,
+    Failed,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage2Verdict {
     Ok,
     Refused,
@@ -306,6 +315,12 @@ pub struct SyncMetrics {
     gmail_quota: AtomicU64,
     gmail_http: AtomicU64,
     gmail_network: AtomicU64,
+
+    agent_applied: AtomicU64,
+    agent_stale: AtomicU64,
+    agent_retryable: AtomicU64,
+    agent_failed: AtomicU64,
+    agent_deferred: AtomicU64,
 
     stage1_ok: AtomicU64,
     stage1_fallback: AtomicU64,
@@ -495,6 +510,23 @@ impl SyncMetrics {
         match self.gmail_auth_failed_since.load(Ordering::Relaxed) {
             0 => None,
             at => Some(at),
+        }
+    }
+
+    /// Agent-stage outcomes preserve the existing dashboard metric family.
+    /// Revisit investigations use the same counter once, rather than pretending
+    /// the retired two-stage classifier also executed.
+    pub fn record_agent(&self, outcome: AgentVerdict) {
+        let slot = match outcome {
+            AgentVerdict::Applied => &self.agent_applied,
+            AgentVerdict::Stale => &self.agent_stale,
+            AgentVerdict::Retryable => &self.agent_retryable,
+            AgentVerdict::Failed => &self.agent_failed,
+            AgentVerdict::Deferred => &self.agent_deferred,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+        if outcome == AgentVerdict::Applied {
+            self.stamp_llm_ok();
         }
     }
 
@@ -1227,6 +1259,19 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         "Triage rows processed by stage and outcome.",
     );
     for (outcome, slot) in [
+        ("ok", &metrics.agent_applied),
+        ("stale", &metrics.agent_stale),
+        ("retryable", &metrics.agent_retryable),
+        ("failed", &metrics.agent_failed),
+        ("deferred", &metrics.agent_deferred),
+    ] {
+        e.sample(
+            "squelchd_triage_verdicts_total",
+            &[("stage", "agent"), ("outcome", outcome)],
+            metrics.get(slot),
+        );
+    }
+    for (outcome, slot) in [
         ("ok", &metrics.stage1_ok),
         ("fallback", &metrics.stage1_fallback),
         ("stale_skipped", &metrics.stage1_stale_skipped),
@@ -1688,6 +1733,24 @@ mod tests {
     /// config-failure counter moves on every pass that broke on a shared 4xx,
     /// and the freshness stamp moves ONLY on a real verdict — a fallback or a
     /// refusal proves the gateway spoke, not that triage works.
+    #[test]
+    fn agent_worker_outcomes_reach_existing_triage_dashboard_family() {
+        let metrics = SyncMetrics::new();
+        metrics.record_agent(AgentVerdict::Applied);
+        metrics.record_agent(AgentVerdict::Stale);
+        metrics.record_agent(AgentVerdict::Retryable);
+        let text = render(&metrics, None);
+        for outcome in ["ok", "stale", "retryable"] {
+            assert!(
+                text.contains(&format!(
+                    "squelchd_triage_verdicts_total{{stage=\"agent\",outcome=\"{outcome}\"}} 1\n"
+                )),
+                "{text}"
+            );
+        }
+        assert!(!text.contains("squelchd_llm_last_ok_unixtime 0\n"));
+    }
+
     #[test]
     fn llm_config_failures_count_and_the_freshness_stamp_moves_only_on_a_verdict() {
         let m = SyncMetrics::new();

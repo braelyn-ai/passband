@@ -15,6 +15,9 @@ struct ThreadArrivalsTests {
     static var checks = 0
 
     static func main() {
+        expect(ThreadOpeningFocus.index(messageIds: [1, 2, 3], requested: 1) == 0, "Notification opens the requested historical message")
+        expect(ThreadOpeningFocus.index(messageIds: [1, 2, 3], requested: 99) == 2, "Unavailable target falls back to newest")
+        expect(ThreadOpeningFocus.index(messageIds: [1, 2, 3, 4], requested: nil) == 3, "Consumed navigation target does not hide sent reply")
         theArrival()
         toldOnceEvenWhenSeenTwice()
         refetchKeepsAsking()
@@ -23,6 +26,10 @@ struct ThreadArrivalsTests {
         nothingAlreadyOnScreen()
         aSwitchForgets()
         aReopenRemembers()
+        expect(!MessageReadVisibility.isFocused(minY: 900, maxY: 1100, viewportHeight: 600), "An appended offscreen message is not opened")
+        expect(!MessageReadVisibility.isFocused(minY: -900, maxY: -20, viewportHeight: 600), "History above the viewport is not opened")
+        expect(MessageReadVisibility.isFocused(minY: -300, maxY: 800, viewportHeight: 600), "A tall message under the reader focus is opened")
+        expect(!MessageReadVisibility.isFocused(minY: 0, maxY: 800, viewportHeight: 0), "Unlaid-out content is not opened")
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")

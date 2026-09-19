@@ -308,10 +308,8 @@ fn list_drafts_orders_by_updated_at_desc_and_scopes_by_account() {
 }
 
 #[test]
-fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
-    // The BELT, not the scrub: the draft row is inserted straight and the parent
-    // is sealed by hand, so neither seal path runs. A draft keyed to sealed mail
-    // must still never come back out of the list.
+fn list_drafts_preserves_human_composition_when_external_access_is_restricted() {
+    // Restricting external readers does not hide the human's own composition.
     let (store, acct) = store();
     let parent = triaged(acct, "g1", "t1").seed(&store);
     store
@@ -352,7 +350,7 @@ fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
         .unwrap();
 
     let left = store.list_drafts(acct).unwrap();
-    assert_eq!(left.len(), 1, "the sealed parent's draft is filtered out");
+    assert_eq!(left.len(), 2, "both human drafts remain available");
     assert!(
         left[0].reply_to_message_id.is_none(),
         "the NULL key compares against nothing and is never filtered"
@@ -360,9 +358,8 @@ fn list_drafts_hides_a_draft_whose_parent_went_sealed() {
 }
 
 #[test]
-fn reingest_that_seals_the_parent_deletes_its_draft() {
-    // The other seal path: a re-ingest can turn a row that was normal when the
-    // draft was saved into a sealed one, and it scrubs in the same transaction.
+fn reingest_never_deletes_a_human_draft() {
+    // Re-ingestion cannot delete explicit user work, whatever the access assessment.
     let (store, acct) = store();
     let normal = triaged(acct, "g1", "t1");
     let parent = normal.ingest(&store);
@@ -382,16 +379,17 @@ fn reingest_that_seals_the_parent_deletes_its_draft() {
 
     let again = normal.clone().sealed(SealedKind::Otp).ingest(&store);
     assert_eq!(again, parent, "same Gmail id, same local row");
-    assert!(
-        store.list_drafts(acct).unwrap().is_empty(),
-        "the re-ingest's seal took the draft with it"
+    assert_eq!(
+        store.list_drafts(acct).unwrap().len(),
+        1,
+        "re-ingest preserves the draft"
     );
 }
 
 #[test]
-fn both_seal_paths_take_the_drafts_staged_files_with_it() {
-    // The draft's files live as long as the draft (see `delete_draft`), and
-    // a seal is a draft delete by another door — two of them.
+fn access_restrictions_preserve_human_drafts_and_their_staged_files() {
+    use crate::store::agent_triage::AgentTriageStore;
+    // External access restrictions must not delete explicit human work.
     let (store, acct) = store();
     let normal = triaged(acct, "g1", "t1");
     let parent = normal.ingest(&store);
@@ -406,8 +404,8 @@ fn both_seal_paths_take_the_drafts_staged_files_with_it() {
         .unwrap();
     normal.clone().sealed(SealedKind::Otp).ingest(&store);
     assert!(
-        store.outbound_attachment(acct, file.id).unwrap().is_none(),
-        "the re-ingest seal took the file with the draft"
+        store.outbound_attachment(acct, file.id).unwrap().is_some(),
+        "re-ingest preserves the draft attachment"
     );
 
     // The hand-correction path, on a second message.
@@ -422,21 +420,22 @@ fn both_seal_paths_take_the_drafts_staged_files_with_it() {
         .claim_outbound_attachments(acct, d2.id, &[file2.id], t(1))
         .unwrap();
     store
-        .correct_triage(
+        .correct_agent_triage(
             acct,
             other,
-            crate::types::TriageAxis::Sensitivity,
-            "sealed",
-            None,
+            "external_access",
+            &serde_json::json!(true),
             t(2),
         )
-        .unwrap()
         .unwrap();
-    assert!(store.list_drafts(acct).unwrap().is_empty());
+    assert_eq!(store.list_drafts(acct).unwrap().len(), 2);
     assert!(
-        store.outbound_attachment(acct, file2.id).unwrap().is_none(),
-        "the hand seal took the file with the draft"
+        store.outbound_attachment(acct, file2.id).unwrap().is_some(),
+        "restricting external agents preserves the human attachment"
     );
+    assert!(store.delete_draft(acct, d2.id).unwrap());
+    assert!(store.outbound_attachment(acct, file2.id).unwrap().is_none());
+    assert!(store.outbound_attachment(acct, file.id).unwrap().is_some());
 }
 
 #[test]

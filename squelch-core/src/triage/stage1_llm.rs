@@ -1,6 +1,6 @@
 //! Stage-1 LLM triage: the pass that gives every non-sealed row its real
 //! verdict, replacing the heuristic seed values ingest wrote. Sealed mail never
-//! reaches here (SQL predicate plus [`super::stage1_sealed_guard`]); an API
+//! reaches here (SQL predicate plus the retired stage guard); an API
 //! failure is the ONLY thing that leaves the deterministic seed standing.
 //!
 //! It runs the same model as Stage-2 at lower effort over less context, so what
@@ -1294,7 +1294,7 @@ mod tests {
             .await
             .unwrap();
         match outcome {
-            ClassifyOutcome::Failed(kind) => {
+            ClassifyOutcome::Failed(kind, _) => {
                 assert!(kind.contains("http_400"));
                 assert!(!kind.contains("secret"), "no message body leaked");
             }

@@ -83,7 +83,7 @@ struct UpdateRow: View {
     #endif
 
     var body: some View {
-        let chip = Fmt.deadlineChip(update.deadline)
+        let chip = Fmt.deadlineChip(update.displayDeadline)
 
         // onHover BEFORE onOpen: the click moves the cursor to this row first,
         // so the verb keys act on what was clicked, not on where the keyboard

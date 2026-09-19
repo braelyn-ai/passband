@@ -1,8 +1,7 @@
 //! squelch-tui: a local debug/setup viewer over the real store (the same
 //! SQLite db the sync daemon and MCP server use), live-refreshed on a tick.
 //! Read-only toward mail; the single write is `Store::set_sender_rule`.
-//! The only surface that shows sealed messages at all — local-only
-//! `Store::sealed_messages`, metadata hidden until the operator reveals it.
+//! Uses the human reader and canonical agent projections, including pending mail.
 
 mod app;
 mod input;
@@ -26,9 +25,6 @@ use squelch_core::types::AccountId;
 
 use crate::app::App;
 
-/// Starting in-session squelch threshold. TODO(persist): read from config.
-const DEFAULT_MIN_IMPORTANCE: u8 = 50;
-
 /// Live-refresh cadence.
 const TICK: StdDuration = StdDuration::from_secs(2);
 
@@ -45,7 +41,7 @@ fn main() -> Result<()> {
     };
 
     let account = store.ensure_account(&squelch_core::config::account_email())?;
-    let mut app = App::new(store, account, DEFAULT_MIN_IMPORTANCE)?;
+    let mut app = App::new(store, account)?;
 
     let mut terminal = init_terminal()?;
     let res = run(&mut terminal, &mut app);

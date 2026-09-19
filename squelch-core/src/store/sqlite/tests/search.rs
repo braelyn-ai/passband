@@ -9,7 +9,7 @@ use chrono::Duration;
 use std::collections::HashSet;
 
 #[test]
-fn search_excludes_sealed_and_delete_rule_works() {
+fn human_search_includes_restricted_mail_and_delete_rule_works() {
     let (store, acct) = store();
 
     triaged(acct, "g1", "t1")
@@ -27,8 +27,15 @@ fn search_excludes_sealed_and_delete_rule_works() {
         .seed(&store);
 
     let hits = store.search(acct, "verification", 10, 0).unwrap();
-    assert_eq!(hits.len(), 1, "sealed row must be excluded from search");
-    assert_eq!(hits[0].thread_id, "t1");
+    assert_eq!(hits.len(), 2, "human search includes restricted mail");
+    assert!(
+        hits.iter().any(|hit| hit.thread_id == "t1")
+            && hits.iter().any(|hit| hit.thread_id == "t2")
+    );
+    assert!(
+        store.external_search_hits(acct, &hits).unwrap().is_empty(),
+        "external access still requires assessment"
+    );
 
     // delete_sender_rule
     let rid = store
@@ -702,13 +709,13 @@ fn keyword_search_applies_from_and_date_filters() {
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
     assert_eq!(
         threads.len(),
-        2,
-        "jane's two received invoices: {threads:?}"
+        3,
+        "all of Jane's received messages: {threads:?}"
     );
     assert!(threads.contains(&"t-jan") && threads.contains(&"t-feb"));
     assert!(
-        !threads.contains(&"t-seal"),
-        "sealed stays absent with operators applied"
+        threads.contains(&"t-seal"),
+        "human filters include restricted mail"
     );
     assert!(!threads.contains(&"t-sent"), "sent mail stays excluded");
 
@@ -728,7 +735,7 @@ fn keyword_search_applies_from_and_date_filters() {
         .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
-    assert_eq!(threads.len(), 2, "february only: {threads:?}");
+    assert_eq!(threads.len(), 3, "february only: {threads:?}");
     assert!(!threads.contains(&"t-jan"));
 
     let (text, filter) = parse_search_query("invoice before:2026-02-16");
@@ -744,8 +751,11 @@ fn keyword_search_applies_from_and_date_filters() {
     let hits = store
         .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].thread_id, "t-feb");
+    assert_eq!(hits.len(), 2);
+    assert!(
+        hits.iter()
+            .all(|hit| ["t-feb", "t-seal"].contains(&hit.thread_id.as_str()))
+    );
 }
 
 #[test]
@@ -760,7 +770,7 @@ fn filter_only_listing_lists_newest_first_and_keeps_the_exclusions() {
         .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
-    assert_eq!(threads, vec!["t-feb", "t-jan"], "newest first");
+    assert_eq!(threads, vec!["t-seal", "t-feb", "t-jan"], "newest first");
 
     // The listing is a search path like any other: sealed and sent stay out.
     let (text, filter) = parse_search_query("after:2026-01-01");
@@ -768,8 +778,8 @@ fn filter_only_listing_lists_newest_first_and_keeps_the_exclusions() {
         .search_filtered(acct, &text, &filter, SearchSort::Recent, false, 10, 0)
         .unwrap();
     let threads: Vec<&str> = hits.iter().map(|h| h.thread_id.as_str()).collect();
-    assert_eq!(threads, vec!["t-bob", "t-feb", "t-jan"]);
-    assert!(!threads.contains(&"t-seal") && !threads.contains(&"t-sent"));
+    assert_eq!(threads, vec!["t-bob", "t-seal", "t-feb", "t-jan"]);
+    assert!(threads.contains(&"t-seal") && !threads.contains(&"t-sent"));
 
     // And it paginates.
     let page = store
@@ -779,8 +789,8 @@ fn filter_only_listing_lists_newest_first_and_keeps_the_exclusions() {
     let page2 = store
         .search_filtered(acct, "", &filter, SearchSort::Recent, false, 2, 2)
         .unwrap();
-    assert_eq!(page2.len(), 1);
-    assert_eq!(page2[0].thread_id, "t-jan");
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2[1].thread_id, "t-jan");
 }
 
 #[test]
@@ -833,7 +843,7 @@ use crate::embed::{Embedder, StubEmbedder};
 use std::sync::Arc;
 
 #[test]
-fn sealed_message_is_never_embedded() {
+fn restricted_mail_can_be_embedded_for_internal_recall() {
     // The structural gate lives at the CALLER, so `messages_missing_vectors`
     // — the backfill's source — must NEVER return a sealed row. Both halves
     // are asserted: absent from the list, and its vec slot stays empty.
@@ -856,8 +866,8 @@ fn sealed_message_is_never_embedded() {
     let missing = store.messages_missing_vectors(acct, 10).unwrap();
     assert!(missing.iter().any(|m| m.message_id == normal));
     assert!(
-        !missing.iter().any(|m| m.message_id == sealed),
-        "sealed message must be structurally absent from the backfill source"
+        missing.iter().any(|m| m.message_id == sealed),
+        "internal models may process restricted mail"
     );
 
     // Simulate the backfill embedding only what it was handed: the sealed row
@@ -866,7 +876,11 @@ fn sealed_message_is_never_embedded() {
     for m in &missing {
         embed_and_store(&store, &embedder, acct, m.message_id, &m.subject, &m.body);
     }
-    assert_eq!(vec_count_for(&store, sealed), 0, "sealed row has no vector");
+    assert_eq!(
+        vec_count_for(&store, sealed),
+        1,
+        "internal vector is available"
+    );
     assert_eq!(vec_count_for(&store, normal), 1, "normal row was embedded");
 }
 
@@ -947,7 +961,7 @@ fn semantic_search_ranks_relevant_above_decoy_and_includes_sent() {
 }
 
 #[test]
-fn semantic_search_excludes_sealed_even_if_a_vector_leaked() {
+fn human_semantic_search_includes_restricted_mail() {
     // BELT-AND-SUSPENDERS: vectors are never written for sealed mail, but if a
     // vector somehow existed, semantic_search's re-join to triage must still
     // drop it. We force the pathological case by inserting a vector directly.
@@ -977,8 +991,8 @@ fn semantic_search_excludes_sealed_even_if_a_vector_leaked() {
         .semantic_search(acct, "verification code passcode", 5)
         .unwrap();
     assert!(
-        !hits.iter().any(|(id, _)| *id == sealed),
-        "sealed row must be excluded by the query-time re-join"
+        hits.iter().any(|(id, _)| *id == sealed),
+        "human semantic search includes restricted mail"
     );
 }
 
@@ -2047,5 +2061,34 @@ fn the_fts_table_drives_every_join() {
     assert!(
         source.matches("FROM messages_fts f").count() >= 5,
         "the source guard found fewer FTS joins than this file has; was the pattern renamed?"
+    );
+}
+
+#[test]
+fn external_search_fills_limit_after_hidden_leading_results() {
+    let (store, acct) = store();
+    let now = Utc::now();
+    let visible = triaged(acct, "readable", "readable-thread")
+        .subject("zebra memo")
+        .received_at(now - chrono::Duration::days(10))
+        .seed(&store);
+    super::messages::assess_external(&store, acct, visible, "allowed");
+    for i in 0..24 {
+        let id = triaged(acct, &format!("hidden-{i}"), &format!("hidden-thread-{i}"))
+            .subject("zebra memo")
+            .received_at(now)
+            .seed(&store);
+        super::messages::assess_external(&store, acct, id, "restricted");
+    }
+    let hits = store
+        .external_search(acct, "zebra", crate::store::SearchSort::Recent, 10)
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, visible);
+    assert!(
+        store
+            .external_search(acct + 1, "zebra", crate::store::SearchSort::Recent, 10)
+            .unwrap()
+            .is_empty()
     );
 }

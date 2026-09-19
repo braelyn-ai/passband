@@ -304,7 +304,7 @@ fn a_blank_spam_subject_is_absent_rather_than_empty() {
 /// Sealed outranks spam. A login code Gmail misfiled is still a login code, and
 /// the spam page is a page someone reads.
 #[test]
-fn a_sealed_row_never_reaches_the_spam_page() {
+fn human_spam_page_includes_restricted_auth_mail() {
     let (store, acct) = store();
     let sealed = triaged(acct, "g-otp", "t-otp")
         .is_spam(true)
@@ -321,7 +321,7 @@ fn a_sealed_row_never_reaches_the_spam_page() {
             SpamScope::Only,
         )
         .unwrap();
-    assert!(!rows.iter().any(|u| u.update.id == sealed));
+    assert!(rows.iter().any(|u| u.update.id == sealed));
 }
 
 /// THE AGENT DOOR GETS NO SPAM AT ALL, not spam it is told to distrust — the
@@ -348,12 +348,18 @@ fn the_agent_door_thread_view_drops_spam() {
         .from("dana@northwind.example")
         .body("here are the redlines")
         .seed(&store);
-    triaged(acct, "g-spoof", "t-mixed")
+    let spam = triaged(acct, "g-spoof", "t-mixed")
         .from("dana@northwind-example.co")
         .is_spam(true)
         .body("wire the deposit to the updated account below")
         .seed(&store);
 
+    super::messages::assess_external(&store, acct, real, "allowed");
+    assert!(
+        store.thread_view(acct, "t-mixed").is_err(),
+        "pending sibling blocks the thread"
+    );
+    super::messages::assess_external(&store, acct, spam, "allowed");
     let view = store.thread_view(acct, "t-mixed").unwrap();
     let ids: Vec<i64> = view.messages.iter().map(|m| m.id).collect();
     assert_eq!(ids, vec![real], "the spoof must not reach the agent");
@@ -438,16 +444,22 @@ fn clearing_spam_twice_reports_the_second_as_no_change() {
     assert!(!store.clear_spam(acct, spam).unwrap());
 }
 
-/// Sealed rows are refused here as everywhere: unsealing by hand is not a thing
-/// this path gets to do.
+/// Auth mail can be rescued from provider spam without granting external access.
 #[test]
-fn clearing_spam_refuses_a_sealed_row() {
+fn clearing_spam_restores_auth_mail_and_queues_agent_triage() {
     let (store, acct) = store();
     let sealed = triaged(acct, "g-otp", "t-otp")
         .is_spam(true)
         .sealed(SealedKind::Otp)
         .seed(&store);
-    assert!(!store.clear_spam(acct, sealed).unwrap());
+    assert!(store.clear_spam(acct, sealed).unwrap());
+    let queued: (i64,i64) = store.lock().unwrap().query_row(
+        "SELECT COUNT(*), COALESCE(SUM(arrival_eligible),0) FROM agent_triage_jobs
+         WHERE account_id=?1 AND message_id=?2 AND kind='triage' AND trigger='not_spam' AND state='queued'",
+        params![acct,sealed], |r| Ok((r.get(0)?,r.get(1)?)),
+    ).unwrap();
+    assert_eq!(queued, (1, 0));
+    assert!(store.thread_view_with_html(acct, "t-otp").is_ok());
 }
 
 /// A message seen under a visible label can never be hidden by a later spam

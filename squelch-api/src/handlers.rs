@@ -1,9 +1,8 @@
 //! `/client/*` handlers for the human door.
 //!
 //! Handlers are thin: validate params, call the store via `spawn_blocking`,
-//! serialize core types to JSON. Sealed handling lives in the store;
-//! [`reveal_sealed`] is the one place a sealed body is surfaced, and it audits
-//! before returning.
+//! serialize core types to JSON. Humans can read pending and restricted mail.
+//! External agents use the separate guarded routes in `agent.rs`.
 
 use axum::{
     Json,
@@ -228,19 +227,20 @@ pub async fn get_updates(
     // would report as seen exactly the mail they asked not to be shown yet.
     let peek = q.peek || pending_reminders;
 
+    let ranking = state.triage_config.ranking.clone();
     let items = store_call(&state, move |store, account_id| {
-        // attention_updates excludes sealed rows in SQL, and serves whichever
-        // side of the provider's spam verdict `spam` asked for. status/band/
-        // reminders filter server-side; tier and pagination apply over the
-        // ranked slice here.
-        let mut all = store.attention_updates(
+        use squelch_core::store::agent_triage::{AgentInventoryQuery, AgentTriageStore};
+        let mut all = store.human_agent_updates(
             account_id,
-            since,
-            min_importance,
-            status_filter,
-            band,
-            pending_reminders,
-            spam,
+            &AgentInventoryQuery {
+                since,
+                min_importance,
+                status: status_filter,
+                band,
+                pending_reminders,
+                spam,
+                ranking,
+            },
         )?;
         if let Some(t) = tier_filter {
             all.retain(|u| u.update.tier == t);
@@ -251,12 +251,8 @@ pub async fn get_updates(
             .take(limit as usize)
             .collect::<Vec<_>>();
 
-        // SEEN-LEDGER: the response carries the PRE-stamp surfaced_at, then this
-        // exact set is stamped (surfaced_at=now if NULL, new->open). Sealed rows
-        // cannot be in `page`, and mark_surfaced re-guards sensitivity anyway.
-        // `peek` skips the stamp entirely: same rows, no ledger write, because
-        // returning a row to an agent is not the same event as showing it to
-        // the user. This is the ONLY thing peek changes.
+        // Listing acknowledgement is distinct from opening a message. Pending
+        // and restricted mail remain available to the human, including surfacing.
         if !peek {
             let ids: Vec<i64> = page.iter().map(|u| u.update.id).collect();
             store.mark_surfaced(account_id, &ids)?;
@@ -294,7 +290,7 @@ pub async fn set_update_status(
     })
     .await?;
     if !updated {
-        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        // Missing or cross-account message.
         return Err(ApiError::not_found());
     }
 
@@ -345,7 +341,7 @@ pub async fn set_update_reminder(
     })
     .await?;
     if !updated {
-        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        // Missing or cross-account message.
         return Err(ApiError::not_found());
     }
 
@@ -439,9 +435,8 @@ pub struct RetriageBody {
     days: Option<u32>,
 }
 
-/// DEV RE-TRIAGE: reset LLM markers on the scoped rows so the pipeline re-runs.
-/// Rule-decided and sealed rows are never touched (store-level guard), and a
-/// sealed or unknown `message_id` resets 0 rows — indistinguishable by design.
+/// Queue durable investigations for the selected message or recent inbox.
+/// Existing decisions and explicit user state remain visible while work runs.
 pub async fn retriage(
     State(state): State<ApiState>,
     Json(body): Json<RetriageBody>,
@@ -537,6 +532,7 @@ struct ThreadMessageView {
 /// `ClientThreadView` on the wire, message-for-message, with the extra bit.
 #[derive(Debug, Serialize)]
 struct ThreadResponse {
+    cache_allowed: bool,
     thread_id: String,
     subject: String,
     messages: Vec<ThreadMessageView>,
@@ -577,6 +573,7 @@ pub async fn get_thread(
             });
         }
         Ok(ThreadResponse {
+            cache_allowed: store.external_thread_allowed(account_id, &thread_id)?,
             thread_id: view.thread_id,
             subject: view.subject,
             messages,
@@ -662,14 +659,13 @@ fn sanitize_attachment_filename(name: &str) -> String {
     }
 }
 
-/// Serve one attachment's raw bytes. The parent-message sealed guard lives in
-/// [`Store::attachment_bytes`]; this handler adds the header discipline (see
-/// [`safe_content_type`]) and the over-cap 410.
+/// Serve account-owned attachment bytes to the human. This handler adds safe
+/// response headers and reports unstored over-cap attachments with 410.
 pub async fn get_attachment(
     State(state): State<ApiState>,
     Path(attachment_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    // `None` => unknown id OR sealed parent (indistinguishable): 404.
+    // Unknown or cross-account attachment: 404.
     let found = store_call(&state, move |store, account_id| {
         store.attachment_bytes(account_id, attachment_id)
     })
@@ -2143,11 +2139,8 @@ pub async fn put_draft(
     State(state): State<ApiState>,
     Json(body): Json<DraftBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // No draft is ever SAVED against sealed mail: the parent is resolved through
-    // the same lookup `send` uses, where sealed and unknown are one 404. A
-    // POST-HOC seal (hand correction, or a re-ingest that trips detection) is the
-    // store's job — both seal paths delete the drafts keyed to that message, and
-    // `list_drafts` filters a sealed parent as a belt.
+    // Resolve ownership independently from external-agent access. A human may
+    // draft a reply to any of their messages, including authentication mail.
     if let Some(parent) = body.reply_to_message_id {
         resolve_target(&state, parent).await?;
     }
@@ -2681,7 +2674,9 @@ pub async fn get_usage(
                 state.stage2_price_in_per_mtok,
                 state.stage2_price_out_per_mtok,
             )
-        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY {
+        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY
+            || name == squelch_core::triage::access::USAGE_CATEGORY
+        {
             (
                 state.notify_model.as_ref(),
                 state.notify_price_in_per_mtok,
@@ -2760,6 +2755,7 @@ pub async fn get_mail_activity(
                 "deadline": r.deadline,
                 "signal": r.signal,
                 "noise": r.noise,
+                "pending": r.pending,
             })
         })
         .collect();
@@ -2845,6 +2841,16 @@ async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiEr
         "thread_daily_cap": thread,
         "sender_daily_cap": sender,
         "global_daily_cap": global,
+        "agent": {
+            "budget_unit": "bounded_investigation",
+            "daily_run_cap": state.triage_config.agent.daily_run_cap,
+            "effective_daily_run_cap": state.triage_config.agent.daily_run_cap,
+            "background_daily_run_cap": state.triage_config.agent.background_daily_run_cap,
+            "effective_background_daily_run_cap": state.triage_config.agent.effective_background_daily_run_cap(),
+            "reserved_arrival_runs": state.triage_config.agent.daily_run_cap - state.triage_config.agent.effective_background_daily_run_cap(),
+            "max_model_turns": state.triage_config.agent.max_model_turns,
+            "legacy_stage_caps_are_active_ceilings": false,
+        },
         "sources": {
             "thread_daily_cap": cap_source_str(overrides.thread_daily_cap.is_some(), src.thread_daily_cap),
             "sender_daily_cap": cap_source_str(overrides.sender_daily_cap.is_some(), src.sender_daily_cap),

@@ -41,7 +41,8 @@ fn build_server() -> anyhow::Result<SquelchServer> {
     let store = Arc::new(SqliteStore::open(squelch_core::config::resolve_db_path())?);
     Ok(
         SquelchServer::new(store, &squelch_core::config::account_email())?
-            .with_shipment_policy(shipment_policy()),
+            .with_shipment_policy(shipment_policy())
+            .with_ranking_config(squelch_core::config::Config::load().triage.ranking),
     )
 }
 
@@ -112,6 +113,7 @@ async fn serve_http(addr: SocketAddr) -> anyhow::Result<()> {
         store,
         &squelch_core::config::account_email(),
         shipment_policy(),
+        squelch_core::config::Config::load().triage.ranking,
         shutdown.child_token(),
     )?;
 

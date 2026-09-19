@@ -134,11 +134,11 @@ struct MobileAuthView: View {
                 .foregroundStyle(Palette.accent)
                 .textCase(.uppercase)
                 .tracking(0.6)
-            Text("Held sealed until you ask.")
+            Text("Your login codes, in one place.")
                 .font(Typo.hero(26))
                 .foregroundStyle(Palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("sealed · revealing is audited")
+            Text("tap to view")
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
         }
