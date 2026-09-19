@@ -73,7 +73,7 @@ pub async fn run_access(
                 model_calls: 1,
             })
         }
-        LlmOutcome::Refused => Err(fail("access_refused", vec![], 1)),
-        LlmOutcome::Failed(kind) => Err(fail(&kind, vec![], 1)),
+        LlmOutcome::Refused(usage) => Err(fail("access_refused", usage.into_iter().collect(), 1)),
+        LlmOutcome::Failed(kind, usage) => Err(fail(&kind, usage.into_iter().collect(), 1)),
     }
 }

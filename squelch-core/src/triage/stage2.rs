@@ -22,7 +22,7 @@ use crate::types::{FieldReasons, Tier};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-// Provider plumbing (endpoints, retry policy, truncation-retry, wire types)
+// Provider plumbing (endpoints, retry policy, usage accounting, wire types)
 // lives in [`crate::triage::llm`]; this module owns only the Stage-2 prompt,
 // user message, schema, verdict parse, and apply.
 pub use crate::triage::llm::{ClassifyError, Usage};
@@ -902,7 +902,7 @@ pub(crate) fn truncate_deadline_kind(kind: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triage::llm::{BACKOFF_CAP, MAX_TOKENS, MAX_TOKENS_RETRY};
+    use crate::triage::llm::BACKOFF_CAP;
     use crate::types::Sensitivity;
     use chrono::TimeZone;
     use std::time::Duration;
@@ -2042,7 +2042,7 @@ mod tests {
         .await
         .unwrap();
         handle.await.unwrap();
-        assert!(matches!(outcome, ClassifyOutcome::Refused));
+        assert!(matches!(outcome, ClassifyOutcome::Refused(_)));
     }
 
     #[tokio::test]
@@ -2065,7 +2065,7 @@ mod tests {
         .unwrap();
         handle.await.unwrap();
         match outcome {
-            ClassifyOutcome::Failed(kind) => {
+            ClassifyOutcome::Failed(kind, _) => {
                 assert!(kind.contains("http_400"));
                 // The upstream error TYPE may appear, but never the message body.
                 assert!(!kind.contains("secret detail"));
@@ -2145,38 +2145,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classify_openai_length_retries_then_succeeds() {
-        // First response: finish_reason "length" (truncation). Second: success.
-        let truncated = r#"{"choices":[{"index":0,"finish_reason":"length","message":{"role":"assistant","content":"{\"importance\":50"}}]}"#;
-        let verdict = r#"{"importance":66,"has_deadline":false,"deadline_iso":null,"deadline_kind":null,"one_line":"retried ok","reason":"x","matches_sender_rule":null,"importance_reason":"x","deadline_reason":null}"#;
-        let (url, handle) = mock_seq(vec![
-            (200, truncated.to_string()),
-            (200, openai_ok_body(verdict)),
-        ])
-        .await;
+    async fn classify_openai_length_returns_paid_usage_without_hidden_retry() {
+        let truncated = r#"{"usage":{"prompt_tokens":1300,"completion_tokens":8000},"choices":[{"finish_reason":"length","message":{"content":"partial"}}]}"#;
+        let (url, handle) = mock_seq(vec![(200, truncated.to_string())]).await;
         let http = reqwest::Client::new();
         let cfg = Stage2Config::default();
         let q = queued(false, None);
         let ctx = RowContext::from_queued(&q, 4000);
-
         let outcome = classify_at(&http, &url, "sk-openai", &cfg, Stage2Provider::OpenAI, &ctx)
             .await
             .unwrap();
-        let reqs = handle.await.unwrap();
-
-        // Two requests: the first at the base budget, the retry at the doubled.
-        assert_eq!(reqs.len(), 2, "length triggered exactly one token-retry");
-        assert!(
-            reqs[0].contains(&format!("\"max_completion_tokens\":{MAX_TOKENS}")),
-            "first request uses base token budget"
-        );
-        assert!(
-            reqs[1].contains(&format!("\"max_completion_tokens\":{MAX_TOKENS_RETRY}")),
-            "retry uses doubled token budget"
-        );
+        assert_eq!(handle.await.unwrap().len(), 1);
         match outcome {
-            ClassifyOutcome::Ok(out, _) => assert_eq!(out.importance, 66),
-            other => panic!("expected Ok after retry, got {other:?}"),
+            ClassifyOutcome::Failed(kind, Some(usage)) => {
+                assert_eq!(kind, "max_tokens_truncation");
+                assert_eq!(usage.input_tokens, 1300);
+                assert_eq!(usage.output_tokens, 8000);
+            }
+            other => panic!("expected paid truncation, got {other:?}"),
         }
     }
 
@@ -2192,7 +2178,7 @@ mod tests {
             .await
             .unwrap();
         handle.await.unwrap();
-        assert!(matches!(outcome, ClassifyOutcome::Refused));
+        assert!(matches!(outcome, ClassifyOutcome::Refused(_)));
     }
 
     #[tokio::test]
@@ -2209,7 +2195,7 @@ mod tests {
             .unwrap();
         handle.await.unwrap();
         match outcome {
-            ClassifyOutcome::Failed(kind) => {
+            ClassifyOutcome::Failed(kind, _) => {
                 assert!(kind.contains("http_400"));
                 assert!(!kind.contains("secret detail"), "no message body leaked");
             }

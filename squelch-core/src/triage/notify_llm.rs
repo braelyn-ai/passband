@@ -282,7 +282,7 @@ mod tests {
         .await
         .unwrap();
         match outcome {
-            LlmOutcome::Failed(kind) => assert_eq!(kind, "importance_out_of_range"),
+            LlmOutcome::Failed(kind, _) => assert_eq!(kind, "importance_out_of_range"),
             other => panic!("expected Failed, got {other:?}"),
         }
     }
@@ -360,7 +360,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(outcome, LlmOutcome::Refused), "{outcome:?}");
+        assert!(matches!(outcome, LlmOutcome::Refused(_)), "{outcome:?}");
     }
 
     /// THE SINGLE-ATTEMPT PROPERTY, and the reason `LlmRequest::max_tries`
