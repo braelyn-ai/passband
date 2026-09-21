@@ -621,6 +621,14 @@ pub struct SearchHit {
     pub subject: String,
     pub received_at: DateTime<Utc>,
     pub snippet: String,
+    /// Missing triage is unfinished. Older serialized hits default to false.
+    #[serde(default)]
+    pub is_done: bool,
+    /// Original surface forms matched by FTS (including stemming/prefixes).
+    #[serde(default)]
+    pub subject_matches: Vec<String>,
+    #[serde(default)]
+    pub snippet_matches: Vec<String>,
 }
 
 /// One row of the human-door audit log. Human-door-only; never crosses MCP.

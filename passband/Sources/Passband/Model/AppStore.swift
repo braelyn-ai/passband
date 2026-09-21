@@ -189,13 +189,15 @@ struct SitrepZoneCache: Sendable {
 /// `@State` on unmount, and parking it here is what makes `/` resumable — same
 /// query, same hits, same selection, no refetch and no empty flash.
 struct SearchSession: Sendable, Equatable {
+    var fetchedRelated: Bool? = nil
+    var revision = 0
+    var fetchedRevision: Int? = nil
     var query = ""
     var hits: [SearchHit] = []
     /// The armed row. -1 = nothing armed, focus semantically in the bar: Enter
     /// expands the panel instead of opening a hit. ArrowDown arms row 0.
     var index = -1
-    /// Fullscreen results with larger previews (Enter in the bar). Collapses
-    /// when a hit opens so the results stay in the strip beside the reader.
+    /// Search opens wide and collapses beside the reader when a hit opens.
     var expanded = false
     var error: String?
     /// The term `hits` actually came from, so reopening on an unchanged query
@@ -2277,6 +2279,8 @@ final class AppStore {
     /// Open search. By default it RESUMES the last one; `seed` forces a fresh
     /// term (`f` on a row or in the reader, seeding `from:<address>`).
     func openSearch(seed: String? = nil) {
+        // Give wide search the window; closing the reader saves its draft.
+        if threadId != nil { closeThread() }
         // A seed matching what is ALREADY fetched keeps the session: the hits
         // on screen are authoritative for exactly that term, and nilling
         // `fetchedQuery` here would not refetch anyway (the panel's task is
@@ -2303,14 +2307,20 @@ final class AppStore {
             // was holding at.
             searchLane.resume()
         }
-        // Always reopen as the strip: resuming the query is a convenience,
-        // resuming a fullscreen takeover is a mode trap.
-        search.expanded = false
-        // And always reopen DISARMED. The hits and query persist, but a row
-        // armed in some earlier session would silently repurpose bar-Enter
-        // from "expand results" to "open that stale row".
+        // Search starts wide; the strip remains available beside an open email.
+        search.expanded = true
+        // Reopen disarmed so Enter starts from the first result rather than a
+        // row selected in an earlier search session.
         search.index = -1
         sideView = .search
+    }
+
+    /// Run the words currently in the field, even before keyword results arrive.
+    func requestDeeperSearch() {
+        guard DeeperSearchPolicy.canRequest(query: search.query,
+            choice: Prefs.shared.deeperSearch, running: searchLane.running) else { return }
+        resetSearchLane(keepingVerdict: true)
+        startDeeperSearch(trigger: .requested)
     }
 
     /// START THE DEEPER SEARCH on the query the panel has just answered, with
@@ -2322,14 +2332,14 @@ final class AppStore {
     /// query is the reader's own words about their own mail, and no part of it,
     /// nor of what the search found, goes near telemetry.
     func startDeeperSearch(trigger: SearchIntent.Trigger) {
-        let query = search.fetchedQuery ?? search.query.trimmed
-        guard !query.isEmpty, !search.laneStarted else { return }
+        let query = trigger == .requested ? search.query.trimmed : (search.fetchedQuery ?? search.query.trimmed)
+        guard Prefs.shared.deeperSearch != .off, !query.isEmpty, !search.laneStarted else { return }
         search.laneStarted = true
         search.laneTrigger = trigger
         search.laneQuery = query
         search.refinementCount = 0
         captureLaneStart(trigger)
-        searchLane.send(query, openEmail: nil, hits: search.hits)
+        searchLane.send(query, openEmail: nil, hits: query == search.fetchedQuery ? search.hits : [])
     }
 
     /// ONE CONVERSATION, ONE EVENT, from the two places a conversation begins:

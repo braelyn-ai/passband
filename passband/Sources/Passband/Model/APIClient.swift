@@ -265,13 +265,15 @@ actor APIClient {
         cursor: String? = nil,
         mode: SearchMode? = nil,
         sort: SearchSortChoice? = nil,
-        partial: Bool = false
+        partial: Bool = false,
+        unfinishedFirst: Bool = false
     ) async throws -> SearchPage {
         try await get(
             "/client/search",
             query: [
                 "q": q, "limit": limit.map(String.init), "cursor": cursor, "mode": mode?.rawValue,
                 "sort": sort?.rawValue, "partial": partial ? "1" : nil,
+                "unfinished_first": unfinishedFirst ? "true" : nil,
             ])
     }
 

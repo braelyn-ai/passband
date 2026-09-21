@@ -43,18 +43,21 @@ enum SearchIntent {
         }
     }
 
-    /// WHY the lane ran, in the two flavours the band can explain.
+    /// Why the lane ran, including an explicit request.
     enum Trigger: Equatable, Sendable {
         /// The reader wrote a question, or something long enough to be one.
         case questionShaped
         /// Three or more words and no message carries all of them.
         case noStrictHits
+        /// Explicit request, independent of the query classifier.
+        case requested
 
         /// The closed-vocabulary string `search_deeper_started` carries. It is
         /// in `Analytics.allowedStrings`; nothing derived from the query or the
         /// mail is anywhere near this event.
         var analyticsValue: String {
             switch self {
+            case .requested: "requested"
             case .questionShaped: "question"
             case .noStrictHits: "no_strict_hits"
             }
@@ -125,6 +128,7 @@ enum SearchIntent {
     /// around after the fact.
     static func reason(_ trigger: Trigger, query: String) -> String {
         switch trigger {
+        case .requested: return "you asked the agent"
         case .questionShaped:
             return "that reads like a question"
         case .noStrictHits:

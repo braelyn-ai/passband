@@ -6,6 +6,24 @@ where the build taught the design something. This is the design record for makin
 find the mail you mean, not just the mail that contains your words, and it
 starts from a query that the current search handled worse than a human did.
 
+## September 18: desktop search presentation and typing latency
+
+By default, the desktop panel sends `mode=keyword&unfinished_first=true` while
+typing. Selecting `Include related` requests hybrid retrieval instead; this
+choice is saved alongside the sort preference across searches and app launches.
+With related results off, embedding is outside the first-result path.
+Agent search defaults are unchanged.
+
+The status option groups unfinished results ahead of done results before
+pagination, retaining the selected ranking within each group. Keyword search
+keeps its strict/partial ordering inside each status group. Hybrid/semantic
+status grouping uses a fixed 600-candidate recall window across pages; recall
+remains approximate. Search hits now include `is_done`, `subject_matches` and
+`snippet_matches`, with matched surface forms supplied by FTS. Desktop results
+use a continuous responsive list, warm evidence highlights and readable previews.
+
+See [the UX investigation](SEARCH-UX-REVIEW.md) for evidence and remaining limits.
+
 ## 1. What the motivating query taught us
 
 The query was "abstract conference wifi password". The reader knew the email

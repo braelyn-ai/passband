@@ -713,6 +713,9 @@ pub async fn get_attachment(
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
+    /// Human search's status grouping; omitted by agent callers.
+    #[serde(default)]
+    unfinished_first: bool,
     /// The raw query, operators included (`invoice from:jane after:2026-01-01`).
     /// Parsed exactly once, here, then threaded into the store as
     /// `(text, filter)`.
@@ -931,7 +934,14 @@ pub async fn search(
         }
     };
 
-    let k = recall_k(limit, offset, &filter);
+    let unfinished_first = query.unfinished_first;
+    // A fixed candidate window keeps the status seam stable between pages.
+    // Semantic recall remains bounded, as it is for the ordinary hybrid path.
+    let k = if unfinished_first {
+        600
+    } else {
+        recall_k(limit, offset, &filter)
+    };
     let partial = parse_partial(query.partial.as_deref())?;
 
     // PUNCTUATION IS NOT AN INVITATION TO LIST THE MAILBOX, in any mode.
@@ -978,8 +988,11 @@ pub async fn search(
     // two leaves the counts describing a mailbox one message newer than the
     // page. Harmless, and written down because "the same store call" is easy to
     // misread as "atomically".
+    let queued_at = std::time::Instant::now();
     let (items, window_full, diagnostics) = store_call(&state, move |store, account_id| {
-        let include_sent = effective != SearchMode::Keyword;
+        let started = std::time::Instant::now();
+        let queue_ms = queued_at.elapsed().as_millis();
+        let include_sent = effective != SearchMode::Keyword || unfinished_first;
         // The strict count worth sharing, and only when it answers the same
         // question the diagnostics ask: no operator predicates. With a `from:`
         // or a date bound the page counted a narrower set, and the two deserve
@@ -987,9 +1000,18 @@ pub async fn search(
         let mut counted_strict = None;
         let (items, window_full): (Vec<SearchItem>, bool) = match effective {
             SearchMode::Keyword => {
-                let (hits, strict) = store.search_filtered_counted(
-                    account_id, &term, &filter, sort, partial, limit, offset,
-                )?;
+                let (hits, strict) = if unfinished_first {
+                    (
+                        store.search_unfinished_first(
+                            account_id, &term, &filter, sort, partial, limit, offset,
+                        )?,
+                        None,
+                    )
+                } else {
+                    store.search_filtered_counted(
+                        account_id, &term, &filter, sort, partial, limit, offset,
+                    )?
+                };
                 if filter.is_empty() {
                     counted_strict = strict;
                 }
@@ -1014,6 +1036,9 @@ pub async fn search(
             SearchMode::Semantic => {
                 let (mut hits, window_full) =
                     store.semantic_search_hits(account_id, &term, &filter, sort, partial, k)?;
+                if unfinished_first {
+                    hits.sort_by_key(|hit| hit.is_done);
+                }
                 let page: Vec<SearchItem> = hits
                     .drain(..)
                     .skip(offset as usize)
@@ -1029,7 +1054,7 @@ pub async fn search(
                 // The range is counted after filtering, exactly like the page
                 // below. Only rows the client receives need match snippets.
                 let start = offset as usize;
-                let (mut hits, window_full) = store.hybrid_search_legs_windowed(
+                let (mut hits, window_full) = store.hybrid_search_legs_ordered(
                     account_id,
                     &term,
                     &filter,
@@ -1037,6 +1062,7 @@ pub async fn search(
                     partial,
                     start..start.saturating_add(limit as usize),
                     k,
+                    unfinished_first,
                 )?;
                 let page: Vec<SearchItem> = hits
                     .drain(..)
@@ -1056,6 +1082,8 @@ pub async fn search(
                 (page, window_full)
             }
         };
+        let retrieval_ms = started.elapsed().as_millis();
+        let diagnostics_started = std::time::Instant::now();
         let diagnostics = store.search_diagnostics_with(
             account_id,
             &term,
@@ -1063,6 +1091,11 @@ pub async fn search(
             include_sent,
             counted_strict,
         )?;
+        if queued_at.elapsed().as_millis() >= 250 {
+            eprintln!("squelch: slow search mode={} queue_ms={queue_ms} retrieval_ms={retrieval_ms} diagnostics_ms={} total_ms={} items={}",
+                effective.as_str(), diagnostics_started.elapsed().as_millis(),
+                queued_at.elapsed().as_millis(), items.len());
+        }
         Ok((items, window_full, diagnostics))
     })
     .await?;

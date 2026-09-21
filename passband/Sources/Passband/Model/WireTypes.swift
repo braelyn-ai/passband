@@ -711,6 +711,10 @@ struct UnsubscribeRecord: Codable, Sendable, Hashable, Identifiable {
 // MARK: - search / audit / stats
 
 struct SearchHit: Codable, Sendable, Identifiable, Hashable {
+    // Optional for compatibility with older daemons: unknown is not unfinished.
+    var is_done: Bool? = nil
+    var subject_matches: [String]? = nil
+    var snippet_matches: [String]? = nil
     var id: Int
     var thread_id: String
     var from_addr: String

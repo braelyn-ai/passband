@@ -9259,3 +9259,108 @@ async fn a_query_of_pure_punctuation_lists_nothing_in_any_mode() {
         "the from: half still lists that sender's mail"
     );
 }
+
+#[tokio::test]
+async fn search_unfinished_first_is_global_across_keyword_pages() {
+    use squelch_core::types::AttentionStatus;
+    let Harness { app, .. } = harness(|store, acct| {
+        for (id, subject, done) in [
+            ("done-strict", "anjuna tickets", true),
+            ("open-partial", "tickets", false),
+            ("open-strict", "anjuna tickets", false),
+            ("done-partial", "tickets", true),
+        ] {
+            let id = store
+                .upsert_message(&msg(acct, id, id, subject, "Save your tickets below"))
+                .unwrap();
+            store
+                .set_triage(
+                    id,
+                    acct,
+                    50,
+                    Tier::Signal,
+                    Sensitivity::Normal,
+                    None,
+                    "",
+                    "",
+                    None,
+                )
+                .unwrap();
+            if done {
+                store
+                    .set_attention_status(acct, id, AttentionStatus::Done)
+                    .unwrap();
+            }
+        }
+    });
+    for sort in ["recent", "best_match"] {
+        let mut cursor = String::new();
+        let mut threads = Vec::new();
+        loop {
+            let uri = format!(
+                "/client/search?q=anjuna%20tickets&mode=keyword&unfinished_first=true&sort={sort}&limit=1{cursor}"
+            );
+            let response = app.clone().oneshot(authed("GET", &uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body_json(response).await;
+            for hit in json["items"].as_array().unwrap() {
+                let thread = hit["thread_id"].as_str().unwrap();
+                assert_eq!(hit["is_done"], thread.starts_with("done"));
+                assert_eq!(hit["snippet_matches"], serde_json::json!(["tickets"]));
+                threads.push(thread.to_string());
+            }
+            match json["next_cursor"].as_str() {
+                Some(c) => cursor = format!("&cursor={c}"),
+                None => break,
+            }
+            assert!(threads.len() <= 4);
+        }
+        assert_eq!(
+            threads,
+            ["open-strict", "open-partial", "done-strict", "done-partial"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_fast_path_keeps_sent_mail_and_matching_diagnostics() {
+    let Harness { app, .. } = harness(|store, acct| {
+        let mut sent = msg(
+            acct,
+            "sent-ticket",
+            "sent-ticket",
+            "tickets",
+            "Here are the tickets",
+        );
+        sent.is_sent = true;
+        store.upsert_message(&sent).unwrap();
+    });
+    for q in ["tickets", "from:alice"] {
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/client/search?q={q}&mode=keyword&unfinished_first=true"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["items"][0]["thread_id"], "sent-ticket");
+        assert_eq!(json["items"][0]["is_done"], false);
+        if q == "tickets" {
+            assert_eq!(json["diagnostics"]["strict_hits"], 1);
+        }
+    }
+    let response = app
+        .oneshot(authed("GET", "/client/search?q=tickets&mode=keyword"))
+        .await
+        .unwrap();
+    assert!(
+        body_json(response).await["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "other keyword callers retain their existing inbound-only scope"
+    );
+}
