@@ -1791,6 +1791,8 @@ async fn gather_store_metrics(
             db_bytes,
             wal_bytes,
             devices_paired,
+            triage_jobs: store.triage_job_counts(account_id)?,
+            retriage: store.retriage_progress(account_id)?,
         })
     })
     .await;

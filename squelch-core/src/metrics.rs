@@ -1089,6 +1089,10 @@ pub struct StoreSnapshot {
     /// this is here so an operator can see the fleet's paired devices on a
     /// dashboard, and nothing reads it back.
     pub devices_paired: u64,
+    /// Durable investigation jobs, including delayed retries; excludes notifications.
+    pub triage_jobs: [u64; 2],
+    /// The same rolling 24-hour manual re-triage window as /client/retriage.
+    pub retriage: crate::types::RetriageProgress,
 }
 
 /// Roll the per-day ledger rows up into one total per category.
@@ -1233,6 +1237,20 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         MetricKind::Gauge,
         "Sync failures since the last success; 0 while sync is healthy.",
         metrics.get(&metrics.sync_consecutive_failures),
+    );
+
+    let (done, total) = metrics.catchup_progress().unwrap_or((0, 0));
+    e.scalar(
+        "squelchd_catchup_messages_done",
+        MetricKind::Gauge,
+        "Messages fetched in the current catch-up; 0 when idle.",
+        done as f64,
+    );
+    e.scalar(
+        "squelchd_catchup_messages_total",
+        MetricKind::Gauge,
+        "Messages listed for the current catch-up; grows when SENT is listed, 0 when idle.",
+        total as f64,
     );
 
     e.family(
@@ -1418,6 +1436,20 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
     // that carries the atomics and omits these is a degraded scrape; a 500 is
     // no scrape at all.
     if let Some(db) = db {
+        e.family("squelchd_triage_jobs", MetricKind::Gauge,
+            "Durable triage/access jobs by state; queued includes delayed retries, leased includes expired leases awaiting reclamation. Excludes notification jobs.");
+        for (state, count) in ["queued", "leased"].into_iter().zip(db.triage_jobs) {
+            e.sample("squelchd_triage_jobs", &[("state", state)], count as f64);
+        }
+        e.scalar(
+            "squelchd_retriage_messages_total",
+            MetricKind::Gauge,
+            "Messages in the rolling 24-hour manual re-triage window, matching /client/retriage.",
+            db.retriage.total as f64,
+        );
+        e.scalar("squelchd_retriage_messages_done", MetricKind::Gauge,
+            "Terminal messages in the manual re-triage window; includes completed and failed jobs, not just successful verdicts.", db.retriage.done as f64);
+
         e.family(
             "squelchd_store_messages",
             MetricKind::Gauge,
@@ -1839,6 +1871,9 @@ mod tests {
         assert!(text.contains("squelchd_embedder_loaded 0\n"));
         assert!(!text.contains("squelchd_db_size_bytes"));
         assert!(!text.contains("squelchd_store_messages"));
+        assert!(!text.contains("squelchd_triage_jobs"));
+        assert!(!text.contains("squelchd_retriage_messages"));
+        assert!(text.contains("squelchd_catchup_messages_total 0\n"));
         assert!(!text.contains("squelchd_devices_paired"));
         assert!(text.ends_with('\n'));
     }
@@ -1885,10 +1920,20 @@ mod tests {
             db_bytes: 4096,
             wal_bytes: 0,
             devices_paired: 2,
+            triage_jobs: [9, 2],
+            retriage: crate::types::RetriageProgress {
+                total: 7,
+                done: 3,
+                started_at: None,
+            },
         };
         let text = render(&m, Some(&db));
         assert!(text.contains("squelchd_store_messages{tier=\"signal\"} 7\n"));
         assert!(text.contains("squelchd_store_messages_sealed 2\n"));
+        assert!(text.contains("squelchd_triage_jobs{state=\"queued\"} 9\n"));
+        assert!(text.contains("squelchd_triage_jobs{state=\"leased\"} 2\n"));
+        assert!(text.contains("squelchd_retriage_messages_total 7\n"));
+        assert!(text.contains("squelchd_retriage_messages_done 3\n"));
         assert!(text.contains("squelchd_llm_calls_total{category=\"extract_banking\"} 3\n"));
         assert!(text.contains(
             "squelchd_llm_tokens_total{category=\"extract_banking\",direction=\"input\"} 150\n"
@@ -2086,6 +2131,21 @@ mod gmail_auth_state_tests {
 #[cfg(test)]
 mod catchup_progress_tests {
     use super::*;
+
+    #[test]
+    fn catchup_exposition_tracks_sent_extension_and_clears_when_idle() {
+        let m = SyncMetrics::new();
+        m.catchup_begin(2);
+        m.catchup_step();
+        assert!(render(&m, None).contains("squelchd_catchup_messages_done 1\n"));
+        assert!(render(&m, None).contains("squelchd_catchup_messages_total 2\n"));
+        m.catchup_begin_extend(3);
+        assert!(render(&m, None).contains("squelchd_catchup_messages_total 3\n"));
+        m.catchup_end();
+        let text = render(&m, None);
+        assert!(text.contains("squelchd_catchup_messages_done 0\n"));
+        assert!(text.contains("squelchd_catchup_messages_total 0\n"));
+    }
 
     /// A catch-up has a denominator while it runs and none when it does not.
     /// Absence is what lets every other caller treat the progress step as a
