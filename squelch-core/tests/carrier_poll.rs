@@ -221,7 +221,7 @@ fn row(store: &SqliteStore, acct: i64, number: &str) -> Shipment {
     // A policy that hides nothing: these tests are about polling, and several of
     // them deliberately drive `poll_failures` up.
     let keep_all = squelch_core::config::ShipmentListPolicy {
-        suppress_failed_ambiguous_at: u32::MAX,
+        retired_at_failures: u32::MAX,
         stale_after_days: 0,
     };
     store

@@ -1087,7 +1087,7 @@ mod tests {
     /// deliberately drive `poll_failures` up or leave a row untouched for days.
     fn keep_all() -> crate::config::ShipmentListPolicy {
         crate::config::ShipmentListPolicy {
-            suppress_failed_ambiguous_at: u32::MAX,
+            retired_at_failures: u32::MAX,
             stale_after_days: 0,
         }
     }

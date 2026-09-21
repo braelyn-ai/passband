@@ -41,6 +41,10 @@ pub struct SquelchServer {
     /// `max_failures = 1` kept seeing retired phantoms through their agent for
     /// four more failures, and one who set `10` had live packages hidden from it
     /// at five. Two doors, one view.
+    ///
+    /// CARRIED, NOT CURRENTLY APPLIED: since the agent rewrite `get_shipments`
+    /// reads `external_shipments`, which takes no policy, and the human door's
+    /// silence window deliberately stops at that door (see `docs/SHIPMENTS.md`).
     shipment_policy: ShipmentListPolicy,
     ranking_config: RankingConfig,
     // Read only by the macro-generated `ServerHandler`, so dead-code analysis

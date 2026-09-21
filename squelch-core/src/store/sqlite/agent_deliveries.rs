@@ -124,6 +124,16 @@ pub(super) fn reconcile(
                  status=COALESCE(?6,?5),
                  delivered_at=CASE WHEN carrier_status_raw IS NULL AND ?5!='delivered' THEN NULL ELSE delivered_at END
                  WHERE account_id=?1 AND id=?2",params![account,id,info.carrier,message,info.status.as_str(),carrier_status,info.tracking_url,received.to_rfc3339()])?;
+        } else {
+            // A LEGACY row is never re-identified or retired here, but newer
+            // mail about its package is still news, and nothing else is left to
+            // record it: take the status and move `last_update`, which is what
+            // returns a row the listing hid as silent. Only mail NEWER than the
+            // row counts, so re-triaging old mail rewrites nothing.
+            conn.execute("UPDATE shipments SET last_message_id=?3,last_update=?6,
+                 status=COALESCE(?5,?4),
+                 delivered_at=CASE WHEN COALESCE(?5,?4)='delivered' THEN COALESCE(delivered_at,?6) ELSE delivered_at END
+                 WHERE account_id=?1 AND id=?2 AND last_update<?6",params![account,id,message,info.status.as_str(),carrier_status,received.to_rfc3339()])?;
         }
     }
     Ok(())
@@ -238,6 +248,115 @@ mod tests {
             marker_count, 0,
             "normalized final retraction removes ownership marker"
         );
+    }
+
+    /// A row written before the agent owned deliveries, `age_days` silent.
+    fn legacy_row(store: &SqliteStore, number: &str, age_days: i64) -> i64 {
+        let at = (Utc::now() - chrono::Duration::days(age_days)).to_rfc3339();
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO shipments(account_id,tracking_number,carrier,item_name,status,first_seen,last_update)
+             VALUES(1,?1,'ups','Lamp','shipped',?2,?2)",
+            params![number, at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn listed(store: &SqliteStore) -> Vec<crate::types::Shipment> {
+        let policy = crate::config::ShipmentListPolicy::default();
+        assert!(
+            policy.stale_after_days > 0,
+            "the default policy goes silent"
+        );
+        store.list_shipments(1, false, policy).unwrap()
+    }
+
+    /// THE PRODUCTION REVIVAL PATH. `reconcile` is the only mail-driven writer
+    /// left, so a row the listing hid as silent comes back through here or not
+    /// at all, and a legacy row is in no projection to be updated through.
+    #[test]
+    fn newer_mail_returns_a_silent_legacy_row_without_adopting_it() {
+        let store = fixture();
+        let id = legacy_row(&store, "1Z999AA10123456784", 30);
+        assert!(listed(&store).is_empty(), "silent for 30 days: hidden");
+
+        let update = delivery("1Z999AA10123456784", "out_for_delivery");
+        write(&store, 2, None, &update);
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1, "the update email brought it back");
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].status, "out_for_delivery");
+        assert_eq!(rows[0].item_name, "Lamp", "the legacy name is untouched");
+
+        // Retracting that mail must not delete a row this projection never owned.
+        write(&store, 2, Some(&update), &MessageDecision::default());
+        let kept: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM shipments WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1, "legacy rows are never retired from here");
+    }
+
+    /// Re-triaging OLD mail is not news: it must not resurrect the row, or a
+    /// re-triage pass would refill the list with every dead package at once.
+    #[test]
+    fn re_deciding_old_mail_does_not_return_a_silent_legacy_row() {
+        let store = fixture();
+        legacy_row(&store, "1Z999AA10123456784", 30);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(40)).to_rfc3339()],
+            )
+            .unwrap();
+        write(
+            &store,
+            1,
+            None,
+            &delivery("1Z999AA10123456784", "delivered"),
+        );
+        assert!(listed(&store).is_empty());
+        let status: String = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM shipments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status, "shipped",
+            "mail older than the row rewrites nothing"
+        );
+    }
+
+    /// The same revival for a row this projection DOES own.
+    #[test]
+    fn newer_mail_returns_a_silent_managed_row() {
+        let store = fixture();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
+            )
+            .unwrap();
+        write(&store, 1, None, &delivery("1Z999AA10123456784", "shipped"));
+        assert!(
+            listed(&store).is_empty(),
+            "minted from 30-day-old mail: hidden"
+        );
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456784", "out_for_delivery"),
+        );
+        assert_eq!(listed(&store).len(), 1);
     }
 
     #[test]

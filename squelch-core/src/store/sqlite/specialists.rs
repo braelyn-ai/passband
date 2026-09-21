@@ -526,22 +526,38 @@ fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipmen
 }
 
 /// `true` while a CARRIER is vouching for the row: one has answered for this
-/// number (`carrier_status_raw`), has not permanently rejected it since
-/// (`poll_failures`), and was asked again inside the window (`last_polled_at`).
-/// The last leg matters because polling stops on its own, when the operator
-/// removes a key or the row ages past `[carriers] max_age_days`, and a row
-/// nobody asks about any more is not being tracked whatever it once said.
-fn carrier_vouches(shipment: &crate::types::Shipment, since: DateTime<Utc>) -> bool {
+/// number (`carrier_status_raw`), has not rejected it into retirement since
+/// (`poll_failures` under the poller's cap), and was asked again inside the
+/// window (`last_polled_at`). The cap rather than zero, because one counted
+/// rejection from a carrier that answers again six hours later is a blip, and
+/// un-vouching on it would blink a parcel off the list and back. The last leg
+/// matters because polling stops on its own, when the operator removes a key or
+/// the row ages past `[carriers] max_age_days`, and a row nobody asks about any
+/// more is not being tracked whatever it once said.
+fn carrier_vouches(
+    shipment: &crate::types::Shipment,
+    since: DateTime<Utc>,
+    retired_at_failures: u32,
+) -> bool {
     shipment.carrier_status_raw.is_some()
-        && shipment.poll_failures == 0
+        && shipment.poll_failures < retired_at_failures
         && shipment.last_polled_at.is_some_and(|at| at >= since)
+}
+
+/// The silence half of a [`ShipmentListPolicy`](crate::config::ShipmentListPolicy),
+/// resolved against the clock: hide what has not moved since `before` unless a
+/// carrier under `retired_at_failures` vouches for it.
+#[derive(Clone, Copy)]
+struct Silence {
+    before: DateTime<Utc>,
+    retired_at_failures: u32,
 }
 
 fn list_shipments_conn(
     conn: &Connection,
     account_id: AccountId,
     include_delivered: bool,
-    silent_before: Option<DateTime<Utc>>,
+    silence: Option<Silence>,
 ) -> Result<Vec<crate::types::Shipment>> {
     // This is a human record listing; external access is enforced separately.
     // `cleared_at` rides along as an extra column: the read-side policy below
@@ -573,8 +589,9 @@ fn list_shipments_conn(
             // the mail stopped. Age alone hides nothing: a package a carrier is
             // still answering for stays listed however long it sits, because
             // that silence is the carrier's word rather than our ignorance.
-            let silent = silent_before.is_some_and(|cutoff| {
-                shipment.last_update < cutoff && !carrier_vouches(shipment, cutoff)
+            let silent = silence.is_some_and(|s| {
+                shipment.last_update < s.before
+                    && !carrier_vouches(shipment, s.before, s.retired_at_failures)
             });
             !(cleared || silent)
         })
@@ -793,10 +810,22 @@ impl SqliteStore {
         include_delivered: bool,
         policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
+        // BEFORE THE LOCK, and checked: an operator writing an enormous window
+        // to mean "never" overflows the subtraction, and a panic with the guard
+        // alive poisons the store for every caller after it. A cutoff before
+        // the calendar begins hides nothing, which is what they meant.
+        let silence = (policy.stale_after_days > 0)
+            .then(|| {
+                chrono::Duration::try_days(policy.stale_after_days as i64)
+                    .and_then(|window| Utc::now().checked_sub_signed(window))
+            })
+            .flatten()
+            .map(|before| Silence {
+                before,
+                retired_at_failures: policy.retired_at_failures,
+            });
         let conn = self.lock()?;
-        let silent_before = (policy.stale_after_days > 0)
-            .then(|| Utc::now() - chrono::Duration::days(policy.stale_after_days as i64));
-        list_shipments_conn(&conn, account_id, include_delivered, silent_before)
+        list_shipments_conn(&conn, account_id, include_delivered, silence)
     }
 
     /// Read carrier facts and validate all contributing messages under one lock.

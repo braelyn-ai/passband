@@ -642,7 +642,7 @@ impl CarriersConfig {
     /// The listing half of this block, as the value both doors carry.
     pub fn list_policy(&self) -> ShipmentListPolicy {
         ShipmentListPolicy {
-            suppress_failed_ambiguous_at: self.max_failures,
+            retired_at_failures: self.max_failures,
             stale_after_days: self.stale_after_days,
         }
     }
@@ -658,9 +658,10 @@ impl CarriersConfig {
 /// [`Store::list_shipments`](crate::store::Store::list_shipments).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShipmentListPolicy {
-    /// Permanent poll failures after which an AMBIGUOUS-shaped tracking number
-    /// is treated as a phantom and hidden. From `[carriers] max_failures`.
-    pub suppress_failed_ambiguous_at: u32,
+    /// Permanent poll failures at which the poller retires a row, and so the
+    /// point past which its carrier no longer vouches for it in the listing.
+    /// Shape is no part of it. From `[carriers] max_failures`.
+    pub retired_at_failures: u32,
     /// Days without a user-visible change after which a row NO CARRIER IS
     /// VOUCHING FOR is hidden. `0` disables the filter. From `[carriers]
     /// stale_after_days`.
@@ -3742,10 +3743,7 @@ backfill_days = 90
             CarriersConfig::default().list_policy()
         );
         assert_eq!(ShipmentListPolicy::default().stale_after_days, 10);
-        assert_eq!(
-            ShipmentListPolicy::default().suppress_failed_ambiguous_at,
-            5
-        );
+        assert_eq!(ShipmentListPolicy::default().retired_at_failures, 5);
 
         let carriers = CarriersConfig {
             max_failures: 2,
@@ -3753,7 +3751,7 @@ backfill_days = 90
             ..CarriersConfig::default()
         };
         let policy = ShipmentListPolicy::from(&carriers);
-        assert_eq!(policy.suppress_failed_ambiguous_at, 2);
+        assert_eq!(policy.retired_at_failures, 2);
         assert_eq!(
             policy.stale_after_days, 0,
             "0 is a real value (the filter off), never a fallback to the default"

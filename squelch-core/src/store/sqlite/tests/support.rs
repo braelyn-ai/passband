@@ -586,7 +586,7 @@ pub(super) fn vec_count_for(store: &SqliteStore, message_id: i64) -> i64 {
 /// something else. The suppression, staleness and clear tests build their own.
 pub(super) const KEEP_ALL_SHIPMENTS: crate::config::ShipmentListPolicy =
     crate::config::ShipmentListPolicy {
-        suppress_failed_ambiguous_at: u32::MAX,
+        retired_at_failures: u32::MAX,
         stale_after_days: 0,
     };
 
@@ -594,7 +594,7 @@ pub(super) const KEEP_ALL_SHIPMENTS: crate::config::ShipmentListPolicy =
 /// tests that ARE about phantom suppression.
 pub(super) fn suppress_at(cap: u32) -> crate::config::ShipmentListPolicy {
     crate::config::ShipmentListPolicy {
-        suppress_failed_ambiguous_at: cap,
+        retired_at_failures: cap,
         ..KEEP_ALL_SHIPMENTS
     }
 }

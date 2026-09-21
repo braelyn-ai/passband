@@ -3611,6 +3611,17 @@ mod tests {
             "explicit valid tracking enters carrier polling"
         );
         assert_eq!(store.external_shipments(1, true).unwrap().len(), 1);
+        // The silence window is the human listing's alone: this feed is merged
+        // with the agent's own delivery records, which have nothing to age by.
+        let silent = (Utc::now() - Duration::days(30)).to_rfc3339();
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE shipments SET last_update=?1", [&silent])
+            .unwrap();
+        let policy = crate::config::ShipmentListPolicy::default();
+        assert!(store.list_shipments(1, true, policy).unwrap().is_empty());
+        assert_eq!(store.external_shipments(1, true).unwrap().len(), 1);
         store
             .enqueue_agent_triage(1, 1, "record_retraction", false)
             .unwrap();
