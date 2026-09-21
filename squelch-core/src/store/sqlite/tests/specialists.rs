@@ -1414,25 +1414,39 @@ fn aged_shipment(store: &SqliteStore, acct: AccountId, number: &str, age_days: i
         .unwrap()
 }
 
+/// The carrier's unchanged answer, for polls that must NOT move `last_update`.
+fn in_transit() -> crate::triage::CarrierTrack {
+    crate::triage::CarrierTrack {
+        status: Some(crate::triage::ShipmentStatus::Shipped),
+        carrier_status_raw: "In Transit".into(),
+        eta: None,
+        delivered_at: None,
+    }
+}
+
+fn listed_ids(store: &SqliteStore, acct: AccountId, days: u32) -> Vec<i64> {
+    store
+        .list_shipments(acct, false, stale_after(days))
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect()
+}
+
+/// Mail was the row's only source and the mail stopped: it leaves the list.
 /// `last_update` advances ONLY on a user-visible change, so "older than N days"
-/// is literally "nothing has happened to this package in N days" — which is what
-/// the timeout is for. 0 turns the whole filter off.
+/// is literally "nothing has happened to this package in N days". 0 turns the
+/// whole filter off.
 #[test]
-fn shipment_age_does_not_change_record_visibility() {
+fn a_silent_shipment_no_carrier_vouches_for_leaves_the_list() {
     let (store, acct) = store();
-    let old = aged_shipment(&store, acct, "1Z999AA10123456784", 8);
-    let recent = aged_shipment(&store, acct, "1Z999AA10123456785", 6);
+    let old = aged_shipment(&store, acct, "1Z999AA10123456784", 11);
+    let recent = aged_shipment(&store, acct, "1Z999AA10123456785", 9);
 
-    let listed = store.list_shipments(acct, false, stale_after(7)).unwrap();
-    let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
-    assert_eq!(ids, vec![recent, old], "age is not a visibility rule");
-
+    assert_eq!(listed_ids(&store, acct, 10), vec![recent]);
     assert_eq!(
-        store
-            .list_shipments(acct, false, stale_after(0))
-            .unwrap()
-            .len(),
-        2,
+        listed_ids(&store, acct, 0),
+        vec![recent, old],
         "stale_after_days = 0 disables the filter entirely"
     );
     assert_eq!(
@@ -1444,15 +1458,105 @@ fn shipment_age_does_not_change_record_visibility() {
         "and the default test policy hides nothing either"
     );
 
-    // HIDDEN IS NOT RETIRED: the stale row is still in the poll queue, because a
-    // poll is exactly what would bring it back.
+    // HIDDEN IS NOT RETIRED: the silent row is still in the poll queue, because
+    // a poll is exactly what would bring it back.
     assert!(
         store
             .list_pollable_shipments(acct, Utc::now() - chrono::Duration::days(45), 5)
             .unwrap()
             .iter()
             .any(|s| s.id == old),
-        "a stale row keeps being polled"
+        "a silent row keeps being polled"
+    );
+}
+
+/// AGE ALONE HIDES NOTHING. A package a carrier is still answering for stays
+/// listed however long it sits; each way the carrier can stop vouching hides it.
+#[test]
+fn a_carrier_vouching_for_a_silent_shipment_keeps_it_listed() {
+    let (store, acct) = store();
+    let long_ago = Utc::now() - chrono::Duration::days(12);
+    let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 12);
+
+    // The carrier answered once, long ago, and was never asked again (a removed
+    // key, or a row aged past `max_age_days`). That is not tracking.
+    store
+        .apply_carrier_track(acct, sid, &in_transit(), long_ago)
+        .unwrap();
+    assert!(
+        listed_ids(&store, acct, 10).is_empty(),
+        "an answer nobody has refreshed inside the window vouches for nothing"
+    );
+
+    // The same answer again, today: no visible change, so `last_update` stays 12
+    // days old, but the carrier is demonstrably still tracking the package.
+    store
+        .apply_carrier_track(acct, sid, &in_transit(), Utc::now())
+        .unwrap();
+    let listed = store.list_shipments(acct, false, stale_after(10)).unwrap();
+    assert_eq!(listed.len(), 1, "a live carrier answer keeps the row");
+    assert!(
+        listed[0].last_update < Utc::now() - chrono::Duration::days(10),
+        "and it did so without the confirming poll touching last_update"
+    );
+
+    // A transient failure is not the carrier disowning the number.
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), false)
+        .unwrap();
+    assert_eq!(listed_ids(&store, acct, 10), vec![sid]);
+
+    // A permanent one is: tracking no longer works for this row.
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), true)
+        .unwrap();
+    assert!(
+        listed_ids(&store, acct, 10).is_empty(),
+        "a number the carrier now rejects is no longer vouched for"
+    );
+}
+
+/// A row that was asked about but never answered for (no key would not even get
+/// this far; this is the carrier rejecting the number from the start).
+#[test]
+fn a_poll_attempt_that_never_succeeded_vouches_for_nothing() {
+    let (store, acct) = store();
+    let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 11);
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), false)
+        .unwrap();
+    assert!(
+        listed_ids(&store, acct, 10).is_empty(),
+        "last_polled_at alone is an attempt, not an answer"
+    );
+}
+
+/// The revival: no un-hide call anywhere, only the next email about the package.
+#[test]
+fn a_silent_shipment_returns_when_new_mail_advances_it() {
+    let (store, acct) = store();
+    let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 30);
+    assert!(listed_ids(&store, acct, 10).is_empty());
+
+    let mid = store
+        .upsert_message(&triaged(acct, "g-revive", "t-stale").msg())
+        .unwrap();
+    store
+        .upsert_shipment(
+            acct,
+            mid,
+            &shipped(
+                "ups",
+                "1Z999AA10123456784",
+                crate::triage::ShipmentStatus::OutForDelivery,
+            ),
+            Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        listed_ids(&store, acct, 10),
+        vec![sid],
+        "the update email brought it back on its own"
     );
 }
 

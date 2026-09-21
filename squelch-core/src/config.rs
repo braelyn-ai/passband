@@ -590,13 +590,15 @@ pub struct CarriersConfig {
     /// Consecutive per-shipment API failures tolerated before it is dropped.
     /// Env: `SQUELCH_CARRIERS_MAX_FAILURES`.
     pub max_failures: u32,
-    /// Hide a shipment from BOTH DOORS' LISTINGS once nothing user-visible has
-    /// changed about it for this many days. A LISTING concern, like
-    /// [`CarriersConfig::max_failures`], which is why it lives here rather than
-    /// in its own table: the same `[carriers]` block already decides when a row
-    /// stops being shown.
+    /// Hide a shipment from the human door's listing once nothing user-visible
+    /// has changed about it for this many days AND no carrier is vouching for
+    /// it (never polled, permanently rejected, or no longer being asked about).
+    /// A package a carrier is still answering for is never hidden for age. A
+    /// LISTING concern, like [`CarriersConfig::max_failures`], which is why it
+    /// lives here rather than in its own table: the same `[carriers]` block
+    /// already decides when a row stops being shown.
     ///
-    /// `0` DISABLES the filter entirely (nothing is ever hidden for age).
+    /// `0` DISABLES the filter entirely (nothing is ever hidden for silence).
     /// Env: `SQUELCH_CARRIERS_STALE_AFTER_DAYS`.
     pub stale_after_days: u32,
     /// `[carriers.ups]`. `None` (or half a pair) => UPS is never polled.
@@ -616,7 +618,7 @@ impl Default for CarriersConfig {
             ofd_poll_interval_mins: 60,
             max_age_days: 45,
             max_failures: 5,
-            stale_after_days: 7,
+            stale_after_days: 10,
             ups: None,
             fedex: None,
             usps: None,
@@ -659,8 +661,9 @@ pub struct ShipmentListPolicy {
     /// Permanent poll failures after which an AMBIGUOUS-shaped tracking number
     /// is treated as a phantom and hidden. From `[carriers] max_failures`.
     pub suppress_failed_ambiguous_at: u32,
-    /// Days without a user-visible change after which a row is hidden as stale.
-    /// `0` disables the staleness filter. From `[carriers] stale_after_days`.
+    /// Days without a user-visible change after which a row NO CARRIER IS
+    /// VOUCHING FOR is hidden. `0` disables the filter. From `[carriers]
+    /// stale_after_days`.
     pub stale_after_days: u32,
 }
 
@@ -3721,7 +3724,7 @@ backfill_days = 90
         assert_eq!(c.carriers.ofd_poll_interval_mins, 60);
         assert_eq!(c.carriers.max_age_days, 45);
         assert_eq!(c.carriers.max_failures, 5);
-        assert_eq!(c.carriers.stale_after_days, 7);
+        assert_eq!(c.carriers.stale_after_days, 10);
 
         // A config predating the feature has no [carriers] table whatsoever.
         let cfg: Config = toml::from_str("squelch_level = 1\n").unwrap();
@@ -3738,7 +3741,7 @@ backfill_days = 90
             ShipmentListPolicy::default(),
             CarriersConfig::default().list_policy()
         );
-        assert_eq!(ShipmentListPolicy::default().stale_after_days, 7);
+        assert_eq!(ShipmentListPolicy::default().stale_after_days, 10);
         assert_eq!(
             ShipmentListPolicy::default().suppress_failed_ambiguous_at,
             5
