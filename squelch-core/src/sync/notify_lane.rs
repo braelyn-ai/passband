@@ -203,11 +203,19 @@ impl<S: Store + 'static> NotifyLane<S> {
             sender: context.message.from_addr.clone(),
             eligible_at,
         };
+        let now = Utc::now();
         let one_line = advice
             .login_code
             .as_ref()
             .and_then(|code| {
-                code.notification(is_auth, &context.message.subject, &context.message.body)
+                code.notification(
+                    is_auth,
+                    &context.message.from_addr,
+                    &context.message.subject,
+                    &context.message.body,
+                    eligible_at,
+                    now,
+                )
             })
             .unwrap_or_else(|| crate::text::truncate_chars(&advice.body, 160));
         self.emit(
@@ -218,7 +226,7 @@ impl<S: Store + 'static> NotifyLane<S> {
                 one_line: &one_line,
                 model_used: model,
             },
-            Utc::now(),
+            now,
             LaneLabel::Deliberate,
         )
     }
@@ -347,7 +355,9 @@ impl<S: Store + 'static> NotifyLane<S> {
                 let one_line = out
                     .login_code
                     .as_ref()
-                    .and_then(|code| code.notification(out.is_auth, &subject, &body))
+                    .and_then(|code| {
+                        code.notification(out.is_auth, &m.sender, &subject, &body, eligible_at, now)
+                    })
                     .unwrap_or_else(|| crate::text::truncate_chars(&out.one_line, 160));
                 self.store.record_notification_assessment(
                     self.account_id,
@@ -1249,23 +1259,30 @@ mod tests {
     #[tokio::test]
     async fn login_code_copy_reaches_both_notification_lanes() {
         for fast in [true, false] {
-            for code in ["001234", "999999"] {
+            for (code, is_auth, age_minutes, formatted) in [
+                ("001234", true, 0, true),
+                ("999999", true, 0, false),
+                ("001234", false, 0, false),
+                ("001234", true, 9, true),
+                ("001234", true, 10, false),
+                ("001234", true, 50, false),
+            ] {
                 let (store, acct) = store();
-                let now = Utc::now();
+                let now = Utc::now() - chrono::Duration::minutes(age_minutes);
                 let extraction = crate::triage::login_code::LoginCode {
                     service: "Example".into(),
                     code: code.into(),
                 };
-                let eml = format!("{}\r\nYour login code is 001234.", note_eml(now));
+                let eml = format!("{}\r\nYour Example login code is 001234.", note_eml(now));
                 let (id, candidate) = ingest(&store, acct, "code", &eml, now, &cfg());
                 let fallback;
                 if fast {
                     let mut response: serde_json::Value =
-                        serde_json::from_str(&verdict(0)).unwrap();
+                        serde_json::from_str(&verdict(90)).unwrap();
                     let mut assessment: serde_json::Value =
                         serde_json::from_str(response["content"][0]["text"].as_str().unwrap())
                             .unwrap();
-                    assessment["is_auth"] = serde_json::json!(true);
+                    assessment["is_auth"] = serde_json::json!(is_auth);
                     assessment["login_code"] = serde_json::to_value(&extraction).unwrap();
                     response["content"][0]["text"] = serde_json::json!(assessment.to_string());
                     let (url, _) = mock(200, response.to_string(), false).await;
@@ -1277,19 +1294,19 @@ mod tests {
                 } else {
                     let context = durable_context(&store, acct, id);
                     let mut advice = advice();
-                    advice.importance = 0;
+                    advice.importance = 90;
                     advice.login_code = Some(extraction);
                     lane(&store, acct, None, cfg())
-                        .request_assessed(&context, true, &advice, "full-model")
+                        .request_assessed(&context, is_auth, &advice, "full-model")
                         .unwrap();
                     fallback = "A cancellation needs your attention";
                 }
                 let events = store.events_after(acct, 0, 10).unwrap();
                 assert_eq!(events.len(), 1);
-                assert!(events[0].is_auth);
+                assert_eq!(events[0].is_auth, is_auth);
                 assert_eq!(
                     events[0].one_line,
-                    if code == "001234" {
+                    if formatted {
                         "Your Example login code is 001234"
                     } else {
                         fallback

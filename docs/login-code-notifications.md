@@ -2,9 +2,9 @@
 
 Both the fast notification assessor and full triage extract an optional
 `login_code: { service, code }` from the arriving email. The notification lane
-checks the auth flag, code shape and exact source occurrence, then emits
+checks the auth flag, an arrival age under ten minutes, code shape and exact source occurrence, then emits
 `Your <service> login code is <code>`. Leading zeros, case, spaces and hyphens
-are preserved. No extra model call or database migration is needed.
+are preserved. Service names must appear case-insensitively in the sender, subject, or body, contain no Unicode control (Cc) or format (Cf) characters, and fit in 32 characters. Older arrivals retain descriptive copy. No extra model call or database migration is needed.
 
 The model identifies the current code and service semantically. It must return
 null for ambiguous codes, older quoted messages, reset links, passwords, recovery
@@ -24,7 +24,7 @@ notification service extension. The relay still transports encrypted events.
 
 Automated tests cover exact copy through both notification lanes, leading zeros,
 mixed-case and separated codes, source matching, invalid extraction fallback,
-and existing notification eligibility/deduplication.
+non-auth and delayed-arrival fallback through both lanes, service source matching, Unicode format/control rejection, and existing notification eligibility/deduplication.
 
 Device acceptance check (requires a configured account and notification grants):
 
