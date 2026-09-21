@@ -107,6 +107,8 @@ pub struct ThreadAttentionDecision {
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NotificationAdvice {
+    #[serde(default)]
+    pub login_code: Option<super::login_code::LoginCode>,
     pub importance: u8,
     pub title: String,
     pub body: String,

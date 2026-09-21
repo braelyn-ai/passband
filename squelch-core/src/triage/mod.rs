@@ -14,6 +14,7 @@ pub mod decision;
 pub mod events;
 pub mod extract;
 pub mod llm;
+pub mod login_code;
 pub mod money;
 pub mod notify_llm;
 pub mod ranking;
