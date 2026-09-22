@@ -119,18 +119,25 @@ pub(super) fn reconcile(
         if managed {
             // The newest retained explicit proposal is authoritative for email
             // fields. Carrier observations remain authoritative once polled.
+            // Mail NEWER than the row also un-retires it: a carrier that said
+            // "never heard of it" five times was answering about a label the
+            // shipper had not handed over, and fresh mail is the evidence the
+            // number is real now. Nothing else can reset the counter, because a
+            // retired row is not polled. Re-triaging old mail resets nothing.
             conn.execute("UPDATE shipments SET carrier=?3,created_by_message_id=?4,last_message_id=?4,
                  tracking_url=?7,last_update=MAX(last_update,?8),
+                 poll_failures=CASE WHEN last_update<?8 THEN 0 ELSE poll_failures END,
                  status=COALESCE(?6,?5),
                  delivered_at=CASE WHEN carrier_status_raw IS NULL AND ?5!='delivered' THEN NULL ELSE delivered_at END
                  WHERE account_id=?1 AND id=?2",params![account,id,info.carrier,message,info.status.as_str(),carrier_status,info.tracking_url,received.to_rfc3339()])?;
         } else {
             // A LEGACY row is never re-identified or retired here, but newer
             // mail about its package is still news, and nothing else is left to
-            // record it: take the status and move `last_update`, which is what
-            // returns a row the listing hid as silent. Only mail NEWER than the
-            // row counts, so re-triaging old mail rewrites nothing.
-            conn.execute("UPDATE shipments SET last_message_id=?3,last_update=?6,
+            // record it: take the status, move `last_update` (which returns a
+            // row the listing hid as silent) and un-retire it, as above. Only
+            // mail NEWER than the row counts, so re-triaging old mail rewrites
+            // nothing.
+            conn.execute("UPDATE shipments SET last_message_id=?3,last_update=?6,poll_failures=0,
                  status=COALESCE(?5,?4),
                  delivered_at=CASE WHEN COALESCE(?5,?4)='delivered' THEN COALESCE(delivered_at,?6) ELSE delivered_at END
                  WHERE account_id=?1 AND id=?2 AND last_update<?6",params![account,id,message,info.status.as_str(),carrier_status,received.to_rfc3339()])?;
@@ -331,6 +338,85 @@ mod tests {
             status, "shipped",
             "mail older than the row rewrites nothing"
         );
+    }
+
+    fn poll_failures(store: &SqliteStore, id: i64) -> u32 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT poll_failures FROM shipments WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn retire(store: &SqliteStore, id: i64) {
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE shipments SET poll_failures=5 WHERE id=?1", [id])
+            .unwrap();
+    }
+
+    fn pollable(store: &SqliteStore, id: i64) -> bool {
+        store
+            .list_pollable_shipments(1, Utc::now() - chrono::Duration::days(45), 5)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == id)
+    }
+
+    /// A retired number is polled again once newer mail says it is real. Only a
+    /// successful poll used to reset the counter, and a retired row never gets
+    /// one, so retirement had quietly become permanent.
+    #[test]
+    fn newer_mail_un_retires_a_row_and_older_mail_does_not() {
+        let store = fixture();
+        // Owned row, minted from 30-day-old mail, then retired.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
+            )
+            .unwrap();
+        write(&store, 1, None, &delivery("1Z999AA10123456784", "shipped"));
+        let owned: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM shipments", [], |r| r.get(0))
+            .unwrap();
+        retire(&store, owned);
+        assert!(!pollable(&store, owned), "retired: out of the poll queue");
+
+        // Re-deciding the SAME mail is not news: still retired.
+        write(&store, 1, None, &delivery("1Z999AA10123456784", "shipped"));
+        assert_eq!(poll_failures(&store, owned), 5);
+
+        // Newer mail is.
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456784", "out_for_delivery"),
+        );
+        assert_eq!(poll_failures(&store, owned), 0);
+        assert!(pollable(&store, owned), "back in the poll queue");
+
+        // The same for a legacy row.
+        let legacy = legacy_row(&store, "1Z999AA10123456785", 20);
+        retire(&store, legacy);
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456785", "out_for_delivery"),
+        );
+        assert_eq!(poll_failures(&store, legacy), 0);
+        assert!(pollable(&store, legacy));
     }
 
     /// The same revival for a row this projection DOES own.

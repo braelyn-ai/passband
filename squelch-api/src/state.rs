@@ -179,10 +179,11 @@ pub struct ApiState {
     pub(crate) shipment_poll: Option<ShipmentPoll>,
     /// The READ-SIDE listing policy for `GET /client/shipments`, derived from
     /// `[carriers]`: the silence window, and the retirement cap past which a
-    /// carrier stops vouching for a row. The agent door is handed the same value
-    /// (`SquelchServer::with_shipment_policy`) but does NOT window its feed,
-    /// which is merged with the agent's own delivery records. Defaults to the
-    /// config default so a hand-built state still filters sensibly.
+    /// carrier stops vouching for a row. The AGENT DOOR CARRIES THE SAME VALUE
+    /// (`SquelchServer::with_shipment_policy`) and applies the same
+    /// `ShipmentListPolicy::hides`, so the two doors cannot disagree about which
+    /// packages exist. Defaults to the config default so a hand-built state
+    /// still filters sensibly.
     pub(crate) shipment_policy: squelch_core::config::ShipmentListPolicy,
 }
 

@@ -273,12 +273,13 @@ tracking number is evidence for the triage agent, not a listing rule, and the
 old "ambiguous digit-run" suppression is gone. What a retired number does lose
 is its carrier's backing, so it goes quiet on the schedule described next.
 
-Retirement is, in practice, permanent for polling. The row stays in the
-database, but the only thing that zeroes `poll_failures` is a successful poll,
-and a retired row is no longer polled. (The legacy mail path used to reset the
-counter on an accepted email; the agent path that replaced it does not.) A new
-email about a retired package still returns it to the list, for one silence
-window at a time.
+Retirement is not permanent. The row stays in the database, and newer mail
+about the package (mail the agent records as a delivery for that tracking
+number, received after the row's last update) zeroes the counter and puts the
+number back in the poll queue: five "not found" answers were about a label the
+shipper had not handed over yet, and the fresh mail is the evidence it is real
+now. Re-deciding old mail resets nothing. A successful poll also zeroes the
+counter, but a retired row does not get one, so mail is the way back.
 
 ### Going quiet, and being told to go away
 
@@ -287,7 +288,8 @@ retirement does: nothing is deleted, nothing stops being polled, and the row
 comes back on its own.
 
 **Silence.** A row nothing has happened to for `stale_after_days` (default 10)
-drops off `GET /client/shipments`, *unless a carrier is vouching for it*.
+drops off both doors, `GET /client/shipments` and the agent door's
+`get_shipments`, *unless a carrier is vouching for it*.
 "Nothing has happened" is precise here rather than approximate. Two things move
 a shipment's `last_update`: newer mail about the package (any mail the agent
 reads as a delivery record for that tracking number, including a reminder that
@@ -319,16 +321,21 @@ the first pass that succeeds.
 
 Mail brings a silent row back the same way for every row, including the ones
 written before the triage agent owned deliveries: newer mail naming the tracking
-number updates the status and moves `last_update`. Only mail *newer than the
-row* counts, so re-triaging an old mailbox does not refill the list. One limit:
+number updates the status, moves `last_update` and un-retires the number (see
+[Retirement](#retirement-and-suppression)). Only mail *newer than the row* counts, so re-triaging an old mailbox does not refill the list. One limit:
 the agent has to name a carrier and a status it recognises. A follow-up it reads
 as carrier-unknown or status-unknown is not a delivery record and revives
 nothing.
 
 Set `stale_after_days = 0` to switch the filter off entirely and keep every
-package on the list forever. The agent door's `get_shipments` does not apply the
-window; it merges the agent's own delivery records, which have no `last_update`
-to age by.
+package on the list forever.
+
+**Both doors apply the same rule**, `ShipmentListPolicy::hides`, and the daemon
+hands both the same policy value. The agent door builds its list from the
+agent's delivery records decorated with carrier rows, so a record hit is aged
+by the newest thing known about the package (the mail's arrival or the carrier
+row's last update, whichever is later) and vouched for by the same carrier row
+the human door sees. A package is on both lists or on neither.
 
 **A user clear.** `POST /client/shipments/{id}/clear` is the "I do not need to
 see this any more" button. It stamps the row and hides it, and that is all it

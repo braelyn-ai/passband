@@ -668,6 +668,65 @@ pub struct ShipmentListPolicy {
     pub stale_after_days: u32,
 }
 
+impl ShipmentListPolicy {
+    /// The instant before which a row nobody vouches for has gone silent, or
+    /// `None` when the window is off or too large to represent. CHECKED, and
+    /// meant to be computed before any lock is taken: an operator writing an
+    /// enormous window to mean "never" once overflowed chrono with the store
+    /// guard alive and poisoned the mutex for every later caller.
+    pub fn silent_before(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        if self.stale_after_days == 0 {
+            return None;
+        }
+        chrono::Duration::try_days(self.stale_after_days as i64)
+            .and_then(|window| now.checked_sub_signed(window))
+    }
+
+    /// THE ONE SILENCE RULE, shared by both doors so they cannot disagree about
+    /// which packages exist: a package is hidden when nothing has happened to
+    /// it since [`silent_before`](Self::silent_before) AND no carrier is
+    /// vouching for it. `last_seen` is the newest thing known about the
+    /// package; `observation` is its carrier row, if it has one.
+    ///
+    /// A carrier vouches while it has answered for the number
+    /// (`carrier_status_raw`), has not since rejected it into retirement
+    /// (`poll_failures` under [`retired_at_failures`](Self::retired_at_failures);
+    /// the cap rather than zero, because one counted rejection from a carrier
+    /// that answers again six hours later is a blip and must not blink the
+    /// parcel off the list), and was asked again inside the window
+    /// (`last_polled_at`). The last leg matters because polling stops on its
+    /// own, when the operator removes a key or the row ages past
+    /// `[carriers] max_age_days`, and a row nobody asks about any more is not
+    /// being tracked whatever it once said.
+    ///
+    /// AGE ALONE HIDES NOTHING: a package a carrier is still answering for
+    /// stays listed however long it sits, because that silence is the
+    /// carrier's word rather than our ignorance. Shape is no part of any of
+    /// this; it is evidence for the agent, never a listing rule.
+    pub fn hides(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        last_seen: chrono::DateTime<chrono::Utc>,
+        observation: Option<&crate::types::Shipment>,
+    ) -> bool {
+        let Some(cutoff) = self.silent_before(now) else {
+            return false;
+        };
+        if last_seen >= cutoff {
+            return false;
+        }
+        let vouched = observation.is_some_and(|s| {
+            s.carrier_status_raw.is_some()
+                && s.poll_failures < self.retired_at_failures
+                && s.last_polled_at.is_some_and(|at| at >= cutoff)
+        });
+        !vouched
+    }
+}
+
 impl Default for ShipmentListPolicy {
     fn default() -> Self {
         CarriersConfig::default().list_policy()

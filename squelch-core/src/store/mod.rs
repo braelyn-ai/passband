@@ -1168,19 +1168,13 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// Two READ-SIDE hides apply, both of which leave the row live in the table
     /// and both of which reverse themselves:
     ///
-    /// * [`stale_after_days`] hides a row that has gone SILENT: its `last_update`
-    ///   is older than that AND no carrier is vouching for it. `last_update`
-    ///   moves on newer mail about the package or a poll that changed something
-    ///   visible, never on a poll that merely confirms, so the first half is literally
-    ///   "nothing has happened to this package in N days". A carrier vouches
-    ///   while it has answered for the number, has not since rejected it
-    ///   [`retired_at_failures`] times running, and was asked again inside the
-    ///   same window; so a row with no pollable number, no configured key, a
-    ///   retired number, or one polling has aged out of all count as
-    ///   unvouched. AGE ALONE HIDES NOTHING: a
-    ///   package a carrier is still answering for stays however long it sits.
-    ///   The next accepted email or poll moves `last_update` and the row is
-    ///   back. 0 disables.
+    /// * SILENCE, the rule in
+    ///   [`ShipmentListPolicy::hides`](crate::config::ShipmentListPolicy::hides),
+    ///   which the agent door applies too so the two doors list the same
+    ///   packages: `last_update` older than [`stale_after_days`] AND no carrier
+    ///   vouching for the row. `last_update` moves on newer mail about the
+    ///   package or a poll that changed something visible, never on a poll that
+    ///   merely confirms. Newer mail or a poll moves it and the row is back.
     /// * `cleared_at` hides a row the user cleared, but ONLY while
     ///   `last_update <= cleared_at`. There is no un-clear: the comparison IS the
     ///   revival, so the first update to land after the clear brings the row back
@@ -1190,10 +1184,6 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// hidden row keeps being polled, because a poll is the most likely source of
     /// the update that un-hides it.
     ///
-    /// Tracking-number SHAPE is no part of either: it is evidence for the agent,
-    /// never a listing rule.
-    ///
-    /// [`retired_at_failures`]: crate::config::ShipmentListPolicy::retired_at_failures
     /// [`stale_after_days`]: crate::config::ShipmentListPolicy::stale_after_days
     fn list_shipments(
         &self,
