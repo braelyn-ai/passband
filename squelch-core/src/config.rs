@@ -669,59 +669,62 @@ pub struct ShipmentListPolicy {
 }
 
 impl ShipmentListPolicy {
-    /// The instant before which a row nobody vouches for has gone silent, or
-    /// `None` when the window is off or too large to represent. CHECKED, and
-    /// meant to be computed before any lock is taken: an operator writing an
-    /// enormous window to mean "never" once overflowed chrono with the store
-    /// guard alive and poisoned the mutex for every later caller.
-    pub fn silent_before(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
+    /// Resolve the policy against the clock, ONCE per request, into the value
+    /// both doors judge every row by. `None` when the window is off, or too
+    /// large for chrono to represent (an operator writing an enormous number
+    /// to mean "never" gets exactly that rather than an overflow).
+    pub fn silence(&self, now: chrono::DateTime<chrono::Utc>) -> Option<Silence> {
         if self.stale_after_days == 0 {
             return None;
         }
-        chrono::Duration::try_days(self.stale_after_days as i64)
-            .and_then(|window| now.checked_sub_signed(window))
+        let cutoff = chrono::Duration::try_days(self.stale_after_days as i64)
+            .and_then(|window| now.checked_sub_signed(window))?;
+        Some(Silence {
+            cutoff,
+            retired_at_failures: self.retired_at_failures,
+        })
     }
+}
 
-    /// THE ONE SILENCE RULE, shared by both doors so they cannot disagree about
-    /// which packages exist: a package is hidden when nothing has happened to
-    /// it since [`silent_before`](Self::silent_before) AND no carrier is
-    /// vouching for it. `last_seen` is the newest thing known about the
-    /// package; `observation` is its carrier row, if it has one.
-    ///
-    /// A carrier vouches while it has answered for the number
-    /// (`carrier_status_raw`), has not since rejected it into retirement
-    /// (`poll_failures` under [`retired_at_failures`](Self::retired_at_failures);
-    /// the cap rather than zero, because one counted rejection from a carrier
-    /// that answers again six hours later is a blip and must not blink the
-    /// parcel off the list), and was asked again inside the window
-    /// (`last_polled_at`). The last leg matters because polling stops on its
-    /// own, when the operator removes a key or the row ages past
-    /// `[carriers] max_age_days`, and a row nobody asks about any more is not
-    /// being tracked whatever it once said.
-    ///
-    /// AGE ALONE HIDES NOTHING: a package a carrier is still answering for
-    /// stays listed however long it sits, because that silence is the
-    /// carrier's word rather than our ignorance. Shape is no part of any of
-    /// this; it is evidence for the agent, never a listing rule.
+/// THE ONE SILENCE RULE, shared by both doors so they cannot disagree about
+/// which packages exist. A package is hidden when nothing has happened to it
+/// since `cutoff` AND no carrier is vouching for it.
+///
+/// A carrier vouches while its last ANSWER for the number (`last_answered_at`,
+/// which a mere attempt never moves) is inside the window and it has not since
+/// rejected the number into retirement (`poll_failures` under
+/// `retired_at_failures`; the cap rather than zero, because one counted
+/// rejection from a carrier that answers again six hours later is a blip and
+/// must not blink the parcel off the list). So a row with no pollable number,
+/// no configured key, a retired number, one whose answers stopped coming, or
+/// one polling has aged past `[carriers] max_age_days` all count as unvouched.
+///
+/// AGE ALONE HIDES NOTHING: a package a carrier is still answering for stays
+/// listed however long it sits, because that silence is the carrier's word
+/// rather than our ignorance. Shape is no part of any of this; it is evidence
+/// for the agent, never a listing rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Silence {
+    /// Nothing seen since this instant is silence.
+    pub cutoff: chrono::DateTime<chrono::Utc>,
+    /// The poller's retirement cap, past which a carrier no longer vouches.
+    pub retired_at_failures: u32,
+}
+
+impl Silence {
+    /// `last_seen` is the newest thing known about the package; `observation`
+    /// is its carrier row, if it has one.
     pub fn hides(
         &self,
-        now: chrono::DateTime<chrono::Utc>,
         last_seen: chrono::DateTime<chrono::Utc>,
         observation: Option<&crate::types::Shipment>,
     ) -> bool {
-        let Some(cutoff) = self.silent_before(now) else {
-            return false;
-        };
-        if last_seen >= cutoff {
+        if last_seen >= self.cutoff {
             return false;
         }
         let vouched = observation.is_some_and(|s| {
-            s.carrier_status_raw.is_some()
+            s.last_answered_at.is_some_and(|at| at >= self.cutoff)
                 && s.poll_failures < self.retired_at_failures
-                && s.last_polled_at.is_some_and(|at| at >= cutoff)
         });
         !vouched
     }

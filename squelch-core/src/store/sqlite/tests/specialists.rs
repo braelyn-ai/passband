@@ -1045,9 +1045,9 @@ fn a_new_email_revives_a_retired_shipment() {
         .upsert_message(&triaged(acct, "g1", "t1").msg())
         .unwrap();
     let t0 = Utc::now();
-    // An AMBIGUOUS shape, so this also exercises the read-side suppression the
-    // same counter drives: a retired row of this shape is invisible to both
-    // doors, not merely unpolled.
+    // An ambiguous shape, which used to drive a read-side suppression as well.
+    // Shape is no longer a listing rule: a retired row is unpolled, and unvouched
+    // for the silence window, and that is all.
     let sid = store
         .upsert_shipment(
             acct,
@@ -1066,7 +1066,7 @@ fn a_new_email_revives_a_retired_shipment() {
     );
     assert_eq!(
         store
-            .list_shipments(acct, false, suppress_at(5))
+            .list_shipments(acct, false, retired_at(5))
             .unwrap()
             .len(),
         1,
@@ -1101,7 +1101,7 @@ fn a_new_email_revives_a_retired_shipment() {
     );
     assert_eq!(
         store
-            .list_shipments(acct, false, suppress_at(5))
+            .list_shipments(acct, false, retired_at(5))
             .unwrap()
             .len(),
         1
@@ -1308,7 +1308,7 @@ fn carrier_failures_do_not_hide_either_tracking_shape() {
     fail_polls(&store, acct, phantom, 5);
     fail_polls(&store, acct, real, 5);
 
-    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
+    let listed = store.list_shipments(acct, false, retired_at(5)).unwrap();
     let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
     assert!(
         ids.contains(&real) && ids.contains(&phantom),
@@ -1348,7 +1348,7 @@ fn an_ambiguous_row_below_the_cap_still_lists() {
         .unwrap();
     fail_polls(&store, acct, sid, 4);
 
-    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
+    let listed = store.list_shipments(acct, false, retired_at(5)).unwrap();
     assert_eq!(listed.len(), 1, "cap-1 failures is not yet a phantom");
     assert_eq!(listed[0].poll_failures, 4);
 }
@@ -1371,7 +1371,7 @@ fn carrier_success_updates_facts_without_changing_visibility() {
     fail_polls(&store, acct, sid, 5);
     assert!(
         !store
-            .list_shipments(acct, false, suppress_at(5))
+            .list_shipments(acct, false, retired_at(5))
             .unwrap()
             .is_empty(),
         "failed carrier polling does not hide records"
@@ -1392,7 +1392,7 @@ fn carrier_success_updates_facts_without_changing_visibility() {
             Utc::now(),
         )
         .unwrap();
-    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
+    let listed = store.list_shipments(acct, false, retired_at(5)).unwrap();
     assert_eq!(listed.len(), 1, "a successful poll brings the row back");
     assert_eq!(listed[0].poll_failures, 0);
 }
@@ -1498,6 +1498,34 @@ fn a_carrier_vouching_for_a_silent_shipment_keeps_it_listed() {
     assert!(
         listed[0].last_update < Utc::now() - chrono::Duration::days(10),
         "and it did so without the confirming poll touching last_update"
+    );
+
+    // ATTEMPTS ARE NOT ANSWERS. A run of transient errors stamps the attempt
+    // clock every six hours while the last real answer recedes past the
+    // window; the vouching must recede with it, or a dead number stays listed
+    // on an answer the carrier has not repeated in weeks.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE shipments SET last_answered_at=?1 WHERE id=?2",
+            params![(Utc::now() - chrono::Duration::days(11)).to_rfc3339(), sid],
+        )
+        .unwrap();
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), false)
+        .unwrap();
+    assert!(
+        listed_ids(&store, acct, 10).is_empty(),
+        "a fresh attempt on an old answer vouches for nothing"
+    );
+    store
+        .apply_carrier_track(acct, sid, &in_transit(), Utc::now())
+        .unwrap();
+    assert_eq!(
+        listed_ids(&store, acct, 10),
+        vec![sid],
+        "a fresh answer does"
     );
 
     // The carrier stops vouching at the poller's RETIREMENT CAP, not before.

@@ -624,14 +624,13 @@ impl SquelchServer {
             .map_err(Self::map_err)?;
         // The RAW observation feed, silent rows included: a record hit is
         // decorated with its carrier row first and judged after, so the same
-        // `ShipmentListPolicy::hides` the human door applies sees the same
-        // carrier evidence here. Two doors, one rule, one package list.
+        // `Silence::hides` the human door applies sees the same carrier
+        // evidence here. Two doors, one rule, one package list.
         let shipments = self
             .store
             .external_shipments(self.account_id, true)
             .map_err(Self::map_err)?;
-        let policy = self.shipment_policy;
-        let now = Utc::now();
+        let silence = self.shipment_policy.silence(Utc::now());
         let mut out: Vec<ShipmentHit> = Vec::new();
         let mut represented = std::collections::HashSet::new();
         for item in records {
@@ -687,12 +686,15 @@ impl SquelchServer {
                     if observation.carrier_status_raw.is_some() {
                         hit.status = observation.status.clone();
                     }
-                    // The newest thing known about the package, whichever side
-                    // learned it: the human door lists by this same instant.
-                    hit.last_update = hit.last_update.max(observation.last_update);
+                    // THE ROW'S CLOCK IS THE PACKAGE'S CLOCK. Reconcile already
+                    // folded every accepted mail into `last_update`; a mail it
+                    // rejected (no carrier, a status it could not read) is not
+                    // news on the human door and must not be news here, or the
+                    // doors disagree about exactly the hidden rows.
+                    hit.last_update = observation.last_update;
                 }
                 if (include_delivered || hit.status != "delivered")
-                    && !policy.hides(now, hit.last_update, observation)
+                    && !silence.is_some_and(|s| s.hides(hit.last_update, observation))
                 {
                     out.push(hit);
                 }
@@ -702,7 +704,7 @@ impl SquelchServer {
         for shipment in shipments {
             if represented.contains(&shipment.tracking_number)
                 || (!include_delivered && shipment.status == "delivered")
-                || policy.hides(now, shipment.last_update, Some(&shipment))
+                || silence.is_some_and(|s| s.hides(shipment.last_update, Some(&shipment)))
             {
                 continue;
             }
@@ -1287,6 +1289,48 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(both_doors().await, (0, 0), "retired on both doors");
+
+        // MAIL RECONCILE REJECTED IS NOT NEWS ON EITHER DOOR. A newer mail the
+        // model read as a delivery but without a carrier never reaches the row
+        // (reconcile drops it), so the human door still sees a silent row. The
+        // agent door lists that mail as a record hit and must age it by the
+        // row's clock, not the mail's, or exactly the hidden rows disagree.
+        let fresh = seed(&store, account, "pkg", "Where is my package");
+        let job = store
+            .claim_agent_job(account, "triage", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        let context = store.load_agent_context(&job).unwrap();
+        let carrierless = MessageDecision {
+            summary: "Delivery question".into(),
+            destinations: vec![squelch_core::triage::decision::MessageDestination::Records],
+            records: vec![RecordProposal::Delivery {
+                carrier: None,
+                tracking_number: Some("1Z999AA10123456784".into()),
+                status: "unknown".into(),
+                evidence: vec![],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .commit_agent_decision(
+                    &job,
+                    &context,
+                    &carrierless,
+                    std::slice::from_ref(&context.message.source)
+                )
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        assert_eq!(
+            both_doors().await,
+            (0, 0),
+            "a carrierless mail today revives the package on neither door"
+        );
+        store
+            .set_attention_status(account, fresh, squelch_core::types::AttentionStatus::Done)
+            .unwrap();
 
         // THE OTHER PATH of the agent door. A record the user marked done leaves
         // the agent feed, and its carrier row is then served by the loop over

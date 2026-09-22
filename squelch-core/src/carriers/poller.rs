@@ -769,6 +769,7 @@ mod tests {
             delivered_at: None,
             last_polled_at: None,
             poll_failures: 0,
+            last_answered_at: None,
         }
     }
 

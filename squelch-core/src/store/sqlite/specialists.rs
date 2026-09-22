@@ -497,7 +497,7 @@ fn shipments_by_order_ref(
 const SHIPMENT_COLUMNS: &str = "s.id, s.account_id, s.tracking_number, s.carrier,
             s.item_name, s.status, s.tracking_url, s.first_seen, s.last_update,
             m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at,
-            s.poll_failures";
+            s.poll_failures, s.last_answered_at";
 
 /// The tables [`SHIPMENT_COLUMNS`] is read from, split out so the listing can
 /// append its own column (`cleared_at`, which the wire type deliberately does
@@ -522,6 +522,7 @@ fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipmen
         delivered_at: dt_opt(r, 12)?,
         last_polled_at: dt_opt(r, 13)?,
         poll_failures: r.get(14)?,
+        last_answered_at: dt_opt(r, 15)?,
     })
 }
 
@@ -529,7 +530,7 @@ fn list_shipments_conn(
     conn: &Connection,
     account_id: AccountId,
     include_delivered: bool,
-    silence: Option<(crate::config::ShipmentListPolicy, DateTime<Utc>)>,
+    silence: Option<crate::config::Silence>,
 ) -> Result<Vec<crate::types::Shipment>> {
     // This is a human record listing; external access is enforced separately.
     // `cleared_at` rides along as an extra column: the read-side policy below
@@ -543,7 +544,7 @@ fn list_shipments_conn(
     let mut stmt = conn.prepare(&sql)?;
     let out = stmt
         .query_map(params![account_id], |r| {
-            Ok((shipment_row(r)?, dt_opt(r, 15)?))
+            Ok((shipment_row(r)?, dt_opt(r, 16)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     // BOTH HIDES ARE READ-SIDE and both reverse themselves: the rows stay live,
@@ -555,11 +556,9 @@ fn list_shipments_conn(
             // CLEARED. The comparison IS the revival: hide only while the row
             // has not moved since the user cleared it.
             let cleared = cleared_at.is_some_and(|at| shipment.last_update <= at);
-            // SILENT. The rule itself lives on the policy, because the agent
-            // door applies the same one to its merged list.
-            let silent = silence.is_some_and(|(policy, now)| {
-                policy.hides(now, shipment.last_update, Some(shipment))
-            });
+            // SILENT. The rule is `Silence::hides`, because the agent door
+            // applies the same one to its merged list.
+            let silent = silence.is_some_and(|s| s.hides(shipment.last_update, Some(shipment)));
             !(cleared || silent)
         })
         .map(|(s, _)| s)
@@ -777,9 +776,7 @@ impl SqliteStore {
         include_delivered: bool,
         policy: crate::config::ShipmentListPolicy,
     ) -> Result<Vec<crate::types::Shipment>> {
-        // The cutoff is resolved BEFORE the lock (see `silent_before`).
-        let now = Utc::now();
-        let silence = policy.silent_before(now).map(|_| (policy, now));
+        let silence = policy.silence(Utc::now());
         let conn = self.lock()?;
         list_shipments_conn(&conn, account_id, include_delivered, silence)
     }
@@ -794,8 +791,8 @@ impl SqliteStore {
         let mut allowed = Vec::new();
         // UNWINDOWED ON PURPOSE: this is the raw observation feed. The agent
         // door decorates its own delivery records with these rows and THEN
-        // applies the same `ShipmentListPolicy::hides` to the merged list, so
-        // a silent row's carrier data must still be here to be judged by.
+        // applies the same `Silence::hides` to the merged list, so a silent
+        // row's carrier data must still be here to be judged by.
         for shipment in list_shipments_conn(&conn, account_id, include_delivered, None)? {
             if super::messages::external_shipment_allowed_conn(&conn, account_id, shipment.id)? {
                 allowed.push(shipment);
@@ -923,6 +920,7 @@ impl SqliteStore {
                     eta                = ?5,
                     delivered_at       = COALESCE(delivered_at, ?6),
                     last_polled_at     = ?7,
+                    last_answered_at   = ?7,
                     poll_failures      = 0,
                     last_update        = CASE WHEN ?8 THEN ?7 ELSE last_update END
               WHERE account_id=?1 AND id=?2",
