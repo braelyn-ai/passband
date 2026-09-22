@@ -858,6 +858,27 @@ fn finish(
     Ok(())
 }
 
+impl SqliteStore {
+    /// Fixed-cardinality scrape counts, scoped to one account. Delayed retries
+    /// remain queued; leases remain leased until reclaimed by a worker.
+    pub fn triage_job_counts(&self, account_id: AccountId) -> Result<[u64; 2]> {
+        let conn = self.lock()?;
+        let mut counts = [0; 2];
+        let mut query = conn.prepare(
+            "SELECT state, COUNT(*) FROM agent_triage_jobs
+             WHERE account_id=?1 AND kind IN ('triage','access')
+               AND state IN ('queued','leased') GROUP BY state",
+        )?;
+        for row in query.query_map([account_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })? {
+            let (state, count) = row?;
+            counts[usize::from(state == "leased")] = count;
+        }
+        Ok(counts)
+    }
+}
+
 impl AgentTriageStore for SqliteStore {
     fn reserve_agent_budget(
         &self,
@@ -2054,6 +2075,34 @@ mod tests {
         }
         store
     }
+    #[test]
+    fn triage_job_counts_include_retries_and_isolate_accounts_and_kinds() {
+        let store = fixture();
+        assert_eq!(store.triage_job_counts(1).unwrap(), [0, 0]);
+        {
+            let conn = store.lock().unwrap();
+            for (account, message, kind, state, trigger) in [
+                (1, 1, "triage", "queued", "retry"),
+                (1, 2, "access", "leased", "access"),
+                (1, 1, "notification", "queued", "notification"),
+                (1, 1, "triage", "completed", "completed"),
+                (1, 1, "triage", "failed", "failed"),
+                (2, 3, "triage", "queued", "other"),
+            ] {
+                conn.execute(
+                    "INSERT INTO agent_triage_jobs
+                    (account_id,message_id,kind,trigger,input_revision,state,available_at)
+                    VALUES(?1,?2,?3,?4,1,?5,'2099-01-01T00:00:00Z')",
+                    params![account, message, kind, trigger, state],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(store.triage_job_counts(1).unwrap(), [1, 1]);
+        assert_eq!(store.triage_job_counts(2).unwrap(), [1, 0]);
+        assert_eq!(store.triage_job_counts(99).unwrap(), [0, 0]);
+    }
+
     pub(super) fn decision(id: i64) -> MessageDecision {
         MessageDecision {
             kinds: vec![EmailKind::Correspondence],
