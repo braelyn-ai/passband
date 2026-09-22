@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PROMPT_VERSION: &str = "agent-triage-v1";
+pub const PROMPT_VERSION: &str = "agent-triage-v2";
 const SYSTEM: &str = include_str!("prompts/agent-v1.txt");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
@@ -785,6 +785,7 @@ pub fn decision_schema() -> Value {
             object(vec![
                 ("importance", integer()),
                 ("title", text()),
+                ("login_code", super::login_code::schema()),
                 ("body", text()),
                 ("reason", text()),
             ]),
