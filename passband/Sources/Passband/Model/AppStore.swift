@@ -1562,7 +1562,7 @@ final class AppStore {
         // here would finish a search of the old mailbox into the new one's
         // panel, cards and all — it holds thread ids that mean something else
         // under the account that just went away.
-        searchLane.clear()
+        resetSearchLane()
         search = SearchSession()
         resolvedIds = []
         selectedId = nil
@@ -2647,6 +2647,7 @@ final class AppStore {
         captureLaneStart(trigger)
         // Both entry points await authorized keyword evidence. Human panel hits
         // may include restricted mail and cannot be forwarded to the agent.
+        let evidenceEpoch = epoch
         searchEvidenceTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -2655,6 +2656,7 @@ final class AppStore {
                     let page = try await APIClient.shared.search(term, limit: 50,
                         mode: .keyword, partial: true, forAgent: true)
                     try Task.checkCancellation()
+                    guard self.epoch == evidenceEpoch else { return }
                     let current = self.search.query.trimmed
                     guard !current.isEmpty, Prefs.shared.deeperSearch != .off else {
                         self.resetSearchLane(keepingVerdict: true)
@@ -2669,7 +2671,7 @@ final class AppStore {
             } catch is CancellationError {
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, self.epoch == evidenceEpoch else { return }
                 self.searchEvidenceTask = nil
                 self.search.laneStarted = false
                 self.search.error = "Could not load search evidence: \(error.localizedDescription)"
