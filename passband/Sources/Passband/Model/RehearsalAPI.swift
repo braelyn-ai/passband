@@ -75,7 +75,7 @@ actor RehearsalAPI {
                 return AgentFeedItem(message_id: message.id, thread_id: threadID(message.id),
                     from_addr: address(message), subject: message.subject, received_at: stamp(),
                     decision: AgentMessageDecision(kinds: [kinds[message.category]!],
-                        destinations: message.lane == .records ? ["records"] : message.lane == .reading ? ["reading"] : [],
+                        destinations: message.lane == .reading ? ["reading"] : [],
                         summary: message.explanation, reason: message.explanation, records: recordFacts(message)),
                     attention: AgentAttention(show_in_fye: row.status != .done && row.tier != .noise,
                         state: "informational", summary: message.explanation,

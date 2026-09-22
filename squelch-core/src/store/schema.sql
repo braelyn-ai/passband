@@ -1375,7 +1375,7 @@ CREATE TABLE IF NOT EXISTS agent_message_decisions (
 CREATE TABLE IF NOT EXISTS agent_message_destinations (
     account_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
-    destination TEXT NOT NULL CHECK(destination IN ('reading','records')),
+    destination TEXT NOT NULL CHECK(destination = 'reading'),
     PRIMARY KEY(account_id,message_id,destination)
 );
 CREATE TABLE IF NOT EXISTS agent_thread_attention (

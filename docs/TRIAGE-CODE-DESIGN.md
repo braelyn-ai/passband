@@ -68,7 +68,7 @@ enum EmailKind {
 }
 
 enum Destination { Fye, Reading, Records }
-enum MessageDestination { Reading, Records }
+enum MessageDestination { Reading }
 enum ExternalAccess { Pending, Allowed, Restricted }
 enum AttentionState { NeedsUser, WaitingOnOthers, Informational, Resolved }
 enum ActionKind { Reply, Pay, Decide, Attend, Review, Other }
@@ -144,7 +144,7 @@ The executor supplies message/account IDs, run metadata, model/config versions, 
 
 ### Message placement and thread attention
 
-Categories and Reading/Records placements are message-level facts. FYE membership belongs only to `thread_attention.show_in_fye`; do not persist a competing FYE flag on old message rows. FYE presents one current attention item per provider thread, with multiple unresolved actions inside it. API projections combine these scopes so a receipt may appear in Records and belong to an active FYE item. A singleton uses the existing fallback thread identity. The thread decision explicitly accounts for active messages and prior actions; a new low-value message does not automatically erase an earlier unresolved request.
+Categories, Reading placement, and typed record facts are message-level facts. FYE membership belongs only to `thread_attention.show_in_fye`; do not persist a competing FYE flag on old message rows. FYE presents one current attention item per provider thread, with multiple unresolved actions inside it. API projections combine these scopes so a receipt may appear in Records and belong to an active FYE item. A singleton uses the existing fallback thread identity. The thread decision explicitly accounts for active messages and prior actions; a new low-value message does not automatically erase an earlier unresolved request.
 
 The agent may fetch another thread and propose a narrowly scoped update to resolve a related obligation, with evidence IDs and the target attention revision. This supports a receipt resolving a bill sent in a different thread. No general-purpose situation graph is required in this rewrite. Cross-thread merging and arbitrary entity resolution are deferred; do not approximate them with merchant/amount heuristics.
 
@@ -197,7 +197,7 @@ Use additive migrations and a one-time cutover marker, following the repository'
 | `triage_jobs` | Account, message/thread target, job kind, trigger, input revision, state, lease token/expiry, attempts, available-at, redacted last error |
 | `triage_runs` | Run ID, target revision, trigger, model/prompt/schema/config versions, timing, token usage, status; no raw model transcript |
 | `message_decisions` | Current message decision, revision, run ID, categories, summary, auth/access assessment; bounded structured JSON plus indexed access fields |
-| `message_destinations` | Unique account/message/destination rows for Reading and Records; overlap supported |
+| `message_destinations` | Unique account/message rows for Reading; specialist record groups derive from typed facts |
 | `thread_attention` | Unique account/thread, revision, show-in-FYE, current state/actions/factors/summary, relevant message IDs, waiting-since, last relevant activity |
 | `attention_user_state` | Account/thread, explicit done-through content revision, completed action IDs, snooze/reminder, user-state revision |
 | `message_read_state` | Account/message, opened-at and acknowledged content revision; no inference from prefetch or opening another sibling |
@@ -294,7 +294,7 @@ Introduce a versioned human API and explicitly advertise its version/capabilitie
 | --- | --- |
 | `GET /client/v2/feed?destination=fye` | Server-ranked `AttentionItem` page and ranking snapshot cursor |
 | `GET /client/v2/feed?destination=reading` | Message-based Reading items with real receipt timestamps; grouping is presentation only |
-| `GET /client/v2/feed?destination=records` | Record/message projections including a generic fallback where no specialist card exists |
+| `GET /client/v2/feed?destination=records` | Aggregate of typed Calendar, Shipping, Billing, and Receipt facts; no generic fallback |
 | `GET /client/v2/messages/{message_id}` | Human message plus thread context/focus target; pending/restricted supported |
 | `POST /client/v2/messages/{message_id}/opened` | Exact displayed-message acknowledgement, independent of done state |
 | `POST /client/v2/attention/{item_id}/actions` | Versioned done/snooze/reminder and undo operations |

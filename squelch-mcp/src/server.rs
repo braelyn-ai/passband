@@ -1005,7 +1005,7 @@ mod tests {
             .to_string();
         let decision = MessageDecision {
             summary: "Order and payment details".into(),
-            destinations: vec![MessageDestination::Records],
+            destinations: vec![],
             records: vec![
                 RecordProposal::Bill {
                     merchant: "Shop".into(),

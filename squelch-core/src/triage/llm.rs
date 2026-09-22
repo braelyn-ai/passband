@@ -138,10 +138,29 @@ pub async fn classify_llm(
     req: &LlmRequest<'_>,
 ) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
     match provider {
-        Stage2Provider::Anthropic => classify_anthropic(http, url, api_key, req).await,
+        Stage2Provider::Anthropic => classify_anthropic(http, url, api_key, req, false).await,
         Stage2Provider::OpenAI => classify_openai(http, url, api_key, req).await,
     }
 }
+
+/// The investigation schema exceeds Anthropic's strict grammar complexity
+/// limits. Use a forced native tool submission there; the agent still parses
+/// and validates every step before it can commit a decision. Other classifiers
+/// and the OpenAI transport retain their existing strict JSON schemas.
+pub async fn classify_agent_step(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    provider: Stage2Provider,
+    req: &LlmRequest<'_>,
+) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
+    match provider {
+        Stage2Provider::Anthropic => classify_anthropic(http, url, api_key, req, true).await,
+        Stage2Provider::OpenAI => classify_openai(http, url, api_key, req).await,
+    }
+}
+
+const AGENT_SUBMISSION_TOOL: &str = "submit_triage_step";
 
 /// [`classify_llm`] plus the verdict parse: deserialize the raw text into `T`,
 /// then hand it to `finish` for the caller's own validation/repackaging (its
@@ -328,6 +347,10 @@ struct MessagesResponse {
 
 #[derive(Debug, Deserialize)]
 struct ContentBlock {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
     #[serde(default, rename = "type")]
     kind: String,
     #[serde(default)]
@@ -368,6 +391,7 @@ async fn classify_anthropic(
     url: &str,
     api_key: &str,
     req: &LlmRequest<'_>,
+    tool_submission: bool,
 ) -> std::result::Result<LlmOutcome<String>, ClassifyError> {
     let max_tokens = MAX_TOKENS;
 
@@ -391,6 +415,25 @@ async fn classify_anthropic(
             effort: req.effort,
         },
     };
+
+    let mut body = serde_json::to_value(body).map_err(|_| ClassifyError {
+        kind: "request_encode".into(),
+        retryable: false,
+    })?;
+    if tool_submission {
+        body["output_config"]
+            .as_object_mut()
+            .expect("output config object")
+            .remove("format");
+        body["tools"] = serde_json::json!([{
+            "name": AGENT_SUBMISSION_TOOL,
+            "description": "Submit the next investigation step using the supplied schema.",
+            "input_schema": req.schema,
+        }]);
+        body["tool_choice"] = serde_json::json!({
+            "type": "tool", "name": AGENT_SUBMISSION_TOOL, "disable_parallel_tool_use": true,
+        });
+    }
 
     let build = || {
         let req = http
@@ -422,6 +465,30 @@ async fn classify_anthropic(
             return Ok(LlmOutcome::Failed("max_tokens_truncation".into(), usage));
         }
         _ => {}
+    }
+
+    if tool_submission {
+        let mut calls = parsed
+            .content
+            .iter()
+            .filter(|block| block.kind == "tool_use");
+        let Some(call) = calls.next() else {
+            return Ok(LlmOutcome::Failed("missing_agent_submission".into(), usage));
+        };
+        if parsed.stop_reason.as_deref() != Some("tool_use")
+            || calls.next().is_some()
+            || call.name.as_deref() != Some(AGENT_SUBMISSION_TOOL)
+            || !call
+                .input
+                .as_ref()
+                .is_some_and(serde_json::Value::is_object)
+        {
+            return Ok(LlmOutcome::Failed("invalid_agent_submission".into(), usage));
+        }
+        return Ok(LlmOutcome::Ok(
+            call.input.as_ref().unwrap().to_string(),
+            usage,
+        ));
     }
 
     let text = parsed
@@ -688,6 +755,88 @@ mod tests {
     /// no credential at all. Anthropic direct is the opposite: `x-api-key` is
     /// the credential and the gateway header means nothing. So the endpoint,
     /// and only the endpoint, decides.
+    #[tokio::test]
+    async fn anthropic_agent_submission_preserves_schema_and_rejects_invalid_calls() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        for (content, stop, expected) in [
+            (
+                json!([{"type":"tool_use","name":AGENT_SUBMISSION_TOOL,"input":{"result":{"step":"request_review","question":"test"}}}]),
+                "tool_use",
+                "ok",
+            ),
+            (
+                json!([{"type":"text","text":"{}"}]),
+                "end_turn",
+                "missing_agent_submission",
+            ),
+            (
+                json!([{"type":"tool_use","name":"wrong","input":{}}]),
+                "tool_use",
+                "invalid_agent_submission",
+            ),
+            (
+                json!([{"type":"tool_use","name":AGENT_SUBMISSION_TOOL,"input":"bad"}]),
+                "tool_use",
+                "invalid_agent_submission",
+            ),
+            (
+                json!([{"type":"tool_use","name":AGENT_SUBMISSION_TOOL,"input":{}},{"type":"tool_use","name":AGENT_SUBMISSION_TOOL,"input":{}}]),
+                "tool_use",
+                "invalid_agent_submission",
+            ),
+            (json!([]), "max_tokens", "max_tokens_truncation"),
+            (json!([]), "refusal", "refused"),
+        ] {
+            let schema = crate::triage::agent::decision_schema();
+            let expected_schema = schema.clone();
+            let app = Router::new().route("/", post(move |Json(body): Json<serde_json::Value>| {
+                let content = content.clone();
+                let schema = expected_schema.clone();
+                async move {
+                    assert!(body["output_config"].get("format").is_none());
+                    assert_eq!(body["output_config"]["effort"], "low");
+                    assert_eq!(body["tools"][0]["input_schema"], schema);
+                    assert!(body["tools"][0].get("strict").is_none());
+                    assert_eq!(body["tool_choice"]["name"], AGENT_SUBMISSION_TOOL);
+                    assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+                    Json(json!({"content":content,"stop_reason":stop,"usage":{"input_tokens":11,"output_tokens":7}}))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let req = LlmRequest {
+                model: "test",
+                system: "test",
+                user: "test",
+                schema,
+                effort: Some("low"),
+                max_tries: 1,
+            };
+            let result = classify_agent_step(
+                &reqwest::Client::new(),
+                &url,
+                "test",
+                Stage2Provider::Anthropic,
+                &req,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.usage().unwrap().input_tokens, 11);
+            match result {
+                LlmOutcome::Ok(text, _) => {
+                    assert_eq!(expected, "ok");
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(value["result"]["step"], "request_review");
+                }
+                LlmOutcome::Failed(kind, _) => assert_eq!(kind, expected),
+                LlmOutcome::Refused(_) => assert_eq!(expected, "refused"),
+            }
+            server.abort();
+        }
+    }
+
     #[test]
     fn only_a_gateway_endpoint_gets_the_virtual_key_header() {
         assert!(!is_gateway_url(API_URL));

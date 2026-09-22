@@ -812,7 +812,7 @@ enum AgentTools {
         Wire.ToolDef(
             name: Tool.getUpdates.rawValue,
             description: """
-                Read the agent-curated For your eyes, Reading, or Records feed.
+                Read For your eyes, Reading, or the aggregate of typed Calendar, Shipping, Billing, and Receipt records. Records is not an independent placement.
                 For your eyes is one server-ordered list using urgency, action needed,
                 personal relevance and recency. Kinds and destinations are independent.
                 Reading this does not acknowledge mail as opened.

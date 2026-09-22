@@ -508,6 +508,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 + ChronoDuration::seconds(
                     self.config.triage.agent.outage_retry_secs.min(86400) as i64
                 );
+            eprintln!(
+                "squelch: triage provider unavailable ({}); queued work retained, retrying in {}s",
+                error.kind,
+                self.config.triage.agent.outage_retry_secs.min(86400)
+            );
             self.agent_retry_after
                 .fetch_max(until.timestamp(), Ordering::Relaxed);
             let _ = self.store.defer_agent_job(job, until, &error.kind);

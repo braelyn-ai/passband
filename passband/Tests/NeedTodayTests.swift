@@ -15,7 +15,7 @@ struct NeedTodayTests {
              "factors":{"urgency":0,"action_need":0,"personal_relevance":1,"importance":0.1,"attention_at":null}}},
           {"message_id":2,"thread_id":"bill","from_addr":"billing@example.com",
            "subject":"Invoice","received_at":"2026-09-01T11:00:00Z","score":50,
-           "decision":{"kinds":["bill"],"destinations":["records"],"summary":"Invoice","reason":"Payment outstanding"},
+           "decision":{"kinds":["bill"],"destinations":[],"summary":"Invoice","reason":"Payment outstanding"},
            "attention":{"show_in_fye":true,"state":"needs_user","summary":"Pay invoice",
              "factors":{"urgency":1,"action_need":1,"personal_relevance":0,"importance":1,"attention_at":{"value":"2026-09-30","timezone":null}}}}
         ]}
@@ -26,7 +26,7 @@ struct NeedTodayTests {
         precondition(NeedToday.count(rows) == 2, "dateless and future-dated FYE both count")
         precondition(NeedToday.count([]) == 0, "empty FYE clears the badge")
         precondition(rows[1].deadline == "2026-09-30", "preserve date-only precision")
-        precondition(feed.items[1].decision.destinations == ["records"], "records may overlap FYE")
+        precondition(feed.items[1].decision.destinations.isEmpty, "Records are facts, not an independent placement")
         precondition(feed.items[1].readingRow.one_line == "Invoice", "Reading uses message summary")
         let pending = try JSONDecoder().decode(AgentTriageInspection.self,
             from: Data("{\"decision\":null}".utf8))
@@ -46,12 +46,17 @@ struct NeedTodayTests {
         [{"kind":"receipt","merchant":"Shop","amount":12.5,"currency":"USD"},
          {"kind":"receipt","merchant":"Other Shop","amount":20,"currency":"USD"},
          {"kind":"event","title":"Dinner","start":{"value":"2026-10-01"}},
-         {"kind":"financial_update","institution":"Bank","description":"Statement ready"}]
+         {"kind":"financial_update","institution":"Bank","description":"Statement ready"},
+         {"kind":"bill","merchant":"Utility","amount":42,"currency":"USD","due":{"value":"2026-10-02"},"autopay":true}]
         """.utf8))
         precondition(projected.receipts.count == 2 && Set(projected.receipts.map(\.id)).count == 2)
         precondition(projected.receipts[0].amount == 12.5 && projected.receipts[0].message_id == 9)
         precondition(projected.calendar[0].starts_at == "2026-10-01", "Record date precision survives presentation")
         precondition(projected.banking[0].kind == .update, "Do not invent financial subtypes")
+        precondition(projected.banking.count == 2, "Bills belong in Billing, not a generic Records card")
+        let billingRow = projected.banking[1]
+        precondition(billingRow.kind == .bill && billingRow.institution == "Utility" && billingRow.amount == 42)
+        precondition(billingRow.due == "2026-10-02" && billingRow.autopay == true, "Keep bill details in the specialist group")
         projected.items[0].decision.kinds = ["promotional"]
         precondition(projected.marketing.count == 1 && projected.marketing[0].code == nil)
         projected.items.removeAll()
