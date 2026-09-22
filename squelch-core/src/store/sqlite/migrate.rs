@@ -65,6 +65,7 @@ fn tables_exist(conn: &Connection, tables: &[&str]) -> Result<bool> {
 /// indexes are handled by `CREATE ... IF NOT EXISTS` in `schema.sql`; only new
 /// COLUMNS on an existing table need this seam.
 pub(super) fn migrate(conn: &Connection) -> Result<()> {
+    retire_records_destination(conn)?;
     add_column_if_missing(conn, "messages", "list_unsubscribe", "TEXT")?;
     add_column_if_missing(
         conn,
@@ -1054,4 +1055,97 @@ fn clear_recoverable_no_body_markers(conn: &Connection) -> Result<usize> {
     }
     tx.commit()?;
     Ok(cleared)
+}
+
+/// Retire the old independent placement without dropping typed record facts.
+/// Old generic placements are queued for investigation rather than relabeled
+/// by guessing. The transaction makes cleanup and requeue atomic and idempotent.
+pub(super) fn retire_records_destination(conn: &Connection) -> Result<()> {
+    if !tables_exist(
+        conn,
+        &[
+            "agent_message_decisions",
+            "agent_message_destinations",
+            "agent_triage_corrections",
+            "agent_triage_jobs",
+            "agent_message_state",
+            "agent_job_lanes",
+        ],
+    )? {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut orphaned = Vec::new();
+    {
+        let mut stmt = tx.prepare("SELECT account_id,message_id,decision_json FROM agent_message_decisions
+            WHERE EXISTS(SELECT 1 FROM json_each(decision_json,'$.destinations') WHERE value='records')")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (account, message, encoded) in rows {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&encoded).map_err(|e| CoreError::Other(e.into()))?;
+            if let Some(destinations) = value["destinations"].as_array_mut() {
+                destinations.retain(|v| v != "records");
+            }
+            if value["records"]
+                .as_array()
+                .is_none_or(|records| records.is_empty())
+            {
+                orphaned.push((account, message));
+            }
+            tx.execute("UPDATE agent_message_decisions SET decision_json=?3 WHERE account_id=?1 AND message_id=?2",
+                params![account,message,value.to_string()])?;
+        }
+    }
+    // Corrections can be a full list or an add/remove delta. Preserve Reading
+    // preferences, but a legacy Records correction can no longer restore it.
+    {
+        let mut stmt = tx.prepare(
+            "SELECT rowid,value_json FROM agent_triage_corrections WHERE field='destinations'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, encoded) in rows {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&encoded).map_err(|e| CoreError::Other(e.into()))?;
+            if let Some(values) = value.as_array_mut() {
+                values.retain(|v| v != "records");
+            }
+            for key in ["add", "remove"] {
+                if let Some(values) = value.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+                    values.retain(|v| v != "records");
+                }
+            }
+            let updated = value.to_string();
+            if updated != encoded {
+                tx.execute(
+                    "UPDATE agent_triage_corrections SET value_json=?2 WHERE rowid=?1",
+                    params![id, updated],
+                )?;
+            }
+        }
+    }
+    tx.execute(
+        "DELETE FROM agent_message_destinations WHERE destination='records'",
+        [],
+    )?;
+    for (account, message) in orphaned {
+        super::agent_triage::enqueue_agent_triage_conn(
+            &tx,
+            account,
+            message,
+            "records_cleanup",
+            false,
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }

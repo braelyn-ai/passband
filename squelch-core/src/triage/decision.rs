@@ -23,7 +23,7 @@ decision_enum!(EmailKind {
     AccountService,
     AuthenticationSecurity
 });
-decision_enum!(MessageDestination { Reading, Records });
+decision_enum!(MessageDestination { Reading });
 decision_enum!(AttentionState {
     Informational,
     NeedsUser,

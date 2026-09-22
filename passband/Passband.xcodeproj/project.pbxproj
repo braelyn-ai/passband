@@ -94,6 +94,7 @@
 		422855E95AB668EF2EC537B1 /* Brand in Resources */ = {isa = PBXBuildFile; fileRef = 5B4B4C15D9674E6B94D01849 /* Brand */; };
 		42B14F1B7A46FE2A0B7E9772 /* PassbandApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 389673F8FDDB51FC4830D9D2 /* PassbandApp.swift */; };
 		42D3E80C99FEE7FA7C6D3CF0 /* Typography.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1E784321EA909951CA347A7 /* Typography.swift */; };
+		4447BE301663F629A86CD500 /* CalendarVisibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = A19BF25A7D06A8FEDAE42B1F /* CalendarVisibility.swift */; };
 		454262AEF38CC6F59CEB4989 /* WhatsNew.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22634771F8C0BE048B034866 /* WhatsNew.swift */; };
 		45E3185440F05D41CF616B8D /* SitrepWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B7D3E42C4E6495943239602 /* SitrepWindow.swift */; };
 		462F8657C4CD7BAA224F5CDD /* NeedToday.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F65DF255404CE32FC4AD8CF /* NeedToday.swift */; };
@@ -146,6 +147,7 @@
 		67BAF2D0252EDA5EB6767C8B /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3BE1E84810E523707C4E2CC5 /* SettingsView.swift */; };
 		690907684E5BA64D7992F2C1 /* AttachmentFiles.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9369773169CED1C1EFD48EB0 /* AttachmentFiles.swift */; };
 		693321A39E2B0E50EC447924 /* ReleaseNotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1964D381D25BBC803E490328 /* ReleaseNotes.swift */; };
+		6979959E7A26F505D071F572 /* CalendarVisibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = A19BF25A7D06A8FEDAE42B1F /* CalendarVisibility.swift */; };
 		6A1794D3DBC04B13BAFD50B8 /* NeedToday.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F65DF255404CE32FC4AD8CF /* NeedToday.swift */; };
 		6D74F4781C3A799E7A404068 /* SearchLanePrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9C4011E6AF1CD8193898F627 /* SearchLanePrompt.swift */; };
 		6DA8A02161F44D736FF51C49 /* GroupToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE5AF3E60001C29040AFCF5 /* GroupToken.swift */; };
@@ -515,6 +517,7 @@
 		9E5E8356451742599F7D7A2A /* MobileAuthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileAuthView.swift; sourceTree = "<group>"; };
 		9ED32B3054A31D7933998E59 /* ComposeAttachments.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ComposeAttachments.swift; sourceTree = "<group>"; };
 		A07093A9D416AD79A642B3A3 /* RelayProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RelayProxy.swift; sourceTree = "<group>"; };
+		A19BF25A7D06A8FEDAE42B1F /* CalendarVisibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarVisibility.swift; sourceTree = "<group>"; };
 		A1DD819E65C2460A88F79805 /* TriageFixPalette.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TriageFixPalette.swift; sourceTree = "<group>"; };
 		A1F7E100AE7B49F14F812A13 /* PassbandiOSNotify.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = PassbandiOSNotify.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A31EE886D87910F0348A94AB /* SitrepPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SitrepPoller.swift; sourceTree = "<group>"; };
@@ -699,6 +702,7 @@
 				8DAF25E856CCAD8284AAA131 /* AttachmentKinds.swift */,
 				BB5FEFF987265DA1E7F85007 /* AuthCode.swift */,
 				40EDDA2423A09A989C77CAED /* AuthLabels.swift */,
+				A19BF25A7D06A8FEDAE42B1F /* CalendarVisibility.swift */,
 				9C9C77BCE41A573ED04E49AA /* CidImages.swift */,
 				9ED32B3054A31D7933998E59 /* ComposeAttachments.swift */,
 				E1C033DDA02DD344F437F943 /* Concurrency.swift */,
@@ -1122,6 +1126,7 @@
 				B65E72D6B22EB9694BFEB245 /* AuthView.swift in Sources */,
 				26C5B834CA3DF63D12F9AAC4 /* Avatar.swift in Sources */,
 				91774D41994F36BA146947E7 /* Badge.swift in Sources */,
+				6979959E7A26F505D071F572 /* CalendarVisibility.swift in Sources */,
 				4DF190F34838471A99C7213B /* Chrome.swift in Sources */,
 				8CCC6315E27DD5683F55D274 /* CidImages.swift in Sources */,
 				2F0512A905C0C28E9629D4D8 /* ComposeAttach.swift in Sources */,
@@ -1286,6 +1291,7 @@
 				E1ACA531EA2201EBCD932243 /* AuthLabels.swift in Sources */,
 				4D1913697E7DE1A0B25EFDC4 /* Avatar.swift in Sources */,
 				396BF899A7D7540E0DBCBB5B /* Badge.swift in Sources */,
+				4447BE301663F629A86CD500 /* CalendarVisibility.swift in Sources */,
 				BDE91DE1BD59B4CD5D50F21D /* Chrome.swift in Sources */,
 				A32CA97991D874737EE663DA /* CidImages.swift in Sources */,
 				856AC67B9A7F90BF5B3D18B9 /* ComposeAttach.swift in Sources */,

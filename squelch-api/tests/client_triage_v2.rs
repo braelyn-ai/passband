@@ -26,7 +26,7 @@ fn assess(store: &squelch_core::store::SqliteStore, account: i64, id: i64, restr
     }];
     let decision = MessageDecision {
         kinds: vec![EmailKind::Promotional],
-        destinations: vec![MessageDestination::Reading, MessageDestination::Records],
+        destinations: vec![MessageDestination::Reading],
         summary: "An offer worth reading".into(),
         reason: "The user can curate promotions".into(),
         auth: if restricted {
@@ -37,6 +37,12 @@ fn assess(store: &squelch_core::store::SqliteStore, account: i64, id: i64, restr
         } else {
             AuthAssessment::default()
         },
+        records: vec![squelch_core::triage::decision::RecordProposal::Receipt {
+            merchant: "Shop".into(),
+            amount: Some(10.0),
+            currency: Some("USD".into()),
+            evidence: evidence.clone(),
+        }],
         external_access: AccessAssessment {
             restricted,
             reason: "Assessment".into(),
@@ -151,7 +157,7 @@ async fn destinations_overlap_and_correction_changes_only_requested_membership()
         .oneshot(authed_json(
             "POST",
             &format!("/client/v2/messages/{id}/corrections"),
-            serde_json::json!({"field":"destinations", "value":["records"]}),
+            serde_json::json!({"field":"destinations", "value":[]}),
         ))
         .await
         .unwrap();
@@ -258,7 +264,7 @@ async fn correction_deltas_preserve_other_destinations_and_reject_ambiguous_payl
         .unwrap()
         .previous_decision
         .unwrap();
-    assert_eq!(current.destinations, vec![MessageDestination::Records]);
+    assert!(current.destinations.is_empty());
     let response = h
         .app
         .clone()
@@ -278,9 +284,10 @@ async fn correction_deltas_preserve_other_destinations_and_reject_ambiguous_payl
             .unwrap()
             .destinations
             .len(),
-        2
+        1
     );
     for invalid in [
+        serde_json::json!({"field":"destinations","add":["records"]}),
         serde_json::json!({"field":"destinations","add":["reading"],"value":[]}),
         serde_json::json!({"field":"kinds","add":["not_a_kind"]}),
     ] {

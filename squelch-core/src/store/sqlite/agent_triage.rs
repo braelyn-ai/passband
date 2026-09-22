@@ -9,6 +9,8 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
+// New arrivals retain first priority. Explicit manual work comes before old
+// import/migration work, without changing which budget pays for each job.
 const CLAIM_JOB_SQL: &str = "SELECT j.id,j.message_id,j.trigger,j.attempts,j.arrival_eligible,j.kind,COALESCE(lane.foreground,0)
              FROM agent_triage_jobs j INDEXED BY idx_agent_jobs_pending_claim JOIN messages candidate ON candidate.account_id=j.account_id AND candidate.id=j.message_id
              LEFT JOIN agent_job_lanes lane ON lane.job_id=j.id
@@ -20,7 +22,11 @@ const CLAIM_JOB_SQL: &str = "SELECT j.id,j.message_id,j.trigger,j.attempts,j.arr
                    WHERE active.account_id=j.account_id AND active.kind IN ('triage','access')
                      AND active.state='leased' AND active.lease_until>?3 AND active.id!=j.id
                      AND other.thread_id=candidate.thread_id))
-             ORDER BY COALESCE(lane.foreground,0) DESC,j.available_at,j.id LIMIT 1";
+             ORDER BY CASE
+                 WHEN COALESCE(lane.foreground,0)=1 AND j.arrival_eligible=1 THEN 0
+                 WHEN j.trigger LIKE 'manual:%' THEN 1
+                 ELSE 2 END,
+                 COALESCE(lane.foreground,0) DESC,j.available_at,j.id LIMIT 1";
 
 fn json<T: serde::Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| CoreError::Other(e.into()))
@@ -243,7 +249,8 @@ fn apply_correction(
 ) -> Result<()> {
     match field {
         "kinds" if value.is_object() => apply_list_delta(&mut decision.kinds, value)?,
-        "destinations" if value.is_object() => apply_list_delta(&mut decision.destinations, value)?,
+        "destinations" if value.is_object() => apply_list_delta(&mut decision.destinations, value)
+            .map_err(|_| CoreError::InvalidInput("Reading is the only selectable destination; record groups come from typed facts".into()))?,
         "kinds" => {
             let kinds: Vec<crate::triage::decision::EmailKind> = decode(&value.to_string())?;
             if kinds.is_empty() {
@@ -251,7 +258,8 @@ fn apply_correction(
             }
             decision.kinds = kinds;
         }
-        "destinations" => decision.destinations = decode(&value.to_string())?,
+        "destinations" => decision.destinations = decode(&value.to_string())
+            .map_err(|_| CoreError::InvalidInput("Reading is the only selectable destination; record groups come from typed facts".into()))?,
         "show_in_fye" => {
             decision.attention.show_in_fye = value
                 .as_bool()
@@ -384,7 +392,6 @@ pub(super) fn correct_agent_triage_conn(
             for destination in decision.destinations {
                 let name = match destination {
                     MessageDestination::Reading => "reading",
-                    MessageDestination::Records => "records",
                 };
                 conn.execute("INSERT OR IGNORE INTO agent_message_destinations(account_id,message_id,destination) VALUES(?1,?2,?3)",
         params![account,message,name])?;
@@ -1413,7 +1420,6 @@ impl AgentTriageStore for SqliteStore {
             for destination in &decision.destinations {
                 let value = match destination {
                     MessageDestination::Reading => "reading",
-                    MessageDestination::Records => "records",
                 };
                 tx.execute("INSERT OR IGNORE INTO agent_message_destinations(account_id,message_id,destination) VALUES(?1,?2,?3)",
         params![job.account_id,job.message_id,value])?;
@@ -1893,6 +1899,17 @@ fn list_items_with_query(
              t.message_id=m.id WHERE a.account_id=?1 AND ?3='fye' AND (a.show_in_fye=1 OR t.reminded_at
              IS NOT NULL) AND m.is_sent=0 AND m.is_spam=0 AND COALESCE(t.status,'new')!='done' AND
              (t.remind_at IS NULL OR t.remind_at<=?2) AND ?4 IS ?4 AND ?5 IS ?5"
+    } else if destination == "records" {
+        "SELECT m.id,m.thread_id,m.from_addr,m.subject,
+             strftime('%Y-%m-%dT%H:%M:%fZ',min(julianday(m.received_at),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))),d.decision_json,a.attention_json,a.unresolved_since,d.message_id
+             FROM agent_message_decisions d JOIN messages m ON m.account_id=d.account_id AND m.id=d.message_id
+             LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id
+             LEFT JOIN agent_thread_attention a ON a.account_id=m.account_id AND a.thread_id=m.thread_id
+             WHERE d.account_id=?1 AND ?3='records' AND m.is_sent=0 AND m.is_spam=0
+             AND EXISTS(SELECT 1 FROM json_each(d.decision_json,'$.records') r
+                 WHERE json_extract(r.value,'$.kind') IN ('bill','receipt','delivery','event','financial_update'))
+             AND (?4 OR COALESCE(t.status,'new')!='done')
+             AND (?5 IS NULL OR min(julianday(m.received_at),COALESCE(julianday(t.created_at),julianday(?2)),julianday(?2))>=julianday(?5))"
     } else {
         "SELECT
              m.id,m.thread_id,m.from_addr,m.subject,
@@ -2076,6 +2093,101 @@ mod tests {
         store
     }
     #[test]
+    fn records_are_derived_from_facts_and_legacy_placements_are_retired() {
+        let store = fixture();
+        {
+            let conn = store.lock().unwrap();
+            conn.execute_batch("DROP TABLE agent_message_destinations;
+                CREATE TABLE agent_message_destinations(account_id INTEGER,message_id INTEGER,destination TEXT,
+                PRIMARY KEY(account_id,message_id,destination));
+                INSERT INTO agent_message_destinations VALUES(1,1,'records'),(1,2,'records');").unwrap();
+            for id in [1, 2] {
+                let mut d = serde_json::to_value(decision(id)).unwrap();
+                d["destinations"] = serde_json::json!(["reading", "records"]);
+                if id == 1 {
+                    d["records"] = serde_json::json!([]);
+                }
+                conn.execute(
+                    "INSERT INTO agent_message_decisions VALUES(1,?1,1,?2,?3)",
+                    params![id, d.to_string(), Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+            }
+            conn.execute("INSERT INTO agent_triage_corrections(account_id,message_id,field,value_json,source_revision,revision,updated_at)
+                VALUES(1,1,'destinations',?1,1,1,?2)",params![r#"{"add":["reading","records"],"remove":[]}"#,Utc::now().to_rfc3339()]).unwrap();
+            super::super::migrate::retire_records_destination(&conn).unwrap();
+            super::super::migrate::retire_records_destination(&conn).unwrap();
+            let jobs: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM agent_triage_jobs WHERE trigger='records_cleanup'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                jobs, 1,
+                "generic placements are queued once, typed records are retained"
+            );
+            let labels: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM agent_message_destinations WHERE destination='records'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(labels, 0);
+            let correction: String = conn
+                .query_row("SELECT value_json FROM agent_triage_corrections", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(!correction.contains("records"));
+            assert!(correction.contains("reading"));
+        }
+        let records = store.agent_records(1, 10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].message_id, 2);
+        assert_eq!(
+            records[0].decision.destinations,
+            vec![MessageDestination::Reading]
+        );
+        assert!(
+            store
+                .correct_agent_triage_delta(
+                    1,
+                    2,
+                    "destinations",
+                    &["records".into()],
+                    &[],
+                    Utc::now()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn manual_retriage_precedes_import_backlog_but_not_new_arrivals() {
+        for arrival in [false, true] {
+            let store = fixture();
+            store.enqueue_agent_triage(1, 1, "ingest", arrival).unwrap();
+            store
+                .enqueue_agent_triage(1, 2, "manual:requested", false)
+                .unwrap();
+            let job = store
+                .claim_agent_job(1, "investigation", Utc::now(), 60)
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.message_id, if arrival { 1 } else { 2 });
+            if !arrival {
+                assert!(
+                    !job.foreground,
+                    "manual priority must not bypass the background budget"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn triage_job_counts_include_retries_and_isolate_accounts_and_kinds() {
         let store = fixture();
         assert_eq!(store.triage_job_counts(1).unwrap(), [0, 0]);
@@ -2108,7 +2220,16 @@ mod tests {
             kinds: vec![EmailKind::Correspondence],
             summary: "Summary".into(),
             reason: "Reason".into(),
-            destinations: vec![MessageDestination::Reading, MessageDestination::Records],
+            destinations: vec![MessageDestination::Reading],
+            records: vec![crate::triage::decision::RecordProposal::Receipt {
+                merchant: "Shop".into(),
+                amount: Some(12.0),
+                currency: Some("USD".into()),
+                evidence: vec![crate::triage::decision::EvidenceRef {
+                    message_id: id,
+                    location: "body".into(),
+                }],
+            }],
             external_access: AccessAssessment {
                 reason: "No credential".into(),
                 ..Default::default()
@@ -2818,7 +2939,7 @@ mod tests {
     }
 
     #[test]
-    fn background_claims_follow_age_instead_of_starving_migration() {
+    fn manual_request_precedes_migration_then_migration_resumes() {
         let store = fixture();
         store
             .enqueue_agent_triage(1, 1, "migration", false)
@@ -2831,7 +2952,12 @@ mod tests {
             .claim_agent_job(1, "investigation", Utc::now(), 60)
             .unwrap()
             .unwrap();
-        assert_eq!(job.message_id, 1);
+        assert_eq!(job.message_id, 2);
+        let next = store
+            .claim_agent_job(1, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.message_id, 1);
     }
 
     #[test]

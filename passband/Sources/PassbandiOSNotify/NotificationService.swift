@@ -280,7 +280,6 @@ final class NotificationService: UNNotificationServiceExtension {
         let account = accountId.uuidString
         let content = UNMutableNotificationContent()
         content.title = copy.title
-        if !copy.subtitle.isEmpty { content.subtitle = copy.subtitle }
         content.body = copy.body
         // Account-prefixed for the reason `Notifier` prefixes its own: thread
         // ids are per-daemon, so two mailboxes would otherwise stack unrelated

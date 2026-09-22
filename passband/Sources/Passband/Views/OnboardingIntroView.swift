@@ -239,7 +239,7 @@ private struct IntroMail: Identifiable {
         .init(id: 0, sender: "Jamie", subject: "A quick decision before Friday",
               destination: "Needs you", symbol: "arrow.turn.up.left", color: Palette.warn),
         .init(id: 1, sender: "Your neighborhood café", subject: "Your receipt. Thanks for stopping by.",
-              destination: "Records", symbol: "tray", color: Palette.inkDim),
+              destination: "Receipts", symbol: "tray", color: Palette.inkDim),
         .init(id: 2, sender: "The Sunday Edit", subject: "A few things we thought you’d like",
               destination: "For later", symbol: "book", color: Palette.inkDim),
     ]

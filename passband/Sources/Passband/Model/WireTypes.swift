@@ -478,13 +478,14 @@ struct CalendarUpdate: Codable, Sendable, Identifiable, Hashable {
 }
 
 enum BankingKind: String, LenientRawEnum {
-    case statement, update
+    case statement, update, bill
     case transactionAlert = "transaction_alert"
     case autopay
     static var unknownFallback: BankingKind { .statement }
 
     var tag: String {
         switch self {
+        case .bill: "bill"
         case .statement: "statement"
         case .update: "update"
         case .transactionAlert: "alert"
@@ -504,6 +505,8 @@ struct BankingRecord: Codable, Sendable, Identifiable, Hashable {
     var currency: String?
     var account_hint: String?
     var received_at: String
+    var due: String? = nil
+    var autopay: Bool? = nil
 }
 
 // MARK: - send groups
@@ -1638,11 +1641,13 @@ extension AgentFeed {
     var banking: [BankingRecord] {
         items.flatMap { item in
             (item.decision.records ?? []).enumerated().compactMap { index, record in
-                guard record.kind == "financial_update" else { return nil }
+                guard record.kind == "financial_update" || record.kind == "bill" else { return nil }
                 return BankingRecord(id: item.message_id * 1000 + index,
                     message_id: item.message_id, thread_id: item.thread_id,
-                    from_addr: item.from_addr, kind: .update, institution: record.institution,
-                    amount: nil, currency: nil, account_hint: nil, received_at: item.received_at)
+                    from_addr: item.from_addr, kind: record.kind == "bill" ? .bill : .update,
+                    institution: record.kind == "bill" ? record.merchant : record.institution,
+                    amount: record.amount, currency: record.currency, account_hint: nil,
+                    received_at: item.received_at, due: record.due?.value, autopay: record.autopay)
             }
         }
     }
