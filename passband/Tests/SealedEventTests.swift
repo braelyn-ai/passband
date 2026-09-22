@@ -210,7 +210,7 @@ struct SealedEventTests {
                 frame(sealedKind: "otp", oneLine: "725104 is your Acme verification code"))
         else { return expect(false, "decodes") }
         let copy = authCopy(e)
-        let everything = [copy.title, copy.subtitle, copy.body, copy.threadIdentifier].joined(
+        let everything = [copy.title, copy.body, copy.threadIdentifier].joined(
             separator: " ")
         expect(!everything.contains("725104"), "no field of an auth banner carries the code")
         expect(
@@ -290,21 +290,22 @@ struct SealedEventTests {
     }
 
     /// The event's deadline is a snapshot taken at triage, and a banner sits
-    /// on a lock screen for hours. The second line says there IS one and
-    /// nothing about when.
+    /// on a lock screen for hours. No field of the banner says when, and no
+    /// kind gets a second line saying the reader is behind.
     static func theThreadBannerNeverCarriesADate() {
         let past = "2026-08-30T09:00:00Z"
         guard let urgent = decode(frame(kind: "urgent", deadline: past)),
             let dated = decode(frame(kind: "deadline", deadline: past)),
             let plain = decode(frame(kind: "surfaced", deadline: past))
         else { return expect(false, "decodes") }
-        expect(
-            EventBanner.copy(for: urgent).subtitle == "",
-            "urgent mail carries no pressure line, and no date")
-        expect(
-            EventBanner.copy(for: dated).subtitle == "has a deadline",
-            "a deadline event says there is one, not when it is")
-        expect(EventBanner.copy(for: plain).subtitle == "", "surfaced mail has no second line")
+        for e in [urgent, dated, plain] {
+            let copy = EventBanner.copy(for: e)
+            for line in ["needs attention", "has a deadline"] {
+                expect(
+                    !(copy.title + " " + copy.body).lowercased().contains(line),
+                    "no kind carries a pressure line (\(line))")
+            }
+        }
         // The chip the rows draw for this date, asserted absent BY ITS OWN
         // TEXT rather than by a guess at its spelling.
         guard let chip = Fmt.deadlineChip(past)?.text, !chip.isEmpty else {
@@ -312,7 +313,7 @@ struct SealedEventTests {
         }
         for e in [urgent, dated, plain] {
             let copy = EventBanner.copy(for: e)
-            let everything = [copy.title, copy.subtitle, copy.body].joined(separator: " ")
+            let everything = [copy.title, copy.body].joined(separator: " ")
             expect(!everything.contains(chip), "the chip \(chip) reaches no field of the banner")
             expect(!everything.contains("2026"), "nor the date it was made from")
         }
