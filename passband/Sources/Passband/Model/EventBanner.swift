@@ -130,18 +130,21 @@ enum EventBanner {
 
         let subtitle: String
         switch event.kind {
-        // The time-bound kinds get a second line saying WHY the banner is worth
-        // the interruption, but NOT the date. The event's deadline is a
-        // snapshot taken at triage, and a banner sits on a lock screen for
-        // hours: "due today" read tomorrow morning is wrong, and "2d PAST DUE"
-        // on mail the human already handled is a nag. The thread has the live
-        // chip; the banner says only that there is one.
-        case .urgent: subtitle = "needs attention"
+        // A deadline event gets a second line saying there IS one, but NOT
+        // the date. The event's deadline is a snapshot taken at triage, and a
+        // banner sits on a lock screen for hours: "due today" read tomorrow
+        // morning is wrong, and "2d PAST DUE" on mail the human already
+        // handled is a nag. The thread has the live chip; the banner says
+        // only that there is one.
         case .deadline: subtitle = "has a deadline"
-        // No second line for the ordinary case: a subtitle on every
-        // notification is a subtitle that means nothing. `.opened` returned
-        // above and is listed only to keep this switch exhaustive.
-        case .surfaced, .opened: subtitle = ""
+        // Urgent mail gets NO second line. It used to say "needs attention",
+        // and a banner that opens by telling the human they are behind is a
+        // banner they flinch away from rather than tap. The chime and the
+        // summary already carry the weight; the pressure line only added
+        // dread. (No second line for surfaced mail either: a subtitle on
+        // every notification is a subtitle that means nothing. `.opened`
+        // returned above and is listed only to keep this switch exhaustive.)
+        case .urgent, .surfaced, .opened: subtitle = ""
         }
 
         return Copy(

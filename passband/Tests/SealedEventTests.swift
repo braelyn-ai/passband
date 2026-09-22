@@ -299,8 +299,8 @@ struct SealedEventTests {
             let plain = decode(frame(kind: "surfaced", deadline: past))
         else { return expect(false, "decodes") }
         expect(
-            EventBanner.copy(for: urgent).subtitle == "needs attention",
-            "urgent says why, not when")
+            EventBanner.copy(for: urgent).subtitle == "",
+            "urgent mail carries no pressure line, and no date")
         expect(
             EventBanner.copy(for: dated).subtitle == "has a deadline",
             "a deadline event says there is one, not when it is")
