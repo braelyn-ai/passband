@@ -308,9 +308,8 @@ struct ThreadViewer: View {
         // Warm the NEXT queued thread while this one is being read, so e/d's
         // done+advance opens it instantly.
         .onAppear {
-            if let cur = store.threadQueue.firstIndex(where: { $0.thread_id == threadId }),
-                let next = store.threadQueue[safe: cur + 1]
-            {
+            // Reading's passive preview fetches and warms the next thread itself.
+            if !store.readingStack, let next = store.nextQueuedThread {
                 ThreadPrefetch.shared.prefetch(next.thread_id)
             }
         }
@@ -335,8 +334,12 @@ struct ThreadViewer: View {
         #if os(macOS)
             VStack(spacing: 0) {
                 header
-                content
-                composer
+                if store.readingStack {
+                    readingDeck
+                } else {
+                    content
+                    composer
+                }
             }
         #else
             VStack(spacing: 0) {
@@ -346,6 +349,41 @@ struct ThreadViewer: View {
             .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         #endif
     }
+
+    #if os(macOS)
+        /// The header belongs to the window; only the mail participates in the deck.
+        private var readingDeck: some View {
+            GeometryReader { reader in
+                let cardWidth = max(0, reader.size.width - 56)
+                // Constrain the scroll viewport to the window. The full-height
+                // preview is decoration and must never size the scroll container.
+                VStack(spacing: 0) {
+                    content
+                    composer
+                }
+                .frame(width: cardWidth, height: reader.size.height)
+                .background { ReaderBackdrop() }
+                .clipped()
+                .offset(store.threadFlight.offset(in: CGSize(
+                    width: cardWidth + 12, height: reader.size.height)))
+                .scaleEffect(store.threadFlight.scale)
+                .opacity(store.threadFlight.opacity)
+                .background(alignment: .topLeading) {
+                    if let next = store.nextQueuedThread {
+                        ReadingStackPeek(row: next)
+                            .id(next.thread_id)
+                            .frame(width: cardWidth, height: reader.size.height, alignment: .topLeading)
+                            .clipped()
+                            .offset(x: cardWidth + 12)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .frame(width: reader.size.width, height: reader.size.height, alignment: .leading)
+                .clipped()
+            }
+        }
+    #endif
 
     /// MOUNTED UNCONDITIONALLY, and gated on `store.inlineReply` INSIDE. Reading
     /// the draft from this body instead would make every keystroke in the reply
@@ -414,8 +452,10 @@ struct ThreadViewer: View {
                     }
                     .scrollIndicators(.hidden)
                     .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
-                    StyleRadio(style: style, ready: styleReady, axis: .horizontal) {
-                        chooseStyle($0)
+                    if !isReadingMail {
+                        StyleRadio(style: style, ready: styleReady, axis: .horizontal) {
+                            chooseStyle($0)
+                        }
                     }
                 }
             }
@@ -821,9 +861,11 @@ struct ThreadViewer: View {
                 // See `header`.
                 #if os(macOS)
                     .overlay(alignment: .topTrailing) {
-                        StyleRadio(style: style, ready: styleReady) { chooseStyle($0) }
-                            .padding(.top, 10)
-                            .padding(.trailing, 12)
+                        if !isReadingMail {
+                            StyleRadio(style: style, ready: styleReady) { chooseStyle($0) }
+                                .padding(.top, 10)
+                                .padding(.trailing, 12)
+                        }
                     }
                 #endif
             }
@@ -1244,16 +1286,7 @@ struct ThreadViewer: View {
                 // subject headers; `openComposeForward` resolves the two.
                 store.openComposeForward(message: m, fallbackSubject: thread?.subject ?? "")
             },
-            // THE PAIR: `e`/`d` finish this email and leave, `E`/`D` finish it
-            // and open the next one in the queue. One letter, one verb, on every
-            // surface — the shifted twin is the SAME verb with the walk attached,
-            // not a different one, which is why it is a case away rather than a
-            // key away.
-            //
-            // Plain done CLOSES even when there is a queue behind it. Finishing
-            // an email is not a commitment to read the next one, and a reader
-            // that hauls in more mail on the key you press to be rid of the mail
-            // in front of you is the app arguing with you.
+            // Reading's sender stack advances with plain done; other surfaces close.
             KeyBinding("e", "done") { Task { await doneAndClose() } },
             KeyBinding("d", "done") { Task { await doneAndClose() } },
             KeyBinding("E", "done + next") { Task { await doneAndNext() } },
@@ -1321,6 +1354,13 @@ struct ThreadViewer: View {
         index = min(newestIndex, max(0, index + delta))
     }
 
+    /// Includes single-email Reading cards and Reading mail opened elsewhere.
+    private var isReadingMail: Bool {
+        store.readingMail || store.zones.reading.contains { sender in
+            sender.items.contains { $0.thread_id == threadId }
+        }
+    }
+
     /// `b` walks the radio: same choice, keyboard spelling.
     private func toggleStyle() { chooseStyle(style.flipped) }
 
@@ -1337,7 +1377,7 @@ struct ThreadViewer: View {
     /// would pin the placeholder, for a thread nobody has read yet, and nothing
     /// would ever ask again.
     private func chooseStyle(_ chosen: ThreadStyle) {
-        guard styleReady else { return }
+        guard styleReady, !isReadingMail else { return }
         styles.set(threadId, chosen)
         guard style != chosen else { return }
         style = chosen
@@ -1362,6 +1402,7 @@ struct ThreadViewer: View {
     /// because the caller is `adopt`, which is holding the thread it is about to
     /// install and has not installed it yet.
     private func resolvedStyle(_ messages: [ClientMessage]) -> ThreadStyle {
+        if isReadingMail { return .classic }
         if let pinned = styles.style(threadId) { return pinned }
         if let fixed = prefs.threadStyle.fixed { return fixed }
         // The participation veto, asked BEFORE the samples exist: it reads
@@ -1525,13 +1566,16 @@ struct ThreadViewer: View {
             let cur = queue.firstIndex(where: { $0.thread_id == threadId }),
             let next = queue[safe: cur + delta]
         else { return }
-        store.openThread(next.thread_id, queue: queue)
+        store.openThread(next.thread_id, queue: queue, readingMail: store.readingMail)
     }
 
-    /// e/d — "done": resolve the email in front of you and leave, whatever is
-    /// or is not queued behind it. The same departure animation as done + next,
-    /// because it is the same verb — the walk is the only difference.
+    /// Plain done walks a Reading sender's stack, or closes an ordinary reader.
     private func doneAndClose() async {
+        guard store.threadFlight == .settled else { return }
+        if store.readingStack {
+            await doneAndNext()
+            return
+        }
         let liftedAt = liftOff()
         await resolveOpenThread()
         await flightOut(since: liftedAt)
@@ -1614,6 +1658,7 @@ struct ThreadViewer: View {
     /// trip — the email is going either way — and only the leftover of its
     /// 220ms is ever waited on.
     private func doneAndNext() async {
+        guard store.threadFlight == .settled else { return }
         let queue = store.threadQueue
         let cur = queue.firstIndex(where: { $0.thread_id == threadId })
         // THE NEXT DIFFERENT EMAIL, not merely the next row. Every band listing
@@ -1629,11 +1674,7 @@ struct ThreadViewer: View {
         // snapshot taken when the reader opened, and mail dealt with since (the
         // sibling the store just resolved, a row done from a list underneath) is
         // not something to walk a reader onto.
-        let next = cur.flatMap { c in
-            queue[(c + 1)...].first {
-                $0.thread_id != threadId && !store.resolvedIds.contains($0.id)
-            }
-        }
+        let next = store.nextQueuedThread
 
         let liftedAt = liftOff()
         await resolveOpenThread()
@@ -1651,13 +1692,15 @@ struct ThreadViewer: View {
             store.closeThread()
             return
         }
-        let edge: AppStore.ThreadEdge = sameSender(next, queue[cur]) ? .trailing : .bottom
+        let edge: AppStore.ThreadEdge =
+            (store.readingStack || sameSender(next, queue[cur])) ? .trailing : .bottom
         // Mounted OFF SCREEN, unanimated, and walked in on the next frame. The
         // sleep is the whole reason this works: an offset that is set and
         // cleared inside one update has never been drawn, so there is nothing
         // for the animation to move away from.
-        store.openThread(next.thread_id, queue: queue, entering: edge)
+        store.openThread(next.thread_id, queue: queue, entering: edge, readingMail: store.readingMail)
         try? await Task.sleep(for: .milliseconds(30))
+        guard store.threadId == next.thread_id else { return }
         withAnimation(Motion.deckCard) { store.threadFlight = .settled }
     }
 
@@ -1680,9 +1723,11 @@ struct ThreadViewer: View {
             store.closeThread()
             return
         }
-        let edge: AppStore.ThreadEdge = sameSender(next, queue[cur]) ? .trailing : .bottom
-        store.openThread(next.thread_id, queue: queue, entering: edge)
+        let edge: AppStore.ThreadEdge =
+            (store.readingStack || sameSender(next, queue[cur])) ? .trailing : .bottom
+        store.openThread(next.thread_id, queue: queue, entering: edge, readingMail: store.readingMail)
         try? await Task.sleep(for: .milliseconds(30))
+        guard store.threadId == next.thread_id else { return }
         withAnimation(Motion.deckCard) { store.threadFlight = .settled }
     }
 
@@ -1690,7 +1735,9 @@ struct ThreadViewer: View {
     /// hand back when it started so the wait can be the REMAINDER of the flight
     /// rather than the whole of it on top of the round trip.
     private func liftOff() -> ContinuousClock.Instant {
-        withAnimation(Motion.depart) { store.threadFlight = .departing }
+        withAnimation(Motion.depart) {
+            store.threadFlight = store.readingStack ? .departingDown : .departing
+        }
         return .now
     }
 
@@ -1949,6 +1996,39 @@ struct ReaderBackdrop: View {
         Rectangle()
             .fill(Palette.readerBackground.opacity(0.97))
             .background(.regularMaterial)
+    }
+}
+
+/// Passive mail preview: no reader shortcuts, read acknowledgement, or selection.
+struct ReadingStackPeek: View {
+    let row: AttentionUpdate
+    @State private var preview: ClientThreadView?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let message = preview?.messages.last {
+                MessageCard(message: message, style: .classic, position: 0,
+                            selected: false, ruled: false, opens: [], onSelect: {})
+            } else {
+                HStack(spacing: 9) {
+                    Avatar(sender: row.senderString, size: 24)
+                    Text(SenderCache.resolved(row.senderString).displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Palette.ink)
+                }
+                .padding(.leading, MessageCard.bodyInset)
+                .padding(.vertical, 16)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.top, 4)
+        .clipped()
+        .task(id: row.thread_id) {
+            let loaded = try? await ThreadPrefetch.shared.fetch(row.thread_id)
+            guard !Task.isCancelled else { return }
+            preview = loaded
+        }
     }
 }
 

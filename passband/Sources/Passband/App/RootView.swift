@@ -342,12 +342,14 @@ struct MainShell: View {
                     ZStack {
                         ThreadViewer(threadId: threadId)
                             .id(threadId)
-                            .offset(store.threadFlight.offset(in: geo.size))
-                            .scaleEffect(store.threadFlight.scale)
-                            .opacity(store.threadFlight.opacity)
+                            // Reading animates its cards below the full-width header.
+                            .offset(store.readingStack ? .zero : store.threadFlight.offset(in: geo.size))
+                            .scaleEffect(store.readingStack ? 1 : store.threadFlight.scale)
+                            .opacity(store.readingStack ? 1 : store.threadFlight.opacity)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
+
                     if store.sideView.isOpen {
                         // Reserves the strip without taking clicks off the panel
                         // sitting under it.
@@ -588,6 +590,7 @@ extension AppStore.ThreadFlight {
         switch self {
         case .settled: .zero
         case .departing: CGSize(width: 0, height: -window.height)
+        case .departingDown: CGSize(width: 0, height: window.height)
         case .entering(.bottom): CGSize(width: 0, height: window.height)
         case .entering(.trailing): CGSize(width: window.width, height: 0)
         }
