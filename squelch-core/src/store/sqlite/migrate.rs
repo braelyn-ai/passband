@@ -391,6 +391,19 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // column comment in schema.sql.
     add_column_if_missing(conn, "shipments", "cleared_at", "TEXT")?;
 
+    // THE CARRIER'S ANSWER CLOCK. Pre-existing rows never recorded which
+    // attempt was answered, so the best available history is: a row holding a
+    // carrier's words was answered no later than its last attempt. That is an
+    // upper bound, which errs toward keeping a row listed for one more window
+    // rather than hiding a live one; it is corrected by the next real answer.
+    if add_column_if_missing(conn, "shipments", "last_answered_at", "TEXT")? {
+        conn.execute(
+            "UPDATE shipments SET last_answered_at = last_polled_at
+              WHERE carrier_status_raw IS NOT NULL",
+            [],
+        )?;
+    }
+
     // The cid an inline image part declared. NULL on every pre-existing row and
     // NOT backfillable from here — the Content-ID lives in the RFC822, which the
     // store never kept — so already-synced mail keeps painting its inline images

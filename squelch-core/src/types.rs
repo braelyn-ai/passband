@@ -540,6 +540,10 @@ pub struct Shipment {
     pub delivered_at: Option<DateTime<Utc>>,
     /// Last carrier-API poll ATTEMPT; `None` = never polled.
     pub last_polled_at: Option<DateTime<Utc>>,
+    /// Last poll the carrier ANSWERED (a track came back, whatever it said);
+    /// `None` = never. The listing's "a carrier is vouching for this row" reads
+    /// this rather than the attempt clock.
+    pub last_answered_at: Option<DateTime<Utc>>,
     /// Consecutive PERMANENT carrier-poll failures (0 until one happens, reset by
     /// any successful poll). Surfaced because it is EVIDENCE ABOUT THE NUMBER: a
     /// bare digit-run the carrier keeps rejecting is very likely a retailer item
