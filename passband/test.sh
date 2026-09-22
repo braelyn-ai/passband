@@ -19,9 +19,38 @@ run_suite() {
   shift
   echo "==> $name"
   xcrun swiftc -swift-version 6 -parse-as-library -Onone \
-    -o "$BUILD/$name" "$@"
+    -o "$BUILD/$name" Sources/Passband/Lib/RehearsalMode.swift "$@"
   "$BUILD/$name"
 }
+
+# The real poller against a cancellation-oblivious transport: mailbox switches
+# must detach old requests before the next mailbox starts warming.
+run_suite sitrep-poller \
+  Sources/Passband/Lib/Concurrency.swift \
+  Sources/Passband/Model/SitrepPoller.swift \
+  Tests/SitrepPollerTests.swift
+
+run_suite onboarding-rehearsal \
+  Sources/Passband/Model/OnboardingRehearsal.swift \
+  Tests/OnboardingRehearsalTests.swift
+
+run_suite rehearsal-api \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/APIError.swift \
+  Sources/Passband/Model/OnboardingRehearsal.swift \
+  Sources/Passband/Model/RehearsalAPI.swift \
+  Tests/RehearsalAPITests.swift
+
+# Credential validation must never succeed against the fixture transport.
+run_suite credential-probe \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/APIError.swift \
+  Sources/Passband/Model/APIClient.swift \
+  Sources/Passband/Lib/TriageTargets.swift \
+  Sources/Passband/Assistant/JSONValue.swift \
+  Tests/CredentialProbeTests.swift
 
 run_suite anthropic-stream \
   Sources/Passband/Assistant/JSONValue.swift \
@@ -69,6 +98,18 @@ run_suite staged-attachment \
   Sources/Passband/Lib/AttachmentKinds.swift \
   Sources/Passband/Lib/StagedAttachment.swift \
   Tests/StagedAttachmentTests.swift
+
+# The composer's attachment markers: how a picture is placed in the body and
+# taken back out, and the token the daemon's own alphabet accepts. Pure string
+# work over the wire type and the mime buckets — the send-side twin of
+# cid-images, and a stray edit to the marker grammar would silently make every
+# dropped picture a plain file.
+run_suite compose-attachments \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/AttachmentKinds.swift \
+  Sources/Passband/Lib/ComposeAttachments.swift \
+  Tests/ComposeAttachmentsTests.swift
 
 # The blocking re-triage modal's state machine. Pure value logic, so it builds
 # with the wire type alone — no store, no daemon, no SwiftUI.
@@ -290,6 +331,15 @@ run_suite from-operator \
   Sources/Passband/Lib/FromOperator.swift \
   Tests/FromOperatorTests.swift
 
+# The actual onboarding controller with in-memory collaborators: the store
+# stub flips the real RehearsalMode flag the way the real one does.
+run_suite tour-controller \
+  Sources/Passband/Model/PracticeTourStep.swift \
+  Sources/Passband/Model/TourController.swift \
+  Tests/TourControllerTests.swift
+
+# Full connection rehearsal must work even when normal onboarding was completed.
+"$BUILD/tour-controller" --onboarding-rehearsal --rehearse-connection
 # The ring behind the search panel's empty state: what a submitted query does to
 # the remembered ones. Pure Foundation, one file — the fold is kept out of the
 # store precisely so the order, the dedupe and the cap can be asserted with no
@@ -303,3 +353,23 @@ run_suite search-preview \
   Sources/Passband/Model/WireTypes.swift \
   Sources/Passband/Lib/SearchPreview.swift \
   Tests/SearchPreviewTests.swift
+
+# Field-scoped corrections must preserve overlapping destinations and keep
+# authentication kinds separate from external access restrictions.
+run_suite triage-targets \
+  Sources/Passband/Lib/TriageTargets.swift \
+  Tests/TriageTargetsTests.swift
+
+run_suite capability-probe \
+  Sources/Passband/Model/APIError.swift \
+  Tests/CapabilityProbeTests.swift
+
+# Reading groups canonical membership without reconstructing triage from copy.
+run_suite reading \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/Format.swift \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Lib/SenderIdentity.swift \
+  Sources/Passband/Lib/Reading.swift \
+  Tests/ReadingTests.swift

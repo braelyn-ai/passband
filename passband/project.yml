@@ -92,6 +92,10 @@ targets:
           # in RootView.swift, which is why the three routed views below cannot
           # come over yet.
           - "App/**"
+          # The guided practice inbox is a Mac lesson over the Mac shell (it
+          # places its card past the sidebar rail). The phone will get its
+          # own guide; until then its onboarding is the live summary alone.
+          - "Views/PracticeProductTour.swift"
           # Sparkle. iOS has no sideloaded updater; the App Store is the updater.
           - "Model/Updater.swift"
           # Its card, for the same reason: it reads Updater's phase, and the
@@ -146,6 +150,9 @@ targets:
       # them up by exactly that name, and the two font files sit at the root
       # where Info.plist's UIAppFonts (and Typo's Bundle lookup) name them.
       - path: Sources/Passband/Resources/Sounds
+        type: folder
+        buildPhase: resources
+      - path: Sources/Passband/Resources/Brand
         type: folder
         buildPhase: resources
       - path: Sources/Passband/Resources/newsreader-var.ttf

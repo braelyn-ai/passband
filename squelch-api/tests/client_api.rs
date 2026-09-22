@@ -72,7 +72,7 @@ async fn an_empty_master_token_serves_and_refuses_everything() {
 }
 
 #[tokio::test]
-async fn search_excludes_sealed() {
+async fn human_search_includes_restricted_mail() {
     let Harness { app, .. } = harness(|store, acct| {
         // Normal message mentioning "verification"...
         let n = store
@@ -123,8 +123,11 @@ async fn search_excludes_sealed() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let items = json["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1, "sealed hit must be excluded from search");
-    assert_eq!(items[0]["thread_id"], "t1");
+    assert_eq!(items.len(), 2, "human search includes restricted mail");
+    assert!(
+        items.iter().any(|item| item["thread_id"] == "t1")
+            && items.iter().any(|item| item["thread_id"] == "t2")
+    );
     // No embedder attached => default mode resolves to keyword.
     assert_eq!(json["match_kind"], "keyword");
 }
@@ -664,25 +667,14 @@ async fn retriage_progress_route_reports_the_run_it_kicked() {
         "a live run says when it began"
     );
 
-    // Stage-1 runs again: the row leaves both queues and the run is complete.
-    let queued = store.stage1_queue(acct, 10).unwrap();
-    assert_eq!(queued.len(), 1);
-    store
-        .stage1_apply(&squelch_core::store::Stage1Applied {
-            message_id: queued[0].message_id,
-            account_id: acct,
-            importance: 50,
-            tier: squelch_core::types::Tier::Noise,
-            one_line: "y".into(),
-            reason: "y".into(),
-            field_reasons: Default::default(),
-            stage1_model_used: "claude-y".into(),
-            needs_stage2: false,
-            escalation_reason: None,
-            deadline: None,
-            category: Some("general".into()),
-        })
-        .unwrap();
+    // Durable jobs, rather than old stage sentinels, determine completion.
+    use squelch_core::store::agent_triage::AgentTriageStore;
+    while let Some(job) = store
+        .claim_agent_job(acct, "triage", chrono::Utc::now(), 60)
+        .unwrap()
+    {
+        store.complete_agent_job(&job).unwrap();
+    }
 
     let resp = app
         .clone()
@@ -1079,7 +1071,7 @@ async fn search_semantic_without_vectors_falls_back_to_keyword() {
 /// With an embedder attached, the default mode is hybrid, semantic/hybrid run,
 /// and sealed mail is STILL excluded from every mode.
 #[tokio::test]
-async fn search_modes_with_embedder_and_sealed_excluded() {
+async fn human_search_modes_include_restricted_mail() {
     use squelch_core::embed::StubEmbedder;
 
     // 384-dim to match the vec0 table.
@@ -1157,8 +1149,8 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
     assert_eq!(json["match_kind"], "hybrid");
     let items = json["items"].as_array().unwrap();
     assert!(
-        items.iter().all(|i| i["thread_id"] != "t2"),
-        "sealed never surfaces"
+        items.iter().any(|i| i["thread_id"] == "t2"),
+        "human hybrid search includes restricted mail"
     );
     assert!(items.iter().any(|i| i["thread_id"] == "t1"));
 
@@ -1171,8 +1163,8 @@ async fn search_modes_with_embedder_and_sealed_excluded() {
     assert_eq!(json["match_kind"], "semantic");
     let items = json["items"].as_array().unwrap();
     assert!(
-        items.iter().all(|i| i["thread_id"] != "t2"),
-        "sealed never surfaces in semantic"
+        items.iter().any(|i| i["thread_id"] == "t2"),
+        "human semantic search includes restricted mail"
     );
 }
 
@@ -1343,8 +1335,11 @@ async fn search_operators_filter_by_sender_and_date() {
     let json = body_json(resp).await;
     assert_eq!(json["match_kind"], "keyword");
     let t = threads(&json);
-    assert_eq!(t.len(), 2, "jane's two received invoices: {t:?}");
-    assert!(!t.contains(&"t-seal".to_string()), "sealed stays absent");
+    assert_eq!(t.len(), 3, "all of Jane's received mail: {t:?}");
+    assert!(
+        t.contains(&"t-seal".to_string()),
+        "restricted mail is human-readable"
+    );
     assert!(!t.contains(&"t-sent".to_string()), "sent stays excluded");
 
     // after: is inclusive at midnight UTC of the named day.
@@ -1356,7 +1351,7 @@ async fn search_operators_filter_by_sender_and_date() {
     )
     .await;
     let t = threads(&json);
-    assert_eq!(t.len(), 2, "february onward: {t:?}");
+    assert_eq!(t.len(), 3, "february onward: {t:?}");
     assert!(!t.contains(&"t-jan".to_string()));
 
     // before: is exclusive at midnight UTC of the named day.
@@ -1386,7 +1381,11 @@ async fn search_operators_filter_by_sender_and_date() {
             .unwrap(),
     )
     .await;
-    assert_eq!(threads(&json), vec!["t-feb".to_string()]);
+    assert_eq!(threads(&json).len(), 2);
+    assert!(
+        threads(&json).contains(&"t-feb".to_string())
+            && threads(&json).contains(&"t-seal".to_string())
+    );
 
     // An unparseable date is not an operator: the token stays in the search
     // text, and the request still succeeds.
@@ -1417,8 +1416,11 @@ async fn search_with_only_operators_lists_and_keeps_exclusions() {
         .iter()
         .map(|i| i["thread_id"].as_str().unwrap())
         .collect();
-    assert_eq!(t, vec!["t-feb", "t-jan"], "newest first");
-    assert!(!t.contains(&"t-seal"), "sealed absent from the listing");
+    assert_eq!(t, vec!["t-seal", "t-feb", "t-jan"], "newest first");
+    assert!(
+        t.contains(&"t-seal"),
+        "restricted mail remains human-readable"
+    );
     assert!(!t.contains(&"t-sent"), "sent absent from the listing");
 
     // NOTHING RETRIEVED THESE ROWS. `legs` is provenance, and a listing has
@@ -1448,7 +1450,7 @@ async fn search_with_only_operators_lists_and_keeps_exclusions() {
         .iter()
         .map(|i| i["thread_id"].as_str().unwrap())
         .collect();
-    assert_eq!(t, vec!["t-bob", "t-feb", "t-jan"]);
+    assert_eq!(t, vec!["t-bob", "t-seal", "t-feb", "t-jan"]);
 
     // Operators that constrain nothing leave nothing to search: still a 400.
     let resp = app
@@ -1472,7 +1474,7 @@ async fn diagnostics_keep_their_own_strict_count_under_an_operator() {
     let Harness { app, .. } = harness(seed_operator_corpus);
 
     // "invoice bob": only Bob's message carries both words, and it is not
-    // Jane's, so the FILTERED strict set is empty and the page is Jane's two
+    // Jane's, so the FILTERED strict set is empty and the page is Jane's three
     // invoices off the any-only pass.
     let json = body_json(
         app.clone()
@@ -1487,7 +1489,11 @@ async fn diagnostics_keep_their_own_strict_count_under_an_operator() {
         .iter()
         .map(|i| i["thread_id"].as_str().unwrap())
         .collect();
-    assert_eq!(t.len(), 2, "jane's invoices, off the any-only pass: {t:?}");
+    assert_eq!(
+        t.len(),
+        3,
+        "jane's invoices, including restricted mail: {t:?}"
+    );
     assert!(!t.contains(&"t-bob"), "the operator still filters the page");
     assert_eq!(
         json["diagnostics"]["strict_hits"], 1,
@@ -1593,9 +1599,7 @@ async fn sealed_list_has_no_bodies() {
 }
 
 #[tokio::test]
-async fn sent_listing_pages_the_outbox_and_hides_sealed_and_received_mail() {
-    // The human door's only `is_sent = 1` listing: the user's own outbox, with
-    // recipients and read receipts, newest first.
+async fn human_sent_listing_includes_restricted_mail_and_excludes_inbound() {
     let Harness { app, .. } = harness(|store, acct| {
         let seed = |gmail: &str, thread: &str, subject: &str, to: &str, sensitivity| {
             let id = store
@@ -1620,7 +1624,6 @@ async fn sent_listing_pages_the_outbox_and_hides_sealed_and_received_mail() {
             "bob@friends.com",
             Sensitivity::Normal,
         );
-        // A sealed outbound copy and ordinary inbound mail: neither is listed.
         seed(
             "s3",
             "ts3",
@@ -1642,15 +1645,12 @@ async fn sent_listing_pages_the_outbox_and_hides_sealed_and_received_mail() {
     let json = body_json(resp).await;
     let items = json["items"].as_array().unwrap();
     assert_eq!(items.len(), 1);
-    // Newest first: each fixture stamps its own `now`, so "second" is later.
-    assert_eq!(items[0]["subject"], "second");
-    assert_eq!(items[0]["to"], "bob@friends.com");
+    assert_eq!(items[0]["subject"], "sealed");
+    assert_eq!(items[0]["to"], "support@bank.com");
     assert_eq!(items[0]["opens"], 0);
     assert!(items[0]["sent_at"].as_str().unwrap().contains('T'));
     assert!(items[0]["thread_id"].as_str().is_some());
 
-    // The cursor pages to the older message, and no sealed or inbound row can
-    // appear on any page.
     let cursor = json["next_cursor"]
         .as_str()
         .expect("next_cursor")
@@ -1665,8 +1665,8 @@ async fn sent_listing_pages_the_outbox_and_hides_sealed_and_received_mail() {
     let json2 = body_json(resp2).await;
     let items2 = json2["items"].as_array().unwrap();
     assert_eq!(items2.len(), 1);
-    assert_eq!(items2[0]["subject"], "first");
-    assert_eq!(items2[0]["to"], "Alice <alice@friends.com>");
+    assert_eq!(items2[0]["subject"], "second");
+    assert_eq!(items2[0]["to"], "bob@friends.com");
 }
 
 #[tokio::test]
@@ -2013,10 +2013,8 @@ async fn archive_success_audits_ok_and_hits_gmail() {
 }
 
 #[tokio::test]
-async fn action_on_sealed_message_is_404() {
-    // A sealed message is invisible to actions: 404, and no Gmail call at all —
-    // the write path can never touch sealed mail.
-    let (base, handle) = mock_gmail(0).await;
+async fn human_can_archive_restricted_mail() {
+    let (base, handle) = mock_gmail(1).await;
     let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let s = store
             .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
@@ -2044,11 +2042,10 @@ async fn action_on_sealed_message_is_404() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    handle.abort();
-    // The attempted action is still audited.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(handle.await.unwrap().len(), 1);
     let audit = store.list_audit(acct, 10).unwrap();
-    assert_eq!(audit[0].detail.as_deref(), Some("failed:target"));
+    assert_eq!(audit[0].detail.as_deref(), Some("ok"));
 }
 
 #[tokio::test]
@@ -2347,10 +2344,7 @@ fn sealed_reply_raw_b64() -> String {
 }
 
 #[tokio::test]
-async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
-    // The echoed copy seals. Committing it would put a sealed row in the thread,
-    // and the thread view 404s any thread holding one — the reply would take the
-    // counterparty's mail down with it. So: no echo, and the thread still opens.
+async fn auth_sent_echo_is_stored_and_the_human_thread_still_opens() {
     let (base, handle) = mock_gmail_seq(vec![
         (200, "{}".to_string()),
         (
@@ -2414,12 +2408,11 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
     let json = body_json(resp).await;
     assert_eq!(json["status"], "sent");
     assert!(
-        json["echo_message_id"].is_null(),
-        "the sealed copy is not echoed"
+        json["echo_message_id"].is_number(),
+        "the sent copy is available to the human before access assessment"
     );
     assert_eq!(handle.await.unwrap().len(), 3);
 
-    // THE POINT: the thread the user was reading still opens, with the parent alone.
     let resp = app
         .clone()
         .oneshot(authed("GET", "/client/thread/thread-77"))
@@ -2427,8 +2420,7 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "the thread must not 404");
     let thread = body_json(resp).await;
-    assert_eq!(thread["messages"].as_array().map(Vec::len), Some(1));
-    // And nothing sealed was committed at all.
+    assert_eq!(thread["messages"].as_array().map(Vec::len), Some(2));
     assert!(store.sealed_messages(acct).unwrap().is_empty());
 
     let audit = store.list_audit(acct, 10).unwrap();
@@ -2437,11 +2429,12 @@ async fn echo_of_a_sealed_sent_message_is_skipped_and_the_thread_still_opens() {
             .iter()
             .any(|a| a.action == "send" && a.detail.as_deref() == Some("ok"))
     );
-    assert!(
-        audit
-            .iter()
-            .any(|a| a.action == "send.echo" && a.detail.as_deref() == Some("skipped:sealed"))
-    );
+    assert!(audit.iter().any(|a| {
+        a.action == "send.echo"
+            && a.detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("ok:"))
+    }));
 }
 
 #[tokio::test]
@@ -2911,9 +2904,8 @@ async fn reply_recipients_preview_with_all_lists_the_room_minus_the_account() {
 }
 
 #[tokio::test]
-async fn reply_recipients_preview_404s_a_sealed_message() {
-    // Sealed and unknown are the same 404, and neither reaches Gmail.
-    let (base, handle) = mock_gmail(0).await;
+async fn human_can_preview_recipients_for_restricted_mail() {
+    let (base, handle) = mock_gmail(2).await;
     let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let s = store
             .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
@@ -2940,9 +2932,17 @@ async fn reply_recipients_preview_404s_a_sealed_message() {
         "/client/messages/999999/reply_recipients".to_string(),
     ] {
         let resp = app.clone().oneshot(authed("GET", &uri)).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        assert_eq!(
+            resp.status(),
+            if uri.contains("999999") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::OK
+            },
+            "{uri}"
+        );
     }
-    handle.abort();
+    assert_eq!(handle.await.unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -3973,7 +3973,7 @@ async fn peek_returns_the_same_rows_without_stamping_the_ledger() {
 }
 
 #[tokio::test]
-async fn updates_carry_field_reasons_object() {
+async fn updates_do_not_reuse_obsolete_field_reasons() {
     use squelch_core::types::FieldReasons;
     let Harness { app, .. } = harness(|store, acct| {
         let id = seed_one_signal(store, acct, "g1", "t1", "hi");
@@ -3994,19 +3994,11 @@ async fn updates_carry_field_reasons_object() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let item = &json["items"][0];
-    // WIRE CONTRACT: field_reasons is an object with per-property string values;
-    // only the properties that carry a reason appear (deadline is absent here).
-    let fr = &item["field_reasons"];
-    assert!(fr.is_object(), "field_reasons must be an object: {item}");
-    assert_eq!(
-        fr["importance"],
-        Value::String("known contact -> signal importance 80".into())
-    );
-    assert_eq!(fr["tier"], Value::String("known contact -> signal".into()));
     assert!(
-        fr.get("deadline").is_none(),
-        "absent deadline reason must be omitted, not null"
+        item.get("field_reasons").is_none(),
+        "obsolete deterministic reasons must not explain pending triage"
     );
+    assert_eq!(item["reason"], "Triage pending");
 }
 
 #[tokio::test]
@@ -4027,8 +4019,10 @@ async fn updates_without_reasons_omit_the_field_reasons_key() {
 
 #[tokio::test]
 async fn band_query_filters_server_side() {
+    use squelch_core::store::agent_triage::{AgentCommitOutcome, AgentTriageStore};
+    use squelch_core::triage::decision::{MessageDecision, ThreadAttentionDecision};
     let Harness { app, .. } = harness(|store, acct| {
-        // A past_due bill (standing) plus a plain signal.
+        // Legacy labels have no placement authority; only the committed agent decision does.
         let bill = store
             .upsert_message(&msg(acct, "g1", "t1", "PG&E past due", "pay"))
             .unwrap();
@@ -4045,6 +4039,34 @@ async fn band_query_filters_server_side() {
                 None,
             )
             .unwrap();
+        store
+            .enqueue_agent_triage(acct, bill, "test", false)
+            .unwrap();
+        let job = store
+            .claim_agent_job(acct, "triage", chrono::Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        let context = store.load_agent_context(&job).unwrap();
+        let decision = MessageDecision {
+            summary: "Bill needs review".into(),
+            attention: ThreadAttentionDecision {
+                show_in_fye: true,
+                relevant_message_ids: vec![bill],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .commit_agent_decision(
+                    &job,
+                    &context,
+                    &decision,
+                    std::slice::from_ref(&context.message.source)
+                )
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
         seed_one_signal(store, acct, "g2", "t2", "hello");
     });
 
@@ -4055,9 +4077,9 @@ async fn band_query_filters_server_side() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let items = json["items"].as_array().unwrap();
-    assert_eq!(items.len(), 1, "standing = past_due/deadline only");
+    assert_eq!(items.len(), 1, "standing uses agent attention membership");
     assert_eq!(items[0]["thread_id"], "t1");
-    assert_eq!(items[0]["tier"], "past_due");
+    assert_eq!(items[0]["tier"], "signal");
 }
 
 #[tokio::test]
@@ -4143,8 +4165,8 @@ async fn dismiss_unknown_message_is_404() {
 }
 
 #[tokio::test]
-async fn dismiss_sealed_message_is_404() {
-    // A sealed row must be invisible to the status endpoint.
+async fn human_can_dismiss_restricted_mail() {
+    // Restriction governs external agents; human lifecycle controls remain available.
     let Harness { app, store, acct } = harness(|store, acct| {
         let s = store
             .upsert_message(&msg(acct, "g1", "t1", "code", "123456"))
@@ -4172,7 +4194,7 @@ async fn dismiss_sealed_message_is_404() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // --- reminders: "remind me about this later" over HTTP ----------------------
@@ -4269,7 +4291,7 @@ async fn reminder_rejects_a_past_or_unparseable_date() {
 }
 
 #[tokio::test]
-async fn reminder_on_unknown_or_sealed_message_is_404() {
+async fn human_reminders_allow_restricted_mail_and_reject_unknown() {
     // A sealed row must be invisible to the reminder endpoints, exactly as it is
     // to the status one: missing and sealed are the same answer.
     let Harness { app, store, acct } = harness(|store, acct| {
@@ -4303,13 +4325,27 @@ async fn reminder_on_unknown_or_sealed_message_is_404() {
             ))
             .await
             .unwrap();
-        assert_eq!(set.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            set.status(),
+            if id == sealed_id {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
         let clear = app
             .clone()
             .oneshot(authed("DELETE", &format!("/client/updates/{id}/reminder")))
             .await
             .unwrap();
-        assert_eq!(clear.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            clear.status(),
+            if id == sealed_id {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        );
     }
 }
 
@@ -4324,7 +4360,7 @@ async fn reminder_on_the_users_own_sent_mail_is_404() {
             .upsert_message(&sent_msg(acct, "g-sent", "t1", "what I wrote", "a@b.com"))
             .unwrap();
     });
-    let sent_id = store.thread_view(acct, "t1").unwrap().messages[0].id;
+    let sent_id = store.thread_view_with_html(acct, "t1").unwrap().messages[0].id;
     store
         .set_triage(
             sent_id,
@@ -4394,7 +4430,7 @@ async fn a_reminder_on_old_mail_survives_the_default_updates_window() {
             )
             .unwrap();
     });
-    let id = store.thread_view(acct, "t-old").unwrap().messages[0].id;
+    let id = store.thread_view_with_html(acct, "t-old").unwrap().messages[0].id;
 
     let set = app
         .clone()
@@ -6057,9 +6093,8 @@ async fn unsubscribe_no_info_is_422() {
 }
 
 #[tokio::test]
-async fn unsubscribe_unknown_and_sealed_are_404() {
+async fn human_can_inspect_unsubscribe_for_restricted_mail_but_unknown_is_404() {
     let Harness { app, store, acct } = harness(|store, acct| {
-        // A sealed message that (defensively) carries an unsub header.
         let s = store
             .upsert_message(&{
                 let mut m = msg(acct, "g-otp", "t-otp", "verification code", "123456");
@@ -6083,7 +6118,6 @@ async fn unsubscribe_unknown_and_sealed_are_404() {
     });
     let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
 
-    // Sealed => 404 (indistinguishable from unknown).
     let resp = app
         .clone()
         .oneshot(authed_json(
@@ -6093,9 +6127,8 @@ async fn unsubscribe_unknown_and_sealed_are_404() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
 
-    // Unknown id => 404.
     let resp = app
         .oneshot(authed_json(
             "POST",
@@ -6208,7 +6241,7 @@ async fn unsubscribe_resolution_sets_blocked_and_404s_unknown_and_400s_bad_value
 }
 
 #[tokio::test]
-async fn thread_sealed_is_not_found_even_with_html() {
+async fn human_can_read_restricted_thread_with_html() {
     let Harness { app, .. } = harness(|store, acct| {
         let mut sealed = msg(acct, "g-otp", "t-sealed", "verification code", "123456");
         sealed.body_html = Some("<p>code 123456</p>".to_string());
@@ -6232,10 +6265,11 @@ async fn thread_sealed_is_not_found_even_with_html() {
         .oneshot(authed("GET", "/client/thread/t-sealed"))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let thread = body_json(resp).await;
+    assert_eq!(thread["messages"][0]["content"], "123456");
+    assert_eq!(thread["messages"][0]["html"], "<p>code 123456</p>");
 }
-
-// --- /client/triage-config --------------------------------------------------
 
 #[tokio::test]
 async fn triage_config_get_default_shape() {
@@ -6253,6 +6287,13 @@ async fn triage_config_get_default_shape() {
     assert_eq!(json["thread_daily_cap"], 3);
     assert_eq!(json["sender_daily_cap"], 5);
     assert_eq!(json["global_daily_cap"], 120);
+    assert_eq!(json["agent"]["effective_daily_run_cap"], 1000);
+    assert_eq!(json["agent"]["effective_background_daily_run_cap"], 200);
+    assert_eq!(json["agent"]["reserved_arrival_runs"], 800);
+    assert_eq!(
+        json["agent"]["legacy_stage_caps_are_active_ceilings"],
+        false
+    );
     assert_eq!(json["sources"]["thread_daily_cap"], "default");
     assert_eq!(json["sources"]["sender_daily_cap"], "default");
     assert_eq!(json["sources"]["global_daily_cap"], "default");
@@ -6781,7 +6822,7 @@ async fn attachment_over_cap_is_410() {
 }
 
 #[tokio::test]
-async fn attachment_on_sealed_parent_is_404() {
+async fn human_can_read_restricted_attachment_but_unknown_is_404() {
     let id = std::sync::Arc::new(std::sync::Mutex::new(0i64));
     let id_seed = id.clone();
     let Harness { app, .. } = harness(move |store, acct| {
@@ -6811,9 +6852,12 @@ async fn attachment_on_sealed_parent_is_404() {
         .oneshot(authed("GET", &format!("/client/attachments/{id}")))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "sealed parent -> 404");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "human can read the attachment"
+    );
 
-    // An unknown id is likewise 404 (indistinguishable from the sealed case).
     let resp = app
         .oneshot(authed("GET", "/client/attachments/999999"))
         .await
@@ -7035,7 +7079,7 @@ async fn put_draft_defaults_missing_text_fields_and_keys_new_mail_on_null() {
 }
 
 #[tokio::test]
-async fn put_draft_on_sealed_or_unknown_parent_is_404_and_stores_nothing() {
+async fn human_can_save_draft_for_restricted_parent_but_unknown_still_fails() {
     let Harness { app, store, acct } = harness(|store, acct| {
         let s = store
             .upsert_message(&msg(acct, "gmail-sealed", "t9", "code", "123456"))
@@ -7056,8 +7100,6 @@ async fn put_draft_on_sealed_or_unknown_parent_is_404_and_stores_nothing() {
     });
     let sealed_id = store.sealed_messages(acct).unwrap()[0].id;
 
-    // Sealed and unknown parents are the SAME 404: a draft can never be keyed to
-    // sealed mail, and the endpoint is no existence oracle.
     for parent in [sealed_id, 999_999] {
         let resp = app
             .clone()
@@ -7070,15 +7112,16 @@ async fn put_draft_on_sealed_or_unknown_parent_is_404_and_stores_nothing() {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::NOT_FOUND,
-            "parent {parent} must 404"
+            if parent == sealed_id {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+            "human access and missing parent are distinct"
         );
     }
-    assert!(
-        store.list_drafts(acct).unwrap().is_empty(),
-        "a 404 stores no draft"
-    );
-    assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(0));
+    assert_eq!(store.list_drafts(acct).unwrap().len(), 1);
+    assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(1));
 }
 
 #[tokio::test]
@@ -8003,8 +8046,7 @@ async fn a_forward_whose_original_cannot_be_read_is_a_loud_502() {
 }
 
 #[tokio::test]
-async fn forwarding_a_sealed_message_is_a_404_and_reads_nothing() {
-    // Sealed mail is invisible to every action, forwarding most of all.
+async fn forwarding_restricted_mail_reaches_provider_and_reports_upstream_errors() {
     let (base, handle) = mock_gmail(0).await;
     let Harness { app, store, acct } = app_with_writes(base, |store, acct| {
         let s = store
@@ -8038,15 +8080,16 @@ async fn forwarding_a_sealed_message_is_a_404_and_reads_nothing() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     handle.abort();
 
     let audit = store.list_audit(acct, 10).unwrap();
-    assert!(
-        audit
-            .iter()
-            .any(|a| a.action == "send" && a.detail.as_deref() == Some("failed:target"))
-    );
+    assert!(audit.iter().any(|a| {
+        a.action == "send"
+            && a.detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("failed:") && detail != "failed:target")
+    }));
 }
 
 #[tokio::test]
@@ -8508,13 +8551,7 @@ async fn updates_serve_only_spam_when_asked_for_it() {
     assert_eq!(items[0]["id"].as_i64().unwrap(), spam_id);
 }
 
-/// AND THE PAGE'S ROWS CARRY THE MAIL'S OWN WORDS. Nothing triaged a spam row,
-/// so `one_line` is the empty string on every one of them; without the subject
-/// and the opening of the body the page is a column of senders against a blank.
-///
-/// The inbox half of the assertion is the load-bearing one: those keys must be
-/// STRUCTURALLY ABSENT off the spam page, or every band on every poll pays two
-/// hundred characters a row for a fill its summary already made unnecessary.
+/// Pending inbox and spam rows remain readable before model classification.
 #[tokio::test]
 async fn the_spam_page_serves_the_subject_and_the_opening_line() {
     let Harness { app, .. } = harness(|store, acct| {
@@ -8528,17 +8565,20 @@ async fn the_spam_page_serves_the_subject_and_the_opening_line() {
         .unwrap();
     let json = body_json(resp).await;
     let row = &json["items"].as_array().unwrap()[0];
-    assert_eq!(row["one_line"], serde_json::json!(""), "nothing triaged it");
+    assert_eq!(
+        row["one_line"],
+        serde_json::json!("you have won"),
+        "pending inventory uses the subject"
+    );
     assert_eq!(row["subject"], serde_json::json!("you have won"));
     assert_eq!(row["preview"], serde_json::json!("claim your prize"));
 
     let resp = app.oneshot(authed("GET", "/client/updates")).await.unwrap();
     let json = body_json(resp).await;
     let row = &json["items"].as_array().unwrap()[0];
-    assert!(
-        row.get("subject").is_none() && row.get("preview").is_none(),
-        "an ordinary row must carry neither key: {row}"
-    );
+    assert_eq!(row["subject"], "lunch tomorrow");
+    assert_eq!(row["preview"], "lunch tomorrow");
+    assert_eq!(row["reason"], "Triage pending");
 }
 
 /// AN UNKNOWN VALUE IS A 400, never a silent full listing. A client asking for
@@ -8910,7 +8950,7 @@ async fn search_reports_diagnostics_and_legs() {
 /// word" answered one word at a time is a read of sealed mail without a single
 /// row ever being returned.
 #[tokio::test]
-async fn search_diagnostics_never_count_sealed_or_spam_mail() {
+async fn human_search_diagnostics_include_restricted_mail_and_exclude_spam() {
     let Harness { app, .. } = harness(seed_diagnostics_corpus);
 
     // "pangolin" appears ONLY in the sealed message; "aardvark" only in spam.
@@ -8923,14 +8963,18 @@ async fn search_diagnostics_never_count_sealed_or_spam_mail() {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         let d = &json["diagnostics"];
-        assert_eq!(d["strict_hits"], 0, "{word}: no visible message has it");
-        assert_eq!(d["any_hits"], 0, "{word}");
+        let expected = if word == "pangolin" { 1 } else { 0 };
+        assert_eq!(
+            d["strict_hits"], expected,
+            "{word}: matches human inventory"
+        );
+        assert_eq!(d["any_hits"], expected, "{word}");
         assert_eq!(d["terms"][0]["text"], word);
         assert_eq!(
-            d["terms"][0]["df"], 0,
+            d["terms"][0]["df"], expected,
             "{word}: the count must not read hidden mail"
         );
-        assert!(json["items"].as_array().unwrap().is_empty());
+        assert_eq!(json["items"].as_array().unwrap().len(), expected as usize);
     }
 }
 
@@ -9363,4 +9407,755 @@ async fn search_fast_path_keeps_sent_mail_and_matching_diagnostics() {
             .is_empty(),
         "other keyword callers retain their existing inbound-only scope"
     );
+}
+
+// ---- compose attachments ----------------------------------------------------
+
+/// An authed upload: the bytes as the body, the metadata in the query and the
+/// `Content-Type` header — the shape the composer sends.
+fn upload(filename: &str, mime: Option<&str>, cid: Option<&str>, bytes: &[u8]) -> Request<Body> {
+    let mut uri = format!("/client/compose/attachments?filename={filename}");
+    if let Some(cid) = cid {
+        uri.push_str(&format!("&content_id={cid}"));
+    }
+    let mut b = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"));
+    if let Some(mime) = mime {
+        b = b.header(header::CONTENT_TYPE, mime);
+    }
+    b.body(Body::from(bytes.to_vec())).unwrap()
+}
+
+async fn stage(app: &axum::Router, filename: &str, mime: &str, cid: &str, bytes: &[u8]) -> Value {
+    let resp = app
+        .clone()
+        .oneshot(upload(filename, Some(mime), Some(cid), bytes))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+#[tokio::test]
+async fn staging_a_file_answers_its_metadata_and_serves_it_back() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let meta = stage(
+        &app,
+        "shot.png",
+        "image/png; charset=x",
+        "shot-1@passband",
+        b"PNGBYTES",
+    )
+    .await;
+    let id = meta["id"].as_i64().expect("an id");
+    assert_eq!(meta["filename"], "shot.png");
+    assert_eq!(meta["mime"], "image/png", "parameters are dropped");
+    assert_eq!(meta["size"], 8);
+    assert_eq!(meta["content_id"], "shot-1@passband");
+
+    // The bytes come back under the byte door's discipline.
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        resp.headers()[header::CACHE_CONTROL],
+        "no-store",
+        "an unsent composition's bytes are not something to leave in a cache"
+    );
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], b"PNGBYTES");
+
+    // Removing it from the tray: gone, and a second delete is a 404.
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/client/compose/attachments/{id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/client/compose/attachments/{id}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn staging_polices_what_it_stores() {
+    let Harness { app, .. } = harness(|_, _| {});
+
+    // No content type: a blob. A multipart claim: a blob. A bad token: 400.
+    let meta = body_json(
+        app.clone()
+            .oneshot(upload("x", None, None, b"1"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(meta["mime"], "application/octet-stream");
+    assert!(
+        meta["content_id"].as_str().unwrap().ends_with("@passband"),
+        "minted when the client sent none: {}",
+        meta["content_id"]
+    );
+    let meta = body_json(
+        app.clone()
+            .oneshot(upload("x", Some("multipart/mixed; boundary=z"), None, b"1"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(meta["mime"], "application/octet-stream");
+    let resp = app
+        .clone()
+        .oneshot(upload("x", Some("text/plain"), Some("a%20b"), b"1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A filename is a name, never a path.
+    let meta = stage(&app, "..%2F..%2Fevil.txt", "text/plain", "t1", b"1").await;
+    assert_eq!(meta["filename"], "....evil.txt");
+
+    // A text file whose bytes are not UTF-8 is a blob: the MIME writer would
+    // otherwise declare a charset the bytes do not have.
+    let latin1 = stage(&app, "caf.txt", "text/plain", "t2", b"caf\xe9").await;
+    assert_eq!(latin1["mime"], "application/octet-stream");
+    let utf8 = stage(&app, "cafe.txt", "text/plain", "t3", "café".as_bytes()).await;
+    assert_eq!(utf8["mime"], "text/plain");
+
+    // Empty is refused; the bearer is required.
+    let resp = app
+        .clone()
+        .oneshot(upload("x", Some("text/plain"), None, b""))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/client/compose/attachments?filename=x")
+                .body(Body::from("1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_draft_claims_exactly_the_files_it_names() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let a = stage(&app, "a.pdf", "application/pdf", "a1", b"A").await["id"]
+        .as_i64()
+        .unwrap();
+    let b = stage(&app, "b.pdf", "application/pdf", "b1", b"B").await["id"]
+        .as_i64()
+        .unwrap();
+
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [a, b] }),
+    )
+    .await;
+    let names: Vec<&str> = draft["attachments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["a.pdf", "b.pdf"],
+        "the PUT's answer already lists them"
+    );
+
+    // The listing restores them, metadata only.
+    let drafts = list_drafts(&app).await;
+    let d = &drafts.as_array().unwrap()[0];
+    assert_eq!(d["attachments"].as_array().unwrap().len(), 2);
+    assert!(d["attachments"][0]["data"].is_null());
+    assert_eq!(d["attachments"][0]["content_id"], "a1");
+
+    // Removing one from the tray: the next save names only the other.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [b] }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
+    assert_eq!(draft["attachments"][0]["id"], b);
+
+    // A save that says nothing about files leaves the claims alone.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files, edited" }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
+
+    // `[]` releases every file, and the released file is still staged.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [] }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 0);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{b}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "released, not deleted");
+    // Claimed again for the rest of the test.
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "files", "attachment_ids": [b] }),
+    )
+    .await;
+    assert_eq!(draft["attachments"].as_array().unwrap().len(), 1);
+
+    // Deleting the draft takes its file with it; the released one survives
+    // (until the sweep).
+    let draft_id = draft["id"].as_i64().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed("DELETE", &format!("/client/drafts/{draft_id}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{b}")))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the draft's file went with it"
+    );
+    let resp = app
+        .oneshot(authed("GET", &format!("/client/compose/attachments/{a}")))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "released, not deleted");
+}
+
+#[tokio::test]
+async fn a_send_carries_its_files_inline_where_the_body_points_and_consumes_them() {
+    let (base, handle) = mock_gmail(1).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let shot = stage(&app, "shot.png", "image/png", "shot-1@passband", b"PNG").await["id"]
+        .as_i64()
+        .unwrap();
+    let deck = stage(
+        &app,
+        "deck.pdf",
+        "application/pdf",
+        "deck-1@passband",
+        b"PDF",
+    )
+    .await["id"]
+        .as_i64()
+        .unwrap();
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "x", "attachment_ids": [shot, deck] }),
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "subject": "Hi",
+                "body": "the shot ![shot](cid:shot-1@passband) and the deck",
+                "body_format": "markdown",
+                "confirm": true,
+                "draft_id": draft["id"],
+                "attachment_ids": [shot, deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    let mime = sent_mime(&reqs[0]);
+    // mixed[ related[ alternative, png inline ], pdf attachment ]
+    assert!(mime.contains("Content-Type: multipart/mixed;"));
+    assert!(mime.contains("Content-Type: multipart/related;"));
+    assert!(mime.contains("Content-Type: multipart/alternative;"));
+    assert!(mime.contains("Content-Disposition: inline; filename=\"shot.png\""));
+    assert!(mime.contains("Content-ID: <shot-1@passband>"));
+    assert!(mime.contains("<img src=\"cid:shot-1@passband\" alt=\"shot\""));
+    assert!(mime.contains("Content-Disposition: attachment; filename=\"deck.pdf\""));
+    use base64::Engine as _;
+    assert!(mime.contains(&base64::engine::general_purpose::STANDARD.encode(b"PDF")));
+
+    // Consumed: the draft, and both files.
+    assert_eq!(list_drafts(&app).await.as_array().map(Vec::len), Some(0));
+    assert!(store.outbound_attachment(acct, shot).unwrap().is_none());
+    assert!(store.outbound_attachment(acct, deck).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_send_naming_a_file_that_is_gone_is_refused_before_gmail() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see attached",
+                "confirm": true,
+                "attachment_ids": [4242]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err = body_json(resp).await["error"].as_str().unwrap().to_string();
+    assert!(err.contains("no longer staged"), "{err}");
+    assert_eq!(handle.await.unwrap().len(), 0, "nothing reached Gmail");
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send"
+                && a.detail.as_deref() == Some("rejected:attachment_missing"))
+    );
+}
+
+#[tokio::test]
+async fn the_guard_reads_a_staged_text_file() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n";
+    let notes = stage(&app, "notes.txt", "text/plain", "n1", key.as_bytes()).await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "the notes you asked for",
+                "confirm": true,
+                "attachment_ids": [notes]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a key inside an attached text file is the body's secret by another door"
+    );
+    assert_eq!(handle.await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn stats_advertise_compose_attachments() {
+    let Harness { app, .. } = harness(|_, _| {});
+    let resp = app.oneshot(authed("GET", "/client/stats")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["compose_attachments"], true);
+}
+
+#[tokio::test]
+async fn a_failed_send_keeps_its_staged_files_and_its_draft() {
+    // Gmail refuses the message: the files are still on the tray, so the
+    // sender can fix whatever it was and send again without re-attaching.
+    let (base, handle) = mock_gmail_seq(vec![(500, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let draft = put_draft(
+        &app,
+        serde_json::json!({ "to": "alice@example.com", "body": "x", "attachment_ids": [deck] }),
+    )
+    .await;
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see attached",
+                "confirm": true,
+                "draft_id": draft["id"],
+                "attachment_ids": [deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(handle.await.unwrap().len(), 1);
+    assert!(
+        store.outbound_attachment(acct, deck).unwrap().is_some(),
+        "a failed send consumes nothing"
+    );
+    assert_eq!(
+        store.list_drafts(acct).unwrap().len(),
+        1,
+        "and the draft still holds it"
+    );
+    assert_eq!(store.list_drafts(acct).unwrap()[0].attachments.len(), 1);
+}
+
+#[tokio::test]
+async fn a_guard_blocked_send_keeps_its_staged_files() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+                "confirm": true,
+                "attachment_ids": [deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(handle.await.unwrap().len(), 0);
+    assert!(
+        store.outbound_attachment(acct, deck).unwrap().is_some(),
+        "the verdict is the first act; the file waits for the second"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_attachment_ids_send_one_part() {
+    let (base, handle) = mock_gmail(1).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see attached",
+                "confirm": true,
+                "attachment_ids": [deck, deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mime = sent_mime(&handle.await.unwrap()[0]);
+    assert_eq!(mime.matches("filename=\"deck.pdf\"").count(), 1);
+}
+
+#[tokio::test]
+async fn an_upload_past_the_router_default_body_limit_is_accepted_and_the_cap_is_not() {
+    // The `/client/*` router's default body limit is 2 MB; the upload route
+    // carries its own. 3 MB proves the layer is really on the route; 26 MB
+    // proves the cap still holds.
+    let Harness { app, .. } = harness(|_, _| {});
+    let three = vec![0x42u8; 3 * 1024 * 1024];
+    let resp = app
+        .clone()
+        .oneshot(upload(
+            "big.bin",
+            Some("application/octet-stream"),
+            Some("big1"),
+            &three,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["size"], 3 * 1024 * 1024);
+
+    let huge = vec![0x42u8; 26 * 1024 * 1024];
+    let resp = app
+        .oneshot(upload(
+            "huge.bin",
+            Some("application/octet-stream"),
+            Some("huge1"),
+            &huge,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn a_fan_out_carries_the_files_to_every_member_and_consumes_them() {
+    let (base, handle) =
+        mock_gmail_seq(vec![(200, "{}".to_string()), (200, "{}".to_string())]).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let group = store
+        .create_send_group(
+            acct,
+            "Pair",
+            squelch_core::types::GroupMode::Individual,
+            "",
+            &["ann@fund.com", "bo@fund.com"].map(|addr| {
+                squelch_core::store::sqlite::groups::NewGroupMember {
+                    addr: addr.into(),
+                    display_name: None,
+                }
+            }),
+        )
+        .unwrap();
+    let shot = stage(&app, "shot.png", "image/png", "shot-1", b"PNG").await["id"]
+        .as_i64()
+        .unwrap();
+    let deck = stage(&app, "deck.pdf", "application/pdf", "deck-1", b"PDF").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "group_id": group,
+                "subject": "Update #3",
+                "body": "the chart ![shot](cid:shot-1) and the deck",
+                "body_format": "markdown",
+                "confirm": true,
+                "attachment_ids": [shot, deck]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let reqs = handle.await.unwrap();
+    assert_eq!(reqs.len(), 2);
+    for req in &reqs {
+        let mime = sent_mime(req);
+        assert!(
+            mime.contains("Content-Disposition: inline; filename=\"shot.png\""),
+            "{mime}"
+        );
+        assert!(mime.contains("Content-ID: <shot-1>"));
+        assert!(mime.contains("Content-Disposition: attachment; filename=\"deck.pdf\""));
+    }
+    assert!(store.outbound_attachment(acct, shot).unwrap().is_none());
+    assert!(store.outbound_attachment(acct, deck).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn attachments_over_the_message_ceiling_are_refused_before_their_bytes_are_read() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, store, acct } = app_with_writes(base, |_, _| {});
+    let thirteen = vec![0x41u8; 13 * 1024 * 1024];
+    let a = stage(&app, "a.bin", "application/octet-stream", "a1", &thirteen).await["id"]
+        .as_i64()
+        .unwrap();
+    let b = stage(&app, "b.bin", "application/octet-stream", "b1", &thirteen).await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "two big ones",
+                "confirm": true,
+                "attachment_ids": [a, b]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(handle.await.unwrap().len(), 0);
+    let audit = store.list_audit(acct, 10).unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|a| a.action == "send" && a.detail.as_deref() == Some("rejected:too_large"))
+    );
+    // Refused, not consumed.
+    assert!(store.outbound_attachment(acct, a).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn two_files_sharing_a_content_id_are_refused() {
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let a = stage(&app, "a.png", "image/png", "same", b"A").await["id"]
+        .as_i64()
+        .unwrap();
+    let b = stage(&app, "b.png", "image/png", "same", b"B").await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "![a](cid:same)",
+                "body_format": "markdown",
+                "confirm": true,
+                "attachment_ids": [a, b]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(resp).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("content id")
+    );
+    assert_eq!(handle.await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn the_guard_reads_an_attached_message_too() {
+    // An attached .eml is RFC822 text carrying whatever its bodies carried.
+    let (base, handle) = mock_gmail(0).await;
+    let Harness { app, .. } = app_with_writes(base, |_, _| {});
+    let eml = "From: a@x.com\r\nSubject: keys\r\n\r\n-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\n";
+    let id = stage(&app, "thread.eml", "message/rfc822", "e1", eml.as_bytes()).await["id"]
+        .as_i64()
+        .unwrap();
+    let resp = app
+        .oneshot(authed_json(
+            "POST",
+            "/client/actions/send",
+            serde_json::json!({
+                "to": "alice@example.com",
+                "body": "see the thread below",
+                "confirm": true,
+                "attachment_ids": [id]
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(handle.await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn grouped_recall_expands_without_repeating_hits_or_returning_done_early() {
+    use squelch_core::embed::StubEmbedder;
+    use squelch_core::types::AttentionStatus;
+    let store = SqliteStore::open_in_memory()
+        .unwrap()
+        .with_embedder(Arc::new(StubEmbedder::new(384)))
+        .unwrap();
+    let acct = store.ensure_account("me@example.com").unwrap();
+    for i in 0..27 {
+        let key = format!("recall-{i}");
+        let id = store
+            .upsert_message(&msg(
+                acct,
+                &key,
+                &key,
+                "anjuna tickets",
+                "save tickets below",
+            ))
+            .unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                50,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        if i % 3 == 0 {
+            store
+                .set_attention_status(acct, id, AttentionStatus::Done)
+                .unwrap();
+        }
+        let vector = store
+            .embedder()
+            .unwrap()
+            .embed("anjuna tickets save tickets below")
+            .unwrap();
+        store.upsert_message_vector(acct, id, &vector).unwrap();
+    }
+    let app = router(ApiState::new(Arc::new(store), acct, TOKEN));
+    for mode in ["hybrid", "semantic"] {
+        let mut cursor = String::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut saw_done = false;
+        for _ in 0..12 {
+            let uri = format!(
+                "/client/search?q=anjuna%20tickets&mode={mode}&unfinished_first=true&limit=5{cursor}"
+            );
+            let response = app.clone().oneshot(authed("GET", &uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let page = body_json(response).await;
+            if seen.is_empty() {
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+                let cursor = page["next_cursor"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("recall:")
+                    .unwrap();
+                let resume: Value =
+                    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor).unwrap()).unwrap();
+                assert!(
+                    resume["k"].as_u64().unwrap() < 600,
+                    "small searches must not pin recall to 600"
+                );
+            }
+            for item in page["items"].as_array().unwrap() {
+                assert!(
+                    seen.insert(item["id"].as_i64().unwrap()),
+                    "repeated hit: {page}"
+                );
+                let done = item["is_done"].as_bool().unwrap();
+                assert!(!saw_done || done, "unfinished hit after done group: {page}");
+                saw_done |= done;
+            }
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = format!("&cursor={next}"),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            27,
+            "every recalled hit should be served in {mode}"
+        );
+    }
 }

@@ -220,483 +220,179 @@ fn ship_extract_mark_removes_the_row_from_the_queue() {
 }
 
 #[test]
-fn retriage_reset_repends_shipping_rows_and_scrubs_marketing_and_staged_orders() {
-    let (store, acct) = store();
-
-    let shipping = triaged_row(acct, "g-ship", "t1", None, false, Sensitivity::Normal)
-        .ship_extract(true)
-        .ingest(&store);
-    let quiet = triaged_row(acct, "g-quiet", "t2", None, false, Sensitivity::Normal).ingest(&store);
-
-    // The shipments extractor already ruled on the shipping row, and left a
-    // staged order behind; the quiet row picked up a marketing extraction.
-    store.ship_extract_mark(acct, shipping, "claude-x").unwrap();
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "INSERT INTO shipment_orders(account_id, order_ref, item_name, thread_id,
-                                         last_message_id, first_seen, last_update)
-             VALUES(?1, 'ORD-1', 'Anker charger', 't1', ?2, ?3, ?3)",
-            params![acct, shipping, Utc::now().to_rfc3339()],
-        )
-        .unwrap();
-    }
-    apply_category(&store, acct, quiet, "marketing", false);
+fn manual_retriage_preserves_decisions_records_and_user_state() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let (store, account) = store();
+    let id = triaged_row(
+        account,
+        "message",
+        "thread",
+        None,
+        false,
+        Sensitivity::Normal,
+    )
+    .ingest(&store);
     store
         .marketing_apply(&crate::store::MarketingApplied {
-            message_id: quiet,
-            account_id: acct,
+            message_id: id,
+            account_id: account,
             brand: Some("Shop".into()),
-            offer: Some("30% off".into()),
+            offer: Some("Offer".into()),
             discount: None,
             code: None,
             expires_at: None,
             received_at: Utc::now(),
-            extractor_model_used: "m".into(),
+            extractor_model_used: "old".into(),
         })
         .unwrap();
-    assert_eq!(store.marketing_offers(acct, 30, 10).unwrap().len(), 1);
-
-    store.retriage_reset(acct, None, 7).unwrap();
-
-    // The shipping row is PENDING again; the never-signalled row stays NULL —
-    // blanking it would be indistinguishable from "had a signal, un-ruled".
-    let markers = |mid: i64| -> Option<String> {
-        let conn = store.lock().unwrap();
-        conn.query_row(
-            "SELECT ship_extract_model FROM triage WHERE message_id=?1",
-            params![mid],
-            |r| r.get(0),
-        )
+    store
+        .set_attention_status(account, id, AttentionStatus::Done)
+        .unwrap();
+    let before: (String, Option<String>, Option<String>) = store
+        .lock()
         .unwrap()
-    };
-    assert_eq!(markers(shipping).as_deref(), Some("pending"));
-    assert_eq!(markers(quiet), None, "a NULL trigger stays NULL");
-    assert_eq!(store.ship_extract_queue(acct, 10).unwrap().len(), 1);
-
-    // Staged orders are re-derivable, so they go...
-    {
-        let conn = store.lock().unwrap();
-        let n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM shipment_orders WHERE account_id=?1",
-                params![acct],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(n, 0, "staged orders are dropped with the other specialists");
-    }
-    // ...and so does marketing, which the reset used to leave stranded.
+        .query_row(
+            "SELECT status,stage1_model_used,extractor_model_used FROM triage WHERE message_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(store.retriage_reset(account, Some(id), 7).unwrap(), 1);
+    let after: (String, Option<String>, Option<String>) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT status,stage1_model_used,extractor_model_used FROM triage WHERE message_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
     assert_eq!(
-        store.marketing_offers(acct, 30, 10).unwrap().len(),
-        0,
-        "marketing rows must not survive a re-triage that drops their category"
+        before, after,
+        "re-triage cannot erase user state or old facts"
+    );
+    assert_eq!(store.marketing_offers(account, 30, 10).unwrap().len(), 1);
+    assert_eq!(store.retriage_progress(account).unwrap().done, 0);
+    let mut found_manual = false;
+    while let Some(job) = store
+        .claim_agent_job(account, "triage", Utc::now(), 60)
+        .unwrap()
+    {
+        if job.trigger.starts_with("manual:") {
+            assert!(!job.arrival_eligible);
+            found_manual = true;
+        }
+        store.complete_agent_job(&job).unwrap();
+    }
+    assert!(found_manual);
+    assert_eq!(store.retriage_progress(account).unwrap().done, 1);
+}
+
+#[test]
+fn repeated_manual_requests_create_new_durable_work() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let (store, account) = store();
+    let id = triaged_row(
+        account,
+        "message",
+        "thread",
+        None,
+        false,
+        Sensitivity::Normal,
+    )
+    .ingest(&store);
+    store.retriage_reset(account, Some(id), 7).unwrap();
+    while let Some(job) = store
+        .claim_agent_job(account, "triage", Utc::now(), 60)
+        .unwrap()
+    {
+        store.complete_agent_job(&job).unwrap();
+    }
+    assert_eq!(store.retriage_progress(account).unwrap().done, 1);
+    store.retriage_reset(account, Some(id), 7).unwrap();
+    assert_eq!(store.retriage_progress(account).unwrap().done, 0);
+    assert!(
+        store
+            .claim_agent_job(account, "triage", Utc::now(), 60)
+            .unwrap()
+            .is_some()
     );
 }
 
 #[test]
-fn retriage_reset_keeps_the_shipment_rows_it_cannot_recover() {
-    // `shipments` is identity-keyed by tracking number and carries carrier-poll
-    // state no re-run can rebuild, so unlike every other specialist table it
-    // must SURVIVE a re-triage.
-    use crate::triage::{ShipmentInfo, ShipmentStatus};
-    let (store, acct) = store();
-    let id = triaged_row(acct, "g-ship", "t1", None, false, Sensitivity::Normal)
-        .ship_extract(true)
-        .ingest(&store);
+fn manual_retriage_includes_restricted_mail_and_preserves_field_corrections() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let (store, account) = store();
+    let id =
+        triaged_row(account, "auth", "thread", None, false, Sensitivity::Sealed).ingest(&store);
     store
-        .upsert_shipment(
-            acct,
+        .correct_agent_triage(
+            account,
             id,
-            &ShipmentInfo {
-                carrier: "ups".into(),
-                tracking_number: "1Z999AA10123456784".into(),
-                item_name: "Anker charger".into(),
-                status: ShipmentStatus::Shipped,
-                tracking_url: None,
-            },
+            "external_access",
+            &serde_json::json!(true),
             Utc::now(),
         )
         .unwrap();
-
-    store.retriage_reset(acct, None, 7).unwrap();
+    assert_eq!(store.retriage_reset(account, Some(id), 7).unwrap(), 1);
+    assert!(!store.agent_access_allowed(account, id).unwrap());
     assert_eq!(
         store
-            .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
+            .agent_thread_context(account, "thread")
             .unwrap()
+            .corrections
             .len(),
-        1,
-        "a tracked package must survive a re-triage"
+        1
     );
+    assert_eq!(store.retriage_progress(account).unwrap().total, 1);
+    assert_eq!(store.retriage_reset(account, Some(999999), 7).unwrap(), 0);
 }
 
-/// DEFECT: re-triage cleared the staged orders keyed by `last_message_id` but
-/// left DONATED item names standing. Extraction attaches a name to a shipment
-/// row ANOTHER message feeds and records that in `item_name_msg`; sealing scrubs
-/// those by provenance, and re-triage did not. So a re-extraction that returned
-/// no item name (or said the mail was not a shipment at all) kept showing the old
-/// name forever. Both tables, both scrubbed, and the ROW still survives.
 #[test]
-fn retriage_reset_clears_a_donated_item_name_in_both_shipment_tables() {
-    use crate::triage::{ShipmentInfo, ShipmentStatus};
-    let (store, acct) = store();
-
-    // The DONOR is an ordinary LLM-classified row, so it is in the reset scope.
-    let donor = triaged_row(acct, "g-donor", "t1", None, false, Sensitivity::Normal)
-        .ship_extract(true)
+fn manual_retriage_windows_bulk_requests_but_accepts_an_explicit_old_message() {
+    let (store, account) = store();
+    let old = triaged_row(account, "old", "old", None, false, Sensitivity::Normal)
+        .received_at(Utc::now() - chrono::Duration::days(120))
         .ingest(&store);
-    // The FEEDER carries a FILTERED rule, which is the marker that still sits
-    // outside the reset scope ('rule'), so it never resets — which is the whole
-    // point: the rows below survive the reset and must still lose the donated
-    // text.
-    let feeder =
-        triaged_row(acct, "g-feeder", "t2", Some(7), false, Sensitivity::Normal).ingest(&store);
-
-    let sid = store
-        .upsert_shipment(
-            acct,
-            feeder,
-            &ShipmentInfo {
-                carrier: "ups".into(),
-                tracking_number: "1Z999AA10123456784".into(),
-                item_name: String::new(),
-                status: ShipmentStatus::Shipped,
-                tracking_url: None,
-            },
-            Utc::now(),
-        )
-        .unwrap();
-    {
-        let conn = store.lock().unwrap();
-        // The donation: the donor's extraction named a package another mail feeds.
-        conn.execute(
-            "UPDATE shipments SET item_name='Anker charger', item_name_msg=?2,
-                 item_name_source='llm'
-             WHERE id=?1",
-            params![sid, donor],
-        )
-        .unwrap();
-        // The same hole one table over: a staged order the donor named but a
-        // later mail feeds, so the delete-by-`last_message_id` cannot reach it.
-        conn.execute(
-            "INSERT INTO shipment_orders(account_id, order_ref, item_name, item_name_msg,
-                                         thread_id, last_message_id, first_seen, last_update)
-             VALUES(?1, 'ORD-9', 'Anker charger', ?2, 't2', ?3, ?4, ?4)",
-            params![acct, donor, feeder, Utc::now().to_rfc3339()],
-        )
-        .unwrap();
-    }
-
-    store.retriage_reset(acct, None, 7).unwrap();
-
-    let listed = store
-        .list_shipments(acct, true, KEEP_ALL_SHIPMENTS)
-        .unwrap();
-    assert_eq!(listed.len(), 1, "the package itself must survive");
-    assert_eq!(listed[0].item_name, "", "the donated name is gone");
-
-    let conn = store.lock().unwrap();
-    let (ship_prov, ship_source): (Option<i64>, String) = conn
-        .query_row(
-            "SELECT item_name_msg, item_name_source FROM shipments WHERE id=?1",
-            params![sid],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(ship_prov, None, "and so is its provenance");
-    assert_eq!(
-        ship_source, "regex",
-        "BOTH halves of the provenance reset: an 'llm' marker with no name left \
-         would lock the row out of taking a regex name on re-extraction"
-    );
-    let (order_name, order_prov): (String, Option<i64>) = conn
-        .query_row(
-            "SELECT item_name, item_name_msg FROM shipment_orders WHERE account_id=?1",
-            params![acct],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        order_name, "",
-        "the staged order loses the donated name too"
-    );
-    assert_eq!(order_prov, None);
+    triaged_row(
+        account,
+        "recent",
+        "recent",
+        None,
+        false,
+        Sensitivity::Normal,
+    )
+    .ingest(&store);
+    assert_eq!(store.retriage_reset(account, None, 7).unwrap(), 1);
+    assert_eq!(store.retriage_reset(account, Some(old), 7).unwrap(), 1);
+    assert_eq!(store.retriage_progress(account).unwrap().total, 2);
 }
 
-/// DEFECT: a re-triage of anything older than the pass's age cutoff requeued the
-/// row and then watched the very next tick stamp it processed with no model call
-/// — "stale-skipped 1" in the log, an unchanged verdict on screen, and no way to
-/// ask again that would work any better. The cutoff exists so a fresh install
-/// does not spend its cap on a backlog nobody asked about; a re-triage IS asking.
 #[test]
-fn a_re_triaged_row_carries_the_stamp_that_overrides_the_stale_skip() {
-    let (store, acct) = store();
-    let now = Utc::now();
-
-    // Old mail — past every pass's cutoff — that the LLM already ruled on, and
-    // that also carries a shipping signal, so it sits in two queues at once.
-    let old = triaged_row(acct, "g-old", "t-old", None, false, Sensitivity::Normal)
-        .received_at(now - chrono::Duration::days(120))
-        .ship_extract(true)
-        .ingest(&store);
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE triage SET stage1_model_used='claude-x', model_used='claude-x',
-                    extractor_model_used='claude-x', ship_extract_model='claude-x',
-                    category='banking_statement'
-             WHERE message_id=?1",
-            rusqlite::params![old],
-        )
-        .unwrap();
-    }
-
-    assert_eq!(store.retriage_reset(acct, Some(old), 7).unwrap(), 1);
-
-    // Every queue the row re-enters carries the request, so every pass's stale
-    // skip yields to it.
-    let s1 = store.stage1_queue(acct, 10).unwrap();
-    assert_eq!(s1.len(), 1);
-    assert!(
-        crate::triage::retriage_forced(s1[0].retriage_at, Utc::now()),
-        "stage-1 must see the hand request on the row it just requeued"
-    );
-    let ship = store.ship_extract_queue(acct, 10).unwrap();
-    assert_eq!(ship.len(), 1);
-    assert!(crate::triage::retriage_forced(
-        ship[0].retriage_at,
-        Utc::now()
-    ));
-    let ext = store
-        .extract_queue(acct, &["banking_statement"], 10)
-        .unwrap();
-    assert_eq!(ext.len(), 1);
-    assert!(crate::triage::retriage_forced(
-        ext[0].retriage_at,
-        Utc::now()
-    ));
-
-    // AND STAGE-2, which the row only reaches after Stage-1 re-runs and escalates
-    // it. The stamp has to survive that hop: a re-triage that redoes Stage-1 and
-    // then skips the escalation it asked for is half a re-triage.
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1
-             WHERE message_id=?1",
-            rusqlite::params![old],
-        )
-        .unwrap();
-    }
-    let s2 = store.stage2_queue(acct, 10).unwrap();
-    assert_eq!(s2.len(), 1);
-    assert!(
-        crate::triage::retriage_forced(s2[0].retriage_at, Utc::now()),
-        "the stamp must outlive the Stage-1 apply that escalates the row"
-    );
-}
-
-/// The progress counter the blocking modal reads. The client cannot dismiss that
-/// modal until `done == total`, so a counter that reaches its total early is
-/// worse than none: it uncovers the app mid-run.
-///
-/// The escalation hop is the whole case. A row Stage-1 has finished AND flagged
-/// for Stage-2 is still queued work, and a naive "stage1_model_used IS NOT NULL"
-/// reading calls it done.
-#[test]
-fn retriage_progress_counts_an_escalated_row_as_unfinished_until_stage2_has_it() {
-    let (store, acct) = store();
-
-    let a = triaged_row(acct, "g-a", "t-a", None, false, Sensitivity::Normal).ingest(&store);
-    let b = triaged_row(acct, "g-b", "t-b", None, false, Sensitivity::Normal).ingest(&store);
-    // Nobody has asked about anything yet.
-    let p = store.retriage_progress(acct).unwrap();
-    assert_eq!((p.total, p.done), (0, 0), "no stamps, no run");
-    assert!(p.started_at.is_none());
-
-    assert_eq!(store.retriage_reset(acct, None, 7).unwrap(), 2);
-    let p = store.retriage_progress(acct).unwrap();
-    assert_eq!((p.total, p.done), (2, 0), "both rows are back in the queue");
-    assert!(p.started_at.is_some(), "a live run knows when it began");
-
-    // `a` finishes outright; `b` is escalated and Stage-2 has not run.
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=0 WHERE message_id=?1",
-            rusqlite::params![a],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1, model_used=NULL
-             WHERE message_id=?1",
-            rusqlite::params![b],
-        )
-        .unwrap();
-    }
-    let p = store.retriage_progress(acct).unwrap();
-    assert_eq!(
-        (p.total, p.done),
-        (2, 1),
-        "an escalated row is not done just because Stage-1 stamped it"
-    );
-    assert_eq!(store.stage2_queue(acct, 10).unwrap().len(), 1);
-
-    // Stage-2 lands, and only now is the run complete.
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE triage SET model_used='claude-x' WHERE message_id=?1",
-            rusqlite::params![b],
-        )
-        .unwrap();
-    }
-    let p = store.retriage_progress(acct).unwrap();
-    assert_eq!(
-        (p.total, p.done),
-        (2, 2),
-        "the run finishes when the queues empty"
-    );
-}
-
-/// The run is the LIVE window, the same one the passes force on. A stamp older
-/// than [`crate::triage::RETRIAGE_FORCE_WINDOW`] is a run that is over — the
-/// passes have stopped honouring it — so counting it would wedge the modal on a
-/// yesterday that can never finish.
-#[test]
-fn retriage_progress_forgets_a_run_whose_stamps_have_aged_out() {
-    let (store, acct) = store();
-    let id = triaged_row(acct, "g-old", "t-old", None, false, Sensitivity::Normal).ingest(&store);
-    store.retriage_reset(acct, Some(id), 7).unwrap();
-    assert_eq!(store.retriage_progress(acct).unwrap().total, 1);
-
-    let stale = (Utc::now() - crate::triage::RETRIAGE_FORCE_WINDOW - chrono::Duration::minutes(1))
-        .to_rfc3339();
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
+fn retriage_progress_expires_old_requests_without_touching_their_jobs() {
+    let (store, account) = store();
+    let id = triaged_row(
+        account,
+        "message",
+        "thread",
+        None,
+        false,
+        Sensitivity::Normal,
+    )
+    .ingest(&store);
+    store.retriage_reset(account, Some(id), 7).unwrap();
+    assert_eq!(store.retriage_progress(account).unwrap().total, 1);
+    store
+        .lock()
+        .unwrap()
+        .execute(
             "UPDATE triage SET retriage_at=?2 WHERE message_id=?1",
-            rusqlite::params![id, stale],
+            params![id, (Utc::now() - chrono::Duration::hours(25)).to_rfc3339()],
         )
         .unwrap();
-    }
-    assert!(!crate::triage::retriage_forced(
-        Some(Utc::now() - crate::triage::RETRIAGE_FORCE_WINDOW - chrono::Duration::minutes(1)),
-        Utc::now()
-    ));
-    assert_eq!(
-        store.retriage_progress(acct).unwrap().total,
-        0,
-        "an expired stamp is not a run in flight"
-    );
-}
-
-/// A row nobody asked about keeps a NULL stamp, so the age cutoff still decides
-/// for it. Without this the fix would read as "re-triage forces everything".
-#[test]
-fn an_untouched_row_carries_no_re_triage_stamp() {
-    let (store, acct) = store();
-    triaged_row(acct, "g-plain", "t-plain", None, false, Sensitivity::Normal).ingest(&store);
-    let q = store.stage1_queue(acct, 10).unwrap();
-    assert_eq!(q.len(), 1);
-    assert_eq!(q[0].retriage_at, None);
-    assert!(!crate::triage::retriage_forced(
-        q[0].retriage_at,
-        Utc::now()
-    ));
-}
-
-/// `batch_per_cycle` is a real ceiling, so a hand-requested row that sorted
-/// purely by age would wait behind the backlog for ticks — which reads exactly
-/// like the skip it is not.
-#[test]
-fn a_hand_re_triaged_row_jumps_the_backlog() {
-    let (store, acct) = store();
-    let now = Utc::now();
-
-    let old = triaged_row(acct, "g-old", "t-old", None, false, Sensitivity::Normal)
-        .received_at(now - chrono::Duration::days(120))
-        .ingest(&store);
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE triage SET stage1_model_used='claude-x' WHERE message_id=?1",
-            rusqlite::params![old],
-        )
-        .unwrap();
-    }
-    // Newer, never-classified mail already waiting in the queue.
-    for i in 0..3 {
-        triaged_row(
-            acct,
-            &format!("g-new{i}"),
-            &format!("t-new{i}"),
-            None,
-            false,
-            Sensitivity::Normal,
-        )
-        .received_at(now - chrono::Duration::minutes(i))
-        .ingest(&store);
-    }
-
-    store.retriage_reset(acct, Some(old), 7).unwrap();
-
-    let batch = store.stage1_queue(acct, 1).unwrap();
-    assert_eq!(batch.len(), 1);
-    assert_eq!(
-        batch[0].message_id, old,
-        "the row a human asked for goes first, not last"
-    );
-}
-
-#[test]
-fn retriage_reset_requeues_llm_rows_but_never_filtered_or_sealed() {
-    let (store, acct) = store();
-
-    let normal = triaged_row(acct, "g-n", "t-n", None, false, Sensitivity::Normal).ingest(&store);
-    // A FILTERED rule row keeps the 'rule' marker (its verdict is pending a
-    // Stage-2 want_text read) and stays outside the reset scope. A
-    // Squelch/Surface row no longer does: it is an ordinary model-classified row
-    // whose rule simply reapplies on the way back through.
-    triaged_row(acct, "g-f", "t-f", Some(7), false, Sensitivity::Normal).ingest(&store);
-    triaged_row(acct, "g-s", "t-s", None, false, Sensitivity::Sealed).ingest(&store);
-
-    // Simulate the LLM having classified the normal row (leaves the queue).
-    {
-        let conn = store.lock().unwrap();
-        conn.execute(
-            "UPDATE triage SET stage1_model_used='claude-x', needs_stage2=1,
-                    extractor_model_used='claude-x'
-             WHERE message_id=?1",
-            rusqlite::params![normal],
-        )
-        .unwrap();
-    }
-    assert_eq!(store.stage1_queue(acct, 10).unwrap().len(), 0);
-
-    // Window re-triage: only the LLM-classified normal row resets.
-    let n = store.retriage_reset(acct, None, 7).unwrap();
-    assert_eq!(n, 1, "filtered + sealed rows must never reset");
-    let q = store.stage1_queue(acct, 10).unwrap();
-    assert_eq!(q.len(), 1);
-    assert_eq!(q[0].message_id, normal);
-    // The escalation + extractor markers were cleared too.
-    {
-        let conn = store.lock().unwrap();
-        let (needs, ext): (i64, Option<String>) = conn
-            .query_row(
-                "SELECT needs_stage2, extractor_model_used FROM triage WHERE message_id=?1",
-                rusqlite::params![normal],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(needs, 0);
-        assert_eq!(ext, None);
-    }
-
-    // Single-message scope on a sealed message: resets nothing.
-    let sealed_reset = store.retriage_reset(acct, Some(999_999), 7).unwrap();
-    assert_eq!(sealed_reset, 0);
+    assert_eq!(store.retriage_progress(account).unwrap().total, 0);
+    let count:i64=store.lock().unwrap().query_row("SELECT COUNT(*) FROM agent_triage_jobs WHERE account_id=?1 AND trigger LIKE 'manual:%'",[account],|r|r.get(0)).unwrap();
+    assert_eq!(count, 1, "progress visibility does not delete durable work");
 }
 
 /// A Squelch/Surface rule still classifies, but it does NOT escalate: the row

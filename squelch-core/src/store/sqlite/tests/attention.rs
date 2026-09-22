@@ -40,10 +40,9 @@ fn opening_and_surfacing_are_separate_stamps() {
 }
 
 /// What each side of the rate counts. Sealed mail is in the denominator (it
-/// arrived and nobody had to open it, which is the point) and can never be in
-/// the numerator; sent mail is in neither.
+/// arrived) and joins the numerator when the human opens it; sent mail is in neither.
 #[test]
-fn the_open_rate_counts_received_mail_and_never_opens_a_sealed_row() {
+fn human_open_rate_counts_opened_restricted_mail() {
     let (store, acct) = store();
     let now = Utc::now();
     let since = now - chrono::Duration::days(30);
@@ -56,23 +55,21 @@ fn the_open_rate_counts_received_mail_and_never_opens_a_sealed_row() {
         .seed(&store);
 
     store.mark_opened(acct, &[opened]).unwrap();
-    // A sealed thread is never opened in the reader, so the client never says
-    // so; the SQL guard is what makes that true rather than merely customary,
-    // and it holds on BOTH doors into the stamp.
+    // Human opens count independently of external access restrictions.
     assert_eq!(
         store.mark_opened(acct, &[sealed]).unwrap(),
-        0,
-        "a sealed row is never stamped opened"
+        1,
+        "a human can open restricted mail"
     );
     assert_eq!(
         store.mark_thread_opened(acct, "t3").unwrap(),
         0,
-        "and not by thread either"
+        "opening the same message twice is idempotent"
     );
 
     let rate = store.share_open_rate(acct, since).unwrap();
     assert_eq!(rate.received, 3, "sealed mail counts as mail that arrived");
-    assert_eq!(rate.opened, 1);
+    assert_eq!(rate.opened, 2);
     assert!(rate.oldest_received_at.is_some());
 }
 
@@ -360,7 +357,7 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
         .seed(&store);
 
     // Case-insensitive on the address, and a different sender is untouched.
-    assert_eq!(store.resolve_sender(acct, "  News@Shop.com ").unwrap(), 2);
+    assert_eq!(store.resolve_sender(acct, "  News@Shop.com ").unwrap(), 3);
 
     let since = now - chrono::Duration::days(1);
     let open = store
@@ -395,8 +392,8 @@ fn resolve_sender_clears_every_open_thread_from_that_address() {
         "another sender is untouched"
     );
     assert!(
-        done.iter().all(|u| u.update.id != sealed),
-        "sealed is never touched"
+        done.iter().any(|u| u.update.id == sealed),
+        "human lifecycle includes restricted mail"
     );
 
     // Idempotent: a second call moves nothing, so an already-done row keeps the
@@ -510,58 +507,29 @@ fn thread_shows_one_row_and_done_resolves_the_whole_thread() {
 }
 
 #[test]
-fn sealed_rows_never_surface_through_the_ledger() {
-    let (store, acct) = store();
-    let since = Utc::now() - chrono::Duration::days(1);
-
-    let sealed = triaged(acct, "g1", "t1")
-        .subject("Your verification code")
-        .importance(90)
+fn human_surfacing_and_done_apply_to_restricted_mail() {
+    let (store, account) = store();
+    let id = triaged(account, "restricted", "thread")
         .sealed(SealedKind::Otp)
         .seed(&store);
-
-    // Never appears in attention_updates (any band).
+    assert_eq!(store.mark_surfaced(account, &[id]).unwrap(), 1);
+    assert_eq!(store.mark_surfaced(account, &[id]).unwrap(), 0);
     assert!(
         store
-            .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        store
-            .attention_updates(
-                acct,
-                since,
-                None,
-                None,
-                Some(SitrepBand::New),
-                false,
-                SpamScope::Exclude
-            )
-            .unwrap()
-            .is_empty()
-    );
-
-    // mark_surfaced refuses to stamp a sealed row.
-    let n = store.mark_surfaced(acct, &[sealed]).unwrap();
-    assert_eq!(n, 0);
-    // set_attention_status refuses a sealed row.
-    assert!(
-        !store
-            .set_attention_status(acct, sealed, AttentionStatus::Done)
+            .set_attention_status(account, id, AttentionStatus::Done)
             .unwrap()
     );
-
-    // Stats: sealed row contributes to `sealed`, never to any band, and
-    // never advances last_surfaced_at.
-    let stats = store
-        .stats(acct, Utc::now() - chrono::Duration::days(30))
+    let (status, surfaced): (String, Option<String>) = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT status,surfaced_at FROM triage WHERE message_id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap();
-    assert_eq!(stats.sealed, 1);
-    assert_eq!(stats.bands.new, 0);
-    assert_eq!(stats.bands.standing, 0);
-    assert_eq!(stats.bands.open, 0);
-    assert!(stats.last_surfaced_at.is_none());
+    assert_eq!(status, "done");
+    assert!(surfaced.is_some());
 }
 
 // ---- standing band: live correspondence ---------------------------------
@@ -939,8 +907,8 @@ fn standing_never_serves_provider_spam_even_when_asked_for_it() {
 }
 
 #[test]
-fn standing_never_admits_sealed_mail_from_a_correspondent() {
-    // SECURITY: participation widens the band's DEFINITION, never its clearance.
+fn human_standing_includes_restricted_correspondence() {
+    // Human inventory does not use the external-agent access boundary.
     let (store, acct) = store();
     let since = Utc::now() - chrono::Duration::days(30);
     contact(&store, acct, "johanna@wvfc.org", 5);
@@ -963,19 +931,16 @@ fn standing_never_admits_sealed_mail_from_a_correspondent() {
         .seed(&store);
 
     let standing = standing_ids(&store, acct, since);
-    assert!(
-        standing.is_empty(),
-        "sealed rows are absent from the band: {standing:?}"
-    );
-    assert!(!standing.contains(&sealed_known));
-    assert!(!standing.contains(&sealed_thread));
+    assert_eq!(standing.len(), 2);
+    assert!(standing.contains(&sealed_known));
+    assert!(standing.contains(&sealed_thread));
     assert_eq!(
         store
             .stats(acct, Utc::now() - chrono::Duration::days(30))
             .unwrap()
             .bands
             .standing,
-        0
+        2
     );
 }
 
@@ -1023,8 +988,8 @@ fn stats_standing_count_matches_the_listed_standing_band() {
     let standing = standing_ids(&store, acct, since);
     assert_eq!(
         standing.len(),
-        3,
-        "bill + known contact + live thread: {standing:?}"
+        4,
+        "bill + known contact + live thread + restricted correspondence: {standing:?}"
     );
     assert!(standing.contains(&bill));
     assert!(standing.contains(&known));
@@ -1325,43 +1290,22 @@ fn clear_reminder_unschedules_without_undoing_the_deferral() {
 }
 
 #[test]
-fn reminders_never_touch_a_sealed_row() {
-    // SECURITY: every reminder query excludes sealed rows in SQL, so a sealed
-    // message is indistinguishable from a missing one — and the sweep re-guards
-    // even though nothing should have been able to schedule one.
-    let (store, acct) = store();
-    let sealed = triaged(acct, "g-sealed", "t-sealed")
+fn human_reminders_work_for_restricted_mail() {
+    let (store, account) = store();
+    let id = triaged(account, "restricted", "thread")
         .sealed(SealedKind::Otp)
         .seed(&store);
-
     let due = Utc::now() + chrono::Duration::days(1);
-    assert!(
-        !store.set_reminder(acct, sealed, due).unwrap(),
-        "sealed reads as missing"
-    );
-    assert!(!store.clear_reminder(acct, sealed).unwrap());
-    assert!(!store.set_reminder(acct, 999, due).unwrap(), "missing id");
-
-    // Force a reminder onto the sealed row behind the store's back: the sweep's
-    // own guard is what is under test, not `set_reminder`'s.
-    store
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE triage SET remind_at = ?1 WHERE message_id = ?2",
-            params![
-                (Utc::now() - chrono::Duration::days(1)).to_rfc3339(),
-                sealed
-            ],
-        )
-        .unwrap();
+    assert!(store.set_reminder(account, id, due).unwrap());
     assert!(
         store
-            .fire_due_reminders(acct, Utc::now())
+            .fire_due_reminders(account, Utc::now())
             .unwrap()
-            .is_empty(),
-        "the sweep will not surface a sealed row"
+            .is_empty()
     );
+    assert_eq!(store.fire_due_reminders(account, due).unwrap(), vec![id]);
+    assert!(store.clear_reminder(account, id).unwrap());
+    assert!(!store.set_reminder(account, 999999, due).unwrap());
 }
 
 #[test]
@@ -1728,20 +1672,22 @@ fn mail_activity_buckets_a_day_and_bounds_the_window() {
         rows,
         vec![
             MailActivityDay {
+                pending: 1,
                 day: "2026-08-10".into(),
                 // Everything inbound that is not spam: 3 triaged + 1 sealed
                 // + 1 untriaged. The sent reply is out, not in.
                 received: 5,
                 sent: 1,
-                sealed: 1,
+                // A legacy regex seal is not a canonical auth assessment.
+                sealed: 0,
                 past_due: 1,
                 deadline: 0,
                 signal: 1,
-                // ONE noise: the sent reply's neutral noise row and the spam
-                // row's must not count.
-                noise: 1,
+                // Restricted human mail stays in inventory; sent/spam do not.
+                noise: 2,
             },
             MailActivityDay {
+                pending: 0,
                 day: "2026-08-11".into(),
                 received: 1,
                 sent: 0,
@@ -1764,5 +1710,78 @@ fn mail_activity_buckets_a_day_and_bounds_the_window() {
     assert!(
         none.is_empty(),
         "an empty window is an empty list, not zero rows"
+    );
+}
+
+#[test]
+fn activity_and_stats_project_current_agent_decisions_and_keep_pending_separate() {
+    use crate::store::agent_triage::AgentTriageStore;
+    use crate::triage::decision::{EmailKind, MessageDecision};
+    let (store, account) = store();
+    let now = Utc::now();
+    triaged(account, "pending-a", "thread-a")
+        .received_at(now)
+        .ingest(&store);
+    triaged(account, "pending-b", "thread-b")
+        .received_at(now)
+        .ingest(&store);
+    let stats = store
+        .stats(account, now - chrono::Duration::days(30))
+        .unwrap();
+    assert_eq!(stats.tier_counts.get("pending"), Some(&2));
+    assert_eq!(stats.tier_counts.get("noise").copied().unwrap_or(0), 0);
+    let job = store
+        .claim_agent_job(
+            account,
+            "investigation",
+            now + chrono::Duration::minutes(1),
+            60,
+        )
+        .unwrap()
+        .unwrap();
+    let context = store.load_agent_context(&job).unwrap();
+    let mut decision = MessageDecision {
+        kinds: vec![EmailKind::Correspondence],
+        summary: "The agent summary".into(),
+        ..Default::default()
+    };
+    decision.attention.show_in_fye = true;
+    decision.attention.relevant_message_ids = vec![job.message_id];
+    store
+        .commit_agent_decision(
+            &job,
+            &context,
+            &decision,
+            std::slice::from_ref(&context.message.source),
+        )
+        .unwrap();
+    let stats = store
+        .stats(account, now - chrono::Duration::days(30))
+        .unwrap();
+    assert_eq!(stats.tier_counts.get("signal"), Some(&1));
+    assert_eq!(stats.tier_counts.get("pending"), Some(&1));
+    assert_eq!(stats.tier_counts.get("noise").copied().unwrap_or(0), 0);
+    let rows = store
+        .mail_activity(
+            account,
+            now - chrono::Duration::hours(1),
+            now + chrono::Duration::hours(1),
+        )
+        .unwrap();
+    assert_eq!(rows.iter().map(|row| row.pending).sum::<u64>(), 1);
+    assert_eq!(rows.iter().map(|row| row.signal).sum::<u64>(), 1);
+    assert_eq!(rows.iter().map(|row| row.noise).sum::<u64>(), 0);
+    let legacy_tier: String = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT tier FROM triage WHERE message_id=?1",
+            [job.message_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        legacy_tier, "noise",
+        "projection must not need a legacy verdict write"
     );
 }

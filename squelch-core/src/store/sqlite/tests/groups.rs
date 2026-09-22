@@ -304,11 +304,9 @@ fn history_ignores_mail_to_non_members() {
     assert!(store.group_history(acct, id, 50, 0).unwrap().is_empty());
 }
 
-/// A group history is a sent-mail listing, so it inherits the sealed guard —
-/// including the THREAD-level one, where the user's own reply in a thread sealed
-/// by a sibling commits as 'normal'.
+/// Human group history remains readable independently of external-agent access.
 #[test]
-fn history_excludes_sealed_mail_and_sealed_threads() {
+fn human_history_includes_restricted_mail_and_threads() {
     let (store, acct) = store();
     triaged(acct, "sealed", "t1")
         .is_sent(true)
@@ -325,10 +323,7 @@ fn history_excludes_sealed_mail_and_sealed_threads() {
         .ingest(&store);
 
     let id = investors(&store, acct);
-    assert!(
-        store.group_history(acct, id, 50, 0).unwrap().is_empty(),
-        "neither a sealed row nor a row in a sealed thread may list"
-    );
+    assert_eq!(store.group_history(acct, id, 50, 0).unwrap().len(), 2);
 }
 
 #[test]

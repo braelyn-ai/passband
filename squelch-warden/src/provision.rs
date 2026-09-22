@@ -636,8 +636,10 @@ impl Warden {
             return Err(WardenError::Conflict);
         }
 
-        self.install_credentials(&name, &ciphertext, status, reopening)
-            .await
+        let pod = self
+            .install_credentials(&name, &ciphertext, status, reopening)
+            .await?;
+        self.mint_pairing(&name, &pod).await
     }
 
     /// REPLACE a live tenant's credential, because its owner re-consented.
@@ -664,6 +666,31 @@ impl Warden {
         raw_email: &str,
         raw_ciphertext: &str,
     ) -> Result<Pairing, WardenError> {
+        let pod = self
+            .replace_credentials_pod(raw_label, raw_email, raw_ciphertext)
+            .await?;
+        self.mint_pairing(&TenantName::parse(raw_label)?, &pod)
+            .await
+    }
+
+    /// Reconnect an existing device without minting another pairing code.
+    pub async fn reconnect_credentials(
+        &self,
+        raw_label: &str,
+        raw_email: &str,
+        raw_ciphertext: &str,
+    ) -> Result<(), WardenError> {
+        self.replace_credentials_pod(raw_label, raw_email, raw_ciphertext)
+            .await
+            .map(|_| ())
+    }
+
+    async fn replace_credentials_pod(
+        &self,
+        raw_label: &str,
+        raw_email: &str,
+        raw_ciphertext: &str,
+    ) -> Result<String, WardenError> {
         let name = TenantName::parse(raw_label)?;
         let account_email = validate::validate_account_email(raw_email)?;
         let ciphertext = validate::validate_ciphertext(raw_ciphertext)?;
@@ -702,8 +729,8 @@ impl Warden {
     }
 
     /// Everything both credential routes do once their own guard has passed:
-    /// store the blob, apply the workload, wait for the new pod, and mint a
-    /// pairing. Shared rather than copied because the ORDER in it is the
+    /// store the blob, apply the workload, and wait for the new pod.
+    /// Shared rather than copied because the ORDER in it is the
     /// contract (volume, policy, service, workload, ingress) and two copies of
     /// an order are one edit away from disagreeing.
     async fn install_credentials(
@@ -712,7 +739,7 @@ impl Warden {
         ciphertext: &str,
         status: TenantStatus,
         reopening: bool,
-    ) -> Result<Pairing, WardenError> {
+    ) -> Result<String, WardenError> {
         // Verbatim. The warden does not parse, re-serialize or pretty-print
         // this: it is somebody else's ciphertext and the only correct thing to
         // do with it is put it where the daemon will look.
@@ -761,13 +788,15 @@ impl Warden {
         // annotation would never differ from the first rotation.
         let share_hash = self.share_hash(name).await?;
         // The hash of what was just stored, not of what is running: this is the
-        // whole mechanism by which a re-consent reaches the daemon.
+        // whole mechanism by which a re-consent reaches the daemon. Computed
+        // once, because the confirmation at the end asks for the same value.
+        let expected_hash = objects::credential_hash(ciphertext);
         self.apply(
             name,
             Object::Deployment(Box::new(objects::deployment(
                 &self.config,
                 name,
-                &objects::credential_hash(ciphertext),
+                &expected_hash,
                 llm_hash.as_deref(),
                 share_hash.as_deref(),
             ))),
@@ -793,7 +822,8 @@ impl Warden {
         // has no old pod to be confused with, and making every new tenant wait
         // out `minReadySeconds` as well would spend a good part of the deadline
         // on a race that cannot happen to it.
-        if matches!(status, TenantStatus::Active | TenantStatus::Failed) {
+        let replacing = matches!(status, TenantStatus::Active | TenantStatus::Failed);
+        if replacing {
             self.cluster
                 .rollout_complete(name.as_str(), self.config.ready_timeout)
                 .await
@@ -834,9 +864,28 @@ impl Warden {
             tracing::info!(tenant = %name, "reopened a cancelled account");
         }
 
-        let pairing = self.mint_pairing(name, &pod).await?;
+        // A concurrent change must not let a healthy but different deployment
+        // confirm this credential. The completed rollout must carry OUR hash:
+        // `rollout_complete` above is satisfied by whatever template is
+        // current, and between it and here another writer may have applied a
+        // different one, so this re-reads the object and checks both at once.
+        let deployment = self
+            .cluster
+            .get_deployment(name.as_str())
+            .await
+            .map_err(|e| fail(name.as_str(), "credential_confirmation_failed", &e))?
+            .ok_or_else(|| WardenError::cluster("credential_confirmation_failed"))?;
+        let hash = deployment
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.metadata.as_ref())
+            .and_then(|meta| meta.annotations.as_ref())
+            .and_then(|annotations| annotations.get(objects::CREDENTIAL_HASH_ANNOTATION));
+        if hash != Some(&expected_hash) || (replacing && !crate::cluster::rolled_out(&deployment)) {
+            return Err(WardenError::cluster("credential_confirmation_failed"));
+        }
         tracing::info!(tenant = %name, "tenant provisioned");
-        Ok(pairing)
+        Ok(pod)
     }
 
     /// Store or rotate the tenant's LLM gateway virtual keys: whichever of the
@@ -2981,6 +3030,43 @@ mod tests {
         );
         // ...and the pod it belongs to is a different pod.
         assert_ne!(before, pod_annotation(&h));
+    }
+
+    #[tokio::test]
+    async fn reconnect_confirms_the_new_credential_without_pairing_again() {
+        let h = Harness::new();
+        serving_tenant(&h, "alice").await;
+        let old_hash = pod_annotation(&h);
+        // Pairing is deliberately broken: reconnecting an existing device
+        // must still succeed, and must not mint unused device credentials.
+        h.cluster.exec_fails();
+        let ciphertext = armored("replacement");
+        h.warden
+            .reconnect_credentials("alice", "alice@example.com", &ciphertext)
+            .await
+            .unwrap();
+        assert_ne!(old_hash, pod_annotation(&h));
+        assert_eq!(pod_annotation(&h), objects::credential_hash(&ciphertext));
+        // Replaying the saved work uses the same template, so no new rollout.
+        h.warden
+            .reconnect_credentials("alice", "alice@example.com", &ciphertext)
+            .await
+            .unwrap();
+        assert_eq!(pod_annotation(&h), objects::credential_hash(&ciphertext));
+    }
+
+    #[tokio::test]
+    async fn reconnect_cannot_confirm_an_old_ready_pod_during_a_hung_rollout() {
+        let h = Harness::new();
+        serving_tenant(&h, "alice").await;
+        h.cluster.rollout_hangs();
+        assert_eq!(
+            h.warden
+                .reconnect_credentials("alice", "alice@example.com", &armored("replacement"))
+                .await
+                .unwrap_err(),
+            WardenError::cluster("not_ready")
+        );
     }
 
     /// A phase two that REPLACES a workload waits for the rollout before it

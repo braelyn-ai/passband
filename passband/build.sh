@@ -7,6 +7,7 @@
 #
 #   ./build.sh          debug build
 #   ./build.sh release  optimized build
+#   ./build.sh preview  faster unoptimized build for visual iteration
 #   ./build.sh run      build, then launch the app
 #
 # The .xcodeproj (via `xcodegen generate`) is still checked in and is the
@@ -56,6 +57,7 @@ SWIFT_FLAGS=(
 
 case "$MODE" in
   release) SWIFT_FLAGS+=(-O -whole-module-optimization) ;;
+  preview) SWIFT_FLAGS+=(-Onone -whole-module-optimization) ;;
   *)       SWIFT_FLAGS+=(-Onone -g) ;;
 esac
 

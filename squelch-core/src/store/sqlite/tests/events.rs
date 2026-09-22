@@ -9,7 +9,7 @@ use chrono::TimeZone;
 fn append_event_is_once_per_message_ever() {
     let (store, acct) = store();
 
-    let first = store.append_event(&new_event(acct, 1)).unwrap();
+    let first = store.append_event(&new_event(&store, acct, 1)).unwrap();
     assert_eq!(
         first,
         Some(1),
@@ -18,7 +18,7 @@ fn append_event_is_once_per_message_ever() {
 
     // A SECOND append for the same message — a re-ingest, or a Stage-2 verdict
     // landing on a row that already notified at ingest — is a silent no-op.
-    let mut again = new_event(acct, 1);
+    let mut again = new_event(&store, acct, 1);
     again.kind = EventKind::Urgent;
     again.one_line = "a louder verdict".into();
     assert_eq!(
@@ -44,10 +44,18 @@ fn events_after_pages_in_id_order_and_scopes_by_account() {
 
     let mut ids = Vec::new();
     for m in 1..=5 {
-        ids.push(store.append_event(&new_event(acct, m)).unwrap().unwrap());
+        ids.push(
+            store
+                .append_event(&new_event(&store, acct, m))
+                .unwrap()
+                .unwrap(),
+        );
     }
     // Another account's event must never appear in this account's replay.
-    store.append_event(&new_event(other, 99)).unwrap().unwrap();
+    store
+        .append_event(&new_event(&store, other, 99))
+        .unwrap()
+        .unwrap();
 
     // From the zero cursor: everything, oldest first.
     let all = store.events_after(acct, 0, 100).unwrap();
@@ -89,7 +97,7 @@ fn event_by_id_round_trips_the_snapshot_and_scopes_by_account() {
     let other = store.ensure_account("other@example.com").unwrap();
 
     let due = Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap();
-    let mut ev = new_event(acct, 42);
+    let mut ev = new_event(&store, acct, 42);
     ev.kind = EventKind::Urgent;
     ev.tier = Tier::PastDue;
     ev.importance = 95;
@@ -127,12 +135,15 @@ fn event_by_id_round_trips_the_snapshot_and_scopes_by_account() {
 fn sealed_kind_round_trips_and_is_absent_from_the_wire_when_there_is_none() {
     let (store, acct) = store();
 
-    let mut sealed = new_event(acct, 1);
+    let mut sealed = new_event(&store, acct, 1);
     sealed.kind = EventKind::Urgent;
     sealed.sealed_kind = Some(SealedKind::Otp);
     sealed.one_line = "Login code arrived".into();
     let sealed_id = store.append_event(&sealed).unwrap().unwrap();
-    let plain_id = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
+    let plain_id = store
+        .append_event(&new_event(&store, acct, 2))
+        .unwrap()
+        .unwrap();
 
     let got = store.event_by_id(acct, sealed_id).unwrap().expect("event");
     assert_eq!(got.sealed_kind, Some(SealedKind::Otp));
@@ -176,12 +187,21 @@ fn latest_event_id_is_zero_until_something_happens() {
         "empty => the 0 cursor"
     );
 
-    let a = store.append_event(&new_event(acct, 1)).unwrap().unwrap();
-    let b = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
+    let a = store
+        .append_event(&new_event(&store, acct, 1))
+        .unwrap()
+        .unwrap();
+    let b = store
+        .append_event(&new_event(&store, acct, 2))
+        .unwrap()
+        .unwrap();
     assert_eq!(store.latest_event_id(acct).unwrap(), b);
     assert!(b > a, "ids are monotonic");
     // A deduped append does not move the cursor.
-    assert_eq!(store.append_event(&new_event(acct, 2)).unwrap(), None);
+    assert_eq!(
+        store.append_event(&new_event(&store, acct, 2)).unwrap(),
+        None
+    );
     assert_eq!(store.latest_event_id(acct).unwrap(), b);
     // Per-account, so a busy second account cannot skip this one's replay.
     assert_eq!(store.latest_event_id(other).unwrap(), 0);
@@ -193,12 +213,18 @@ fn append_event_pokes_the_attached_notifier_only_on_a_real_insert() {
 
     // No notifier attached: appending must still work (a consumer that never
     // attaches simply polls the table instead).
-    store.append_event(&new_event(acct, 1)).unwrap().unwrap();
+    store
+        .append_event(&new_event(&store, acct, 1))
+        .unwrap()
+        .unwrap();
 
     let (tx, mut rx) = tokio::sync::broadcast::channel(8);
     assert!(store.attach_event_notifier(tx).unwrap().is_none());
 
-    let id = store.append_event(&new_event(acct, 2)).unwrap().unwrap();
+    let id = store
+        .append_event(&new_event(&store, acct, 2))
+        .unwrap()
+        .unwrap();
     assert_eq!(
         rx.try_recv().unwrap(),
         id,
@@ -206,7 +232,10 @@ fn append_event_pokes_the_attached_notifier_only_on_a_real_insert() {
     );
 
     // A deduped append broadcasts nothing — no phantom wake for a no-op.
-    assert_eq!(store.append_event(&new_event(acct, 2)).unwrap(), None);
+    assert_eq!(
+        store.append_event(&new_event(&store, acct, 2)).unwrap(),
+        None
+    );
     assert!(rx.try_recv().is_err(), "no broadcast for a deduped append");
 }
 
@@ -219,7 +248,10 @@ fn append_event_survives_having_no_receivers() {
     let (tx, rx) = tokio::sync::broadcast::channel::<i64>(8);
     drop(rx);
     store.attach_event_notifier(tx).unwrap();
-    assert_eq!(store.append_event(&new_event(acct, 1)).unwrap(), Some(1));
+    assert_eq!(
+        store.append_event(&new_event(&store, acct, 1)).unwrap(),
+        Some(1)
+    );
 }
 
 // ---- REGISTERED PUSH DEVICES -----------------------------------------
@@ -314,5 +346,131 @@ fn delete_device_by_token_is_scoped_and_idempotent() {
         !store
             .delete_device_by_token(acct, "ffff0000ffff0000")
             .unwrap()
+    );
+}
+
+#[test]
+fn arrival_arbitration_obeys_open_done_and_snooze_for_both_lanes() {
+    let (store, acct) = store();
+    for (id, state) in [(201, "opened"), (202, "done"), (203, "snoozed")] {
+        let event = new_event(&store, acct, id);
+        store
+            .set_triage(
+                id,
+                acct,
+                0,
+                Tier::Noise,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        match state {
+            "opened" => {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE triage SET opened_at=?1 WHERE message_id=?2",
+                        params![Utc::now().to_rfc3339(), id],
+                    )
+                    .unwrap();
+            }
+            "done" => {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE triage SET status='done' WHERE message_id=?1", [id])
+                    .unwrap();
+            }
+            _ => {
+                store
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE triage SET remind_at=?1 WHERE message_id=?2",
+                        params![(Utc::now() + chrono::Duration::days(1)).to_rfc3339(), id],
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.append_event(&event).unwrap(), None, "{state}");
+        let auth = NewEvent {
+            kind: EventKind::Urgent,
+            is_auth: true,
+            ..event
+        };
+        assert_eq!(
+            store.append_event(&auth).unwrap(),
+            None,
+            "auth after {state}"
+        );
+    }
+    assert!(store.events_after(acct, 0, 10).unwrap().is_empty());
+}
+
+#[test]
+fn dispatch_rechecks_user_actions_after_an_event_was_queued() {
+    let (store, acct) = store();
+    let event = new_event(&store, acct, 301);
+    store
+        .set_triage(
+            301,
+            acct,
+            0,
+            Tier::Noise,
+            Sensitivity::Normal,
+            None,
+            "",
+            "",
+            None,
+        )
+        .unwrap();
+    let id = store.append_event(&event).unwrap().unwrap();
+    assert!(store.notification_delivery_allowed(acct, id).unwrap());
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE triage SET opened_at=?1 WHERE message_id=301",
+            [Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+    assert!(!store.notification_delivery_allowed(acct, id).unwrap());
+    assert!(!store.notification_delivery_allowed(acct + 1, id).unwrap());
+    assert!(!store.notification_delivery_allowed(acct, id + 1).unwrap());
+    assert!(
+        store.event_by_id(acct, id).unwrap().is_some(),
+        "delivery suppression preserves the event audit trail"
+    );
+}
+
+#[test]
+fn explicit_auth_flag_round_trips_and_legacy_json_defaults_false() {
+    let (store, acct) = store();
+    let mut auth = new_event(&store, acct, 901);
+    auth.is_auth = true;
+    auth.sealed_kind = None;
+    let id = store.append_event(&auth).unwrap().unwrap();
+    let stored = store.event_by_id(acct, id).unwrap().unwrap();
+    assert!(stored.is_auth);
+    assert!(store.events_after(acct, 0, 10).unwrap()[0].is_auth);
+    let mut json = serde_json::to_value(stored).unwrap();
+    assert_eq!(json["is_auth"], true);
+    json.as_object_mut().unwrap().remove("is_auth");
+    assert!(!serde_json::from_value::<Event>(json).unwrap().is_auth);
+    let mut legacy = serde_json::to_value(auth).unwrap();
+    legacy.as_object_mut().unwrap().remove("is_auth");
+    assert!(!serde_json::from_value::<NewEvent>(legacy).unwrap().is_auth);
+    let ordinary = new_event(&store, acct, 902);
+    let ordinary_id = store.append_event(&ordinary).unwrap().unwrap();
+    assert!(
+        !store
+            .event_by_id(acct, ordinary_id)
+            .unwrap()
+            .unwrap()
+            .is_auth
     );
 }

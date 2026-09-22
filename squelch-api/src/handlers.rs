@@ -1,9 +1,8 @@
 //! `/client/*` handlers for the human door.
 //!
 //! Handlers are thin: validate params, call the store via `spawn_blocking`,
-//! serialize core types to JSON. Sealed handling lives in the store;
-//! [`reveal_sealed`] is the one place a sealed body is surfaced, and it audits
-//! before returning.
+//! serialize core types to JSON. Humans can read pending and restricted mail.
+//! External agents use the separate guarded routes in `agent.rs`.
 
 use axum::{
     Json,
@@ -18,8 +17,8 @@ use serde_json::json;
 use squelch_core::CoreError;
 use squelch_core::config::{CACHE_READ_INPUT_MULT, CACHE_WRITE_INPUT_MULT};
 use squelch_core::store::{
-    ActionMessageRef, Draft, FtsQuery, NewAuditEntry, SearchDiagnostics, SearchFilter, SearchSort,
-    SitrepBand, SpamScope, SqliteStore, Store,
+    ActionMessageRef, Draft, FtsQuery, NewAuditEntry, OutboundAttachmentMeta, SearchDiagnostics,
+    SearchFilter, SearchSort, SitrepBand, SpamScope, SqliteStore, Store,
 };
 use squelch_core::sync::{LABEL_INBOX, LABEL_SPAM, decode_raw_b64url, parse_internal_date};
 use squelch_core::triage::llm::Usage;
@@ -32,9 +31,10 @@ use std::time::Duration;
 
 use crate::error::ApiError;
 use crate::gmail_write::{
-    ForwardParts, GmailWriteClient, ReplyParts, SentRef, WriteError, addrs_excluding,
-    build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding, count_addrs,
-    derive_reply_recipients, forward_subject, parse_forwarded_original, reply_subject,
+    ForwardParts, GmailWriteClient, MailAttachment, ReplyParts, SentRef, WriteError,
+    addrs_excluding, build_forward_rfc822, build_references, build_reply_rfc822, cc_excluding,
+    count_addrs, derive_reply_recipients, forward_subject, mark_inline, parse_forwarded_original,
+    reply_subject,
 };
 use crate::group_send;
 use crate::guard;
@@ -227,19 +227,20 @@ pub async fn get_updates(
     // would report as seen exactly the mail they asked not to be shown yet.
     let peek = q.peek || pending_reminders;
 
+    let ranking = state.triage_config.ranking.clone();
     let items = store_call(&state, move |store, account_id| {
-        // attention_updates excludes sealed rows in SQL, and serves whichever
-        // side of the provider's spam verdict `spam` asked for. status/band/
-        // reminders filter server-side; tier and pagination apply over the
-        // ranked slice here.
-        let mut all = store.attention_updates(
+        use squelch_core::store::agent_triage::{AgentInventoryQuery, AgentTriageStore};
+        let mut all = store.human_agent_updates(
             account_id,
-            since,
-            min_importance,
-            status_filter,
-            band,
-            pending_reminders,
-            spam,
+            &AgentInventoryQuery {
+                since,
+                min_importance,
+                status: status_filter,
+                band,
+                pending_reminders,
+                spam,
+                ranking,
+            },
         )?;
         if let Some(t) = tier_filter {
             all.retain(|u| u.update.tier == t);
@@ -250,12 +251,8 @@ pub async fn get_updates(
             .take(limit as usize)
             .collect::<Vec<_>>();
 
-        // SEEN-LEDGER: the response carries the PRE-stamp surfaced_at, then this
-        // exact set is stamped (surfaced_at=now if NULL, new->open). Sealed rows
-        // cannot be in `page`, and mark_surfaced re-guards sensitivity anyway.
-        // `peek` skips the stamp entirely: same rows, no ledger write, because
-        // returning a row to an agent is not the same event as showing it to
-        // the user. This is the ONLY thing peek changes.
+        // Listing acknowledgement is distinct from opening a message. Pending
+        // and restricted mail remain available to the human, including surfacing.
         if !peek {
             let ids: Vec<i64> = page.iter().map(|u| u.update.id).collect();
             store.mark_surfaced(account_id, &ids)?;
@@ -293,7 +290,7 @@ pub async fn set_update_status(
     })
     .await?;
     if !updated {
-        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        // Missing or cross-account message.
         return Err(ApiError::not_found());
     }
 
@@ -344,7 +341,7 @@ pub async fn set_update_reminder(
     })
     .await?;
     if !updated {
-        // Missing OR sealed => NotFound, keeping the two indistinguishable.
+        // Missing or cross-account message.
         return Err(ApiError::not_found());
     }
 
@@ -438,9 +435,8 @@ pub struct RetriageBody {
     days: Option<u32>,
 }
 
-/// DEV RE-TRIAGE: reset LLM markers on the scoped rows so the pipeline re-runs.
-/// Rule-decided and sealed rows are never touched (store-level guard), and a
-/// sealed or unknown `message_id` resets 0 rows — indistinguishable by design.
+/// Queue durable investigations for the selected message or recent inbox.
+/// Existing decisions and explicit user state remain visible while work runs.
 pub async fn retriage(
     State(state): State<ApiState>,
     Json(body): Json<RetriageBody>,
@@ -536,6 +532,7 @@ struct ThreadMessageView {
 /// `ClientThreadView` on the wire, message-for-message, with the extra bit.
 #[derive(Debug, Serialize)]
 struct ThreadResponse {
+    cache_allowed: bool,
     thread_id: String,
     subject: String,
     messages: Vec<ThreadMessageView>,
@@ -576,6 +573,7 @@ pub async fn get_thread(
             });
         }
         Ok(ThreadResponse {
+            cache_allowed: store.external_thread_allowed(account_id, &thread_id)?,
             thread_id: view.thread_id,
             subject: view.subject,
             messages,
@@ -661,14 +659,13 @@ fn sanitize_attachment_filename(name: &str) -> String {
     }
 }
 
-/// Serve one attachment's raw bytes. The parent-message sealed guard lives in
-/// [`Store::attachment_bytes`]; this handler adds the header discipline (see
-/// [`safe_content_type`]) and the over-cap 410.
+/// Serve account-owned attachment bytes to the human. This handler adds safe
+/// response headers and reports unstored over-cap attachments with 410.
 pub async fn get_attachment(
     State(state): State<ApiState>,
     Path(attachment_id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    // `None` => unknown id OR sealed parent (indistinguishable): 404.
+    // Unknown or cross-account attachment: 404.
     let found = store_call(&state, move |store, account_id| {
         store.attachment_bytes(account_id, attachment_id)
     })
@@ -677,11 +674,33 @@ pub async fn get_attachment(
     // Metadata exists but the bytes were never stored (over the ingest cap): 410.
     let bytes =
         data.ok_or_else(|| ApiError::new(StatusCode::GONE, "attachment bytes not stored"))?;
+    Ok(attachment_response(
+        &filename,
+        &mime,
+        bytes,
+        "private, max-age=3600",
+    ))
+}
 
-    let ctype = safe_content_type(&mime);
+/// One attachment's bytes as a response, under the header discipline that IS
+/// the byte door's security story (see [`safe_content_type`]). Shared by the
+/// inbound door above and the staged-upload door below: a file the user
+/// attached themselves is served with exactly the caution a stranger's gets,
+/// because the byte endpoint cannot tell a screenshot from a renamed html.
+///
+/// `cache` is the door's own policy: the inbound door may let a browser keep
+/// a photo for an hour, the staged-upload door is `no-store` like every other
+/// read of an unsent composition.
+fn attachment_response(
+    filename: &str,
+    mime: &str,
+    bytes: Vec<u8>,
+    cache: &'static str,
+) -> Response {
+    let ctype = safe_content_type(mime);
     let disposition = format!(
         "attachment; filename=\"{}\"",
-        sanitize_attachment_filename(&filename)
+        sanitize_attachment_filename(filename)
     );
 
     // Built by hand, not via `Vec<u8>`'s IntoResponse, so we own the
@@ -704,9 +723,361 @@ pub async fn get_attachment(
     );
     h.insert(
         header::CACHE_CONTROL,
-        header::HeaderValue::from_static("private, max-age=3600"),
+        header::HeaderValue::from_static(cache),
     );
-    Ok(resp)
+    resp
+}
+
+// --- /client/compose/attachments --------------------------------------------
+//
+// FILES ON THEIR WAY OUT. The composer uploads each file the moment it is
+// attached, gets an id back, and every later request — the autosave, the send
+// — names the file by that id. HUMAN DOOR ONLY, like drafts: what somebody is
+// about to send is their own business until it is sent.
+//
+// Bytes travel as the REQUEST BODY, raw, with the metadata in the query string
+// and the `Content-Type` header — not as base64 inside JSON, which would put
+// a 25 MB file through a 34 MB JSON parse and a 2 MB default body limit. The
+// route carries its own body limit for the same reason.
+
+/// The most one staged file may hold. Gmail refuses a message over 25 MB, and
+/// [`MAX_SEND_ATTACHMENT_BYTES`] enforces that total at the send; a single file
+/// is capped at the same figure so the upload can refuse a file no send could
+/// ever carry rather than store it and refuse later.
+pub const MAX_OUTBOUND_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+/// The most a send's attachments may total, before base64 — Gmail's own
+/// message ceiling, and past it the send fails deep in Gmail as an opaque
+/// error that blames the wrong side.
+const MAX_SEND_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct StageAttachmentQuery {
+    filename: String,
+    /// The `cid:` token the composer will reference this file by, MINTED BY
+    /// THE CLIENT so it can write the reference into the body before the
+    /// upload lands. Optional: a client that sends none gets one minted here
+    /// and read back off the response. Validated against [`content_id_ok`]
+    /// either way — it is written into a MIME header and into html.
+    #[serde(default)]
+    content_id: Option<String>,
+}
+
+/// A `Content-ID` token this daemon will store and later write into a header:
+/// the address-ish alphabet, nothing that could close a quote, open a header
+/// line or end a `cid:` reference early. Same rule the markdown renderer
+/// applies before it lets a `cid:` image through (see `markdown::cid_token`).
+pub(crate) fn content_id_ok(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'@'))
+}
+
+/// The filename a staged file is stored — and later sent — under. Path
+/// separators and control characters go (the name reaches a
+/// `Content-Disposition` header and, on the recipient's side, a disk); everything
+/// else stays, unicode included, because the MIME writer speaks RFC 2231 and a
+/// `résumé.pdf` should arrive as one. Capped well under the MIME writer's own
+/// 80-character truncation so the stored name and the sent name are the same
+/// name.
+fn clean_upload_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return "attachment".to_string();
+    }
+    trimmed.chars().take(80).collect()
+}
+
+/// The mime a staged file is stored under: the bare `type/subtype` off the
+/// upload's `Content-Type`, lowercased, or `application/octet-stream` when the
+/// header is missing or not a media type at all. Parameters are dropped — a
+/// `charset` on a text upload would be a claim about bytes this daemon never
+/// transcoded, and the MIME writer states its own. A `multipart/*` claim is
+/// refused outright: a part declaring itself multipart with no boundary is a
+/// malformed message, and the file is served better as a blob.
+fn clean_upload_mime(header: Option<&str>) -> String {
+    const FALLBACK: &str = "application/octet-stream";
+    let Some(raw) = header else {
+        return FALLBACK.to_string();
+    };
+    let base = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let Some((kind, sub)) = base.split_once('/') else {
+        return FALLBACK.to_string();
+    };
+    let token_ok = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 127
+            && s.bytes().all(|b| {
+                b.is_ascii_alphanumeric()
+                    || matches!(
+                        b,
+                        b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                    )
+            })
+    };
+    if !token_ok(kind) || !token_ok(sub) || kind == "multipart" {
+        return FALLBACK.to_string();
+    }
+    base
+}
+
+/// What the client knows about a staged file: everything but the bytes.
+#[derive(Debug, Serialize)]
+pub struct OutboundAttachmentView {
+    id: i64,
+    filename: String,
+    mime: String,
+    size: i64,
+    content_id: String,
+}
+
+impl From<OutboundAttachmentMeta> for OutboundAttachmentView {
+    fn from(m: OutboundAttachmentMeta) -> Self {
+        Self {
+            id: m.id,
+            filename: m.filename,
+            mime: m.mime,
+            size: m.size_bytes,
+            content_id: m.content_id,
+        }
+    }
+}
+
+/// `POST /client/compose/attachments?filename=…[&content_id=…]` — stage one
+/// file for a send. The body is the file. Answers the stored metadata; the
+/// `id` is how the draft and the send refer to it from here on.
+///
+/// A file over [`MAX_OUTBOUND_ATTACHMENT_BYTES`] is a 413 from the body limit
+/// on the route, before this runs; the explicit check below is the belt for a
+/// caller that arrived some other way.
+pub async fn stage_compose_attachment(
+    State(state): State<ApiState>,
+    Query(q): Query<StageAttachmentQuery>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.len() > MAX_OUTBOUND_ATTACHMENT_BYTES {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "attachment is larger than 25 MB",
+        ));
+    }
+    if body.is_empty() {
+        return Err(ApiError::bad_request("attachment is empty"));
+    }
+    let filename = clean_upload_filename(&q.filename);
+    let mut mime = clean_upload_mime(
+        headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+    );
+    // A `text/*` PART GOES OUT DECLARED `charset="utf-8"` (the MIME writer
+    // states the charset of the bytes it is handed, which for a forward's
+    // decoded parts is always UTF-8). An upload's bytes are whatever the file
+    // held — a Windows-1252 `notes.txt`, a UTF-16 export — and stamping UTF-8
+    // on those would render as mojibake at the other end. A text file whose
+    // bytes are not UTF-8 is therefore stored as a blob: it arrives intact,
+    // and the recipient's client works out the encoding the way it would for
+    // any download.
+    if mime.starts_with("text/") && std::str::from_utf8(&body).is_err() {
+        mime = "application/octet-stream".to_string();
+    }
+    let content_id = match q.content_id.as_deref().map(str::trim) {
+        Some(token) if content_id_ok(token) => token.to_string(),
+        Some(_) => return Err(ApiError::bad_request("content_id must be a plain token")),
+        None => match squelch_core::tracking::mint_token() {
+            Ok(t) => format!("{t}@passband"),
+            Err(_) => {
+                return Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not mint a content id",
+                ));
+            }
+        },
+    };
+    let data = body.to_vec();
+    let meta = store_call(&state, move |store, account_id| {
+        store.stage_outbound_attachment(
+            account_id,
+            &filename,
+            &mime,
+            &content_id,
+            &data,
+            Utc::now(),
+        )
+    })
+    .await?;
+    Ok((no_store(), Json(OutboundAttachmentView::from(meta))))
+}
+
+/// `GET /client/compose/attachments/{id}` — one staged file's bytes, for the
+/// composer to draw a thumbnail of a file it did not upload in this session
+/// (a restored draft). Same headers as the inbound byte door.
+pub async fn get_compose_attachment(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    let found = store_call(&state, move |store, account_id| {
+        store.outbound_attachment(account_id, id)
+    })
+    .await?;
+    let att = found.ok_or_else(ApiError::not_found)?;
+    Ok(attachment_response(
+        &att.meta.filename,
+        &att.meta.mime,
+        att.data,
+        "no-store",
+    ))
+}
+
+/// `DELETE /client/compose/attachments/{id}` — a file removed from the tray.
+/// Another account's id and an unknown id are the same 404.
+pub async fn delete_compose_attachment(
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<impl IntoResponse, ApiError> {
+    let deleted = store_call(&state, move |store, account_id| {
+        store.delete_outbound_attachment(account_id, id)
+    })
+    .await?;
+    if deleted {
+        Ok(Json(json!({ "status": "deleted", "id": id })))
+    } else {
+        Err(ApiError::not_found())
+    }
+}
+
+/// The files a send names, loaded for composing. EVERY id must resolve: a
+/// staged file that is gone (swept, deleted, another account's) refuses the
+/// whole send rather than going out without it, because the sender reviewed a
+/// tray and the mail must carry what the tray showed. Duplicated ids collapse
+/// to one file — one row is one part.
+async fn load_send_attachments(
+    state: &ApiState,
+    ids: &[i64],
+    target: Option<String>,
+) -> Result<Vec<MailAttachment>, ApiError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut wanted: Vec<i64> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !wanted.contains(id) {
+            wanted.push(*id);
+        }
+    }
+    let count = wanted.len();
+    // METADATA FIRST. Every file passes the per-file cap on its own, so ten
+    // of them could be 250 MB — pulled through the store mutex just to be
+    // refused. The sizes say everything the refusals need to know.
+    let sizes = {
+        let wanted = wanted.clone();
+        store_call(state, move |store, account_id| {
+            store.outbound_attachment_sizes(account_id, &wanted)
+        })
+        .await?
+    };
+    if sizes.len() != count {
+        audit_action(state, "send", target, "rejected:attachment_missing").await;
+        return Err(ApiError::bad_request(
+            "an attached file is no longer staged; remove it and attach it again",
+        ));
+    }
+    let total: i64 = sizes.iter().map(|(_, size, _)| size).sum();
+    if total > MAX_SEND_ATTACHMENT_BYTES as i64 {
+        audit_action(state, "send", target, "rejected:too_large").await;
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "attachments total more than 25 MB",
+        ));
+    }
+    // TWO PARTS WITH ONE CONTENT-ID would leave the html's reference pointing
+    // at whichever the recipient's client picks. The token is client-minted,
+    // so a collision is a client bug — refused here, where it costs nothing,
+    // rather than shipped as a coin flip.
+    let mut cids: Vec<&str> = sizes.iter().map(|(_, _, cid)| cid.as_str()).collect();
+    cids.sort_unstable();
+    if cids.windows(2).any(|w| w[0] == w[1]) {
+        audit_action(state, "send", target, "rejected:attachment_cid_clash").await;
+        return Err(ApiError::bad_request(
+            "two attached files share a content id; remove one and attach it again",
+        ));
+    }
+    let rows = store_call(state, move |store, account_id| {
+        store.outbound_attachments(account_id, &wanted)
+    })
+    .await?;
+    if rows.len() != count {
+        audit_action(state, "send", target, "rejected:attachment_missing").await;
+        return Err(ApiError::bad_request(
+            "an attached file is no longer staged; remove it and attach it again",
+        ));
+    }
+    Ok(rows
+        .into_iter()
+        .map(|a| MailAttachment {
+            filename: a.meta.filename,
+            mime: a.meta.mime,
+            content_id: Some(a.meta.content_id),
+            // Decided later, against the rendered html — see `mark_inline`.
+            is_inline: false,
+            method: None,
+            data: a.data,
+        })
+        .collect())
+}
+
+/// The guard kinds found in the TEXT of a set of attachments. A PEM key
+/// pasted into `notes.txt` and dragged onto a mail is the same exfil shape as
+/// one pasted into the body — arguably the more natural one — so every
+/// `text/*` part is scanned as text, and so is every `message/*` part (an
+/// attached email is plain RFC822 text carrying whatever its bodies carried).
+/// BINARY PARTS STAY UNSCANNED (a key inside a zip passes): the guard is a
+/// seatbelt against the accident, not a DLP boundary, and it is overridable by
+/// design.
+fn attachment_text_kinds(attachments: &[MailAttachment]) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    for att in attachments {
+        let mime = att.mime.to_ascii_lowercase();
+        if !(mime.starts_with("text/") || mime.starts_with("message/")) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&att.data);
+        for kind in guard::scan_kinds(&text) {
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+    }
+    kinds
+}
+
+/// The staged files a send CONSUMED, dropped once the mail is away — the same
+/// contract as `discard_sent_draft`, and the same best-effort posture: the
+/// mail has left, so a failed cleanup is logged and never fails the request.
+async fn discard_sent_attachments(state: &ApiState, ids: Vec<i64>) {
+    if ids.is_empty() {
+        return;
+    }
+    if store_call(state, move |store, account_id| {
+        store.delete_outbound_attachments(account_id, &ids)
+    })
+    .await
+    .is_err()
+    {
+        eprintln!("squelch-api: staged attachments outlived their send; discard failed");
+    }
 }
 
 // --- GET /client/search -----------------------------------------------------
@@ -858,6 +1229,40 @@ struct SearchItem {
     legs: Vec<&'static str>,
 }
 
+/// Recall grows on demand. Remember delivered IDs because expanding RRF's
+/// candidate pool can change ranks; an offset alone would repeat or skip mail.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SearchResume {
+    seen: Vec<i64>,
+    k: usize,
+    done: bool,
+}
+
+impl SearchResume {
+    fn decode(raw: &str) -> Result<Self, ApiError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        if raw.len() > 16_384 {
+            return Err(ApiError::bad_request("invalid search cursor"));
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| ApiError::bad_request("invalid search cursor"))?;
+        let state: Self = serde_json::from_slice(&bytes)
+            .map_err(|_| ApiError::bad_request("invalid search cursor"))?;
+        if state.seen.len() > 600 || state.k > 600 {
+            return Err(ApiError::bad_request("invalid search cursor"));
+        }
+        Ok(state)
+    }
+    fn encode(&self) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!(
+            "recall:{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).expect("search cursor"))
+        )
+    }
+}
+
 /// The recall window semantic/hybrid rank before the page is cut out of it.
 ///
 /// With no filter it is exactly the page. With one, the filter is applied
@@ -894,7 +1299,20 @@ pub async fn search(
     if term.is_empty() && filter.is_empty() {
         return Err(ApiError::bad_request("q must not be empty"));
     }
-    let (limit, offset) = paginate(query.limit, query.cursor.as_deref())?;
+    let resume = query
+        .cursor
+        .as_deref()
+        .and_then(|c| c.strip_prefix("recall:"))
+        .map(SearchResume::decode)
+        .transpose()?;
+    let (limit, offset) = paginate(
+        query.limit,
+        if resume.is_some() {
+            None
+        } else {
+            query.cursor.as_deref()
+        },
+    )?;
 
     // Unknown values 400 rather than falling back to the default: a client that
     // sends `sort=newest` and silently gets `recent` has a bug it cannot see.
@@ -935,13 +1353,13 @@ pub async fn search(
     };
 
     let unfinished_first = query.unfinished_first;
-    // A fixed candidate window keeps the status seam stable between pages.
-    // Semantic recall remains bounded, as it is for the ordinary hybrid path.
-    let k = if unfinished_first {
-        600
-    } else {
-        recall_k(limit, offset, &filter)
-    };
+    let grouped_recall = unfinished_first && effective != SearchMode::Keyword;
+    if resume.is_some() && !grouped_recall {
+        return Err(ApiError::bad_request(
+            "recall cursor requires grouped recall",
+        ));
+    }
+    let k = recall_k(limit, offset, &filter);
     let partial = parse_partial(query.partial.as_deref())?;
 
     // PUNCTUATION IS NOT AN INVITATION TO LIST THE MAILBOX, in any mode.
@@ -972,123 +1390,134 @@ pub async fn search(
         }));
     }
 
-    // Keyword paginates and filters in SQL; semantic/hybrid rank a top-k window,
-    // filter the hydrated hits, and offset the fused slice. EVERY leg excludes
-    // sealed rows in SQL. The bool is the recall legs' WINDOW FULL signal (see
-    // below); the keyword leg paginates exactly, so it never needs one.
-    //
-    // The diagnostics are counted in the SAME store call, and told which leg
-    // ran: the keyword leg excludes the reader's own sent mail and the recall
-    // legs include it, so counts taken under the other rule would contradict
-    // the list they sit beside. They are counted AFTER the page, because the
-    // keyword page has already counted the strict set to place its own seam and
-    // hands that number over rather than have it walked a second time. NOT
-    // under the same LOCK, though: the page takes the store mutex and gives it
-    // back before the counts take it again, so an ingest landing between the
-    // two leaves the counts describing a mailbox one message newer than the
-    // page. Harmless, and written down because "the same store call" is easy to
-    // misread as "atomically".
+    // Human retrieval and diagnostics share the corpus policy below. A keyword
+    // page holds one lock across both status groups; diagnostics run afterward
+    // and may reflect newer mailbox state. Recall uses a bounded candidate pool.
     let queued_at = std::time::Instant::now();
-    let (items, window_full, diagnostics) = store_call(&state, move |store, account_id| {
+    let (items, window_full, diagnostics, recall_next) = store_call(&state, move |store, account_id| {
         let started = std::time::Instant::now();
         let queue_ms = queued_at.elapsed().as_millis();
-        let include_sent = effective != SearchMode::Keyword || unfinished_first;
+        let mut filter = filter;
+        filter.include_sent = effective != SearchMode::Keyword || unfinished_first;
+        filter.unfinished_first = unfinished_first;
+        let mut resume = resume.unwrap_or_default();
+        if grouped_recall {
+            filter.exclude_ids = resume.seen.clone();
+            if resume.done { filter.done = Some(true); }
+        }
+        let mut current_k = k.max(resume.k).max(resume.seen.len().saturating_add(limit as usize)).min(600);
         // The strict count worth sharing, and only when it answers the same
         // question the diagnostics ask: no operator predicates. With a `from:`
         // or a date bound the page counted a narrower set, and the two deserve
         // their own counts.
+        let page_limit = if grouped_recall { limit.min(600 - resume.seen.len() as u32) } else { limit };
         let mut counted_strict = None;
-        let (items, window_full): (Vec<SearchItem>, bool) = match effective {
-            SearchMode::Keyword => {
-                let (hits, strict) = if unfinished_first {
-                    (
-                        store.search_unfinished_first(
+        let (items, window_full): (Vec<SearchItem>, bool) = loop {
+            let (items, window_full): (Vec<SearchItem>, bool) = match effective {
+                SearchMode::Keyword => {
+                    let (hits, strict) = if unfinished_first {
+                        (
+                            store.search_unfinished_first(
+                                account_id, &term, &filter, sort, partial, limit, offset,
+                            )?,
+                            None,
+                        )
+                    } else {
+                        store.search_filtered_counted(
                             account_id, &term, &filter, sort, partial, limit, offset,
-                        )?,
-                        None,
+                        )?
+                    };
+                    if filter.is_empty() {
+                        counted_strict = strict;
+                    }
+                    // A filter-only listing retrieved nothing: no MATCH ran, no
+                    // ranking happened, and the rows are simply this account's
+                    // newest mail. `legs` is provenance, so it is empty.
+                    let legs: Vec<&'static str> = if ranks_on_text {
+                        vec!["keyword"]
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        hits.into_iter()
+                            .map(|hit| SearchItem {
+                                hit,
+                                legs: legs.clone(),
+                            })
+                            .collect(),
+                        false,
                     )
-                } else {
-                    store.search_filtered_counted(
-                        account_id, &term, &filter, sort, partial, limit, offset,
-                    )?
-                };
-                if filter.is_empty() {
-                    counted_strict = strict;
                 }
-                // A filter-only listing retrieved nothing: no MATCH ran, no
-                // ranking happened, and the rows are simply this account's
-                // newest mail. `legs` is provenance, so it is empty.
-                let legs: Vec<&'static str> = if ranks_on_text {
-                    vec!["keyword"]
-                } else {
-                    Vec::new()
-                };
-                (
-                    hits.into_iter()
+                SearchMode::Semantic => {
+                    let (mut hits, window_full) =
+                        store.semantic_search_hits(account_id, &term, &filter, sort, partial, current_k)?;
+                    let page: Vec<SearchItem> = hits
+                        .drain(..)
+                        .skip(offset as usize)
+                        .take(page_limit as usize)
                         .map(|hit| SearchItem {
                             hit,
-                            legs: legs.clone(),
+                            legs: vec!["vector"],
                         })
-                        .collect(),
-                    false,
-                )
-            }
-            SearchMode::Semantic => {
-                let (mut hits, window_full) =
-                    store.semantic_search_hits(account_id, &term, &filter, sort, partial, k)?;
-                if unfinished_first {
-                    hits.sort_by_key(|hit| hit.is_done);
+                        .collect();
+                    (page, window_full)
                 }
-                let page: Vec<SearchItem> = hits
-                    .drain(..)
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .map(|hit| SearchItem {
-                        hit,
-                        legs: vec!["vector"],
-                    })
-                    .collect();
-                (page, window_full)
+                SearchMode::Hybrid => {
+                    // The range is counted after filtering, exactly like the page
+                    // below. Only rows the client receives need match snippets.
+                    let start = offset as usize;
+                    let (mut hits, window_full) = store.hybrid_search_legs_ordered(
+                        account_id,
+                        &term,
+                        &filter,
+                        sort,
+                        partial,
+                        start..start.saturating_add(page_limit as usize),
+                        current_k,
+                    )?;
+                    let page: Vec<SearchItem> = hits
+                        .drain(..)
+                        .skip(offset as usize)
+                        .take(page_limit as usize)
+                        .map(|h| {
+                            let mut legs = Vec::with_capacity(2);
+                            if h.keyword {
+                                legs.push("keyword");
+                            }
+                            if h.vector {
+                                legs.push("vector");
+                            }
+                            SearchItem { hit: h.hit, legs }
+                        })
+                        .collect();
+                    (page, window_full)
+                }
+            };
+            // A first page containing enough unfinished hits needs no larger pool.
+            // Before crossing into done mail, exhaust the bounded recall window.
+            let unfinished = items.iter().filter(|item| !item.hit.is_done).count();
+            if grouped_recall && window_full && current_k < 600
+                && (items.len() < limit as usize || (!resume.done && unfinished < limit as usize)) {
+                current_k = (current_k * 2).max(current_k + limit as usize).min(600);
+                continue;
             }
-            SearchMode::Hybrid => {
-                // The range is counted after filtering, exactly like the page
-                // below. Only rows the client receives need match snippets.
-                let start = offset as usize;
-                let (mut hits, window_full) = store.hybrid_search_legs_ordered(
-                    account_id,
-                    &term,
-                    &filter,
-                    sort,
-                    partial,
-                    start..start.saturating_add(limit as usize),
-                    k,
-                    unfinished_first,
-                )?;
-                let page: Vec<SearchItem> = hits
-                    .drain(..)
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .map(|h| {
-                        let mut legs = Vec::with_capacity(2);
-                        if h.keyword {
-                            legs.push("keyword");
-                        }
-                        if h.vector {
-                            legs.push("vector");
-                        }
-                        SearchItem { hit: h.hit, legs }
-                    })
-                    .collect();
-                (page, window_full)
-            }
+            break (items, window_full);
         };
+        let recall_next = if grouped_recall && !items.is_empty() {
+            resume.k = current_k;
+            resume.done |= items.iter().any(|item| item.hit.is_done);
+            resume.seen.extend(items.iter().map(|item| item.hit.id));
+            if resume.seen.len() < 600 && (items.len() == limit as usize || window_full) {
+                Some(resume.encode())
+            } else { None }
+        } else { None };
         let retrieval_ms = started.elapsed().as_millis();
         let diagnostics_started = std::time::Instant::now();
         let diagnostics = store.search_diagnostics_with(
             account_id,
             &term,
             partial,
-            include_sent,
+            filter.include_sent,
             counted_strict,
         )?;
         if queued_at.elapsed().as_millis() >= 250 {
@@ -1096,7 +1525,7 @@ pub async fn search(
                 effective.as_str(), diagnostics_started.elapsed().as_millis(),
                 queued_at.elapsed().as_millis(), items.len());
         }
-        Ok((items, window_full, diagnostics))
+        Ok((items, window_full, diagnostics, recall_next))
     })
     .await?;
 
@@ -1107,12 +1536,16 @@ pub async fn search(
     // sequence, and ranking is deterministic). A short page that served
     // NOTHING ends the walk even window-full: the same offset would rebuild
     // the same window and hand the client the same empty page forever.
-    let next = match next_cursor(items.len(), limit, offset) {
-        Some(cursor) => Some(cursor),
-        None if window_full && !items.is_empty() => {
-            Some(cursor::encode_offset(offset + items.len() as u32))
+    let next = if grouped_recall {
+        recall_next
+    } else {
+        match next_cursor(items.len(), limit, offset) {
+            Some(cursor) => Some(cursor),
+            None if window_full && !items.is_empty() => {
+                Some(cursor::encode_offset(offset + items.len() as u32))
+            }
+            None => None,
         }
-        None => None,
     };
     Ok(Json(SearchPage {
         items,
@@ -1614,6 +2047,10 @@ struct DraftView {
     bcc: String,
     subject: String,
     body: String,
+    /// The files this draft holds, upload order. Always present — `[]` when
+    /// there are none — so a client tells "no files" from a daemon too old to
+    /// stage any by the key's absence.
+    attachments: Vec<OutboundAttachmentView>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1628,6 +2065,11 @@ impl From<Draft> for DraftView {
             bcc: d.bcc_addr,
             subject: d.subject,
             body: d.body,
+            attachments: d
+                .attachments
+                .into_iter()
+                .map(OutboundAttachmentView::from)
+                .collect(),
             created_at: d.created_at,
             updated_at: d.updated_at,
         }
@@ -1778,6 +2220,12 @@ pub struct DraftBody {
     subject: Option<String>,
     #[serde(default)]
     body: Option<String>,
+    /// The staged files this draft holds — EXACTLY these, so a file removed
+    /// from the tray is released by the next save. ABSENT leaves the claims
+    /// alone (a client that predates staging never touches them); `[]` releases
+    /// every file the draft held.
+    #[serde(default)]
+    attachment_ids: Option<Vec<i64>>,
 }
 
 /// `PUT /client/drafts` — save the draft for one key (reply target, or the
@@ -1786,11 +2234,8 @@ pub async fn put_draft(
     State(state): State<ApiState>,
     Json(body): Json<DraftBody>,
 ) -> Result<impl IntoResponse, ApiError> {
-    // No draft is ever SAVED against sealed mail: the parent is resolved through
-    // the same lookup `send` uses, where sealed and unknown are one 404. A
-    // POST-HOC seal (hand correction, or a re-ingest that trips detection) is the
-    // store's job — both seal paths delete the drafts keyed to that message, and
-    // `list_drafts` filters a sealed parent as a belt.
+    // Resolve ownership independently from external-agent access. A human may
+    // draft a reply to any of their messages, including authentication mail.
     if let Some(parent) = body.reply_to_message_id {
         resolve_target(&state, parent).await?;
     }
@@ -1801,8 +2246,9 @@ pub async fn put_draft(
     let subject = body.subject.unwrap_or_default();
     let text = body.body.unwrap_or_default();
 
+    let attachment_ids = body.attachment_ids;
     let draft = store_call(&state, move |store, account_id| {
-        store.upsert_draft(
+        let mut draft = store.upsert_draft(
             account_id,
             reply_to,
             squelch_core::store::DraftFields {
@@ -1813,7 +2259,16 @@ pub async fn put_draft(
                 body: &text,
             },
             Utc::now(),
-        )
+        )?;
+        // Claim under the same store call, then re-read: the row the upsert
+        // returned was read before the claim and would list the OLD files.
+        if let Some(ids) = attachment_ids {
+            store.claim_outbound_attachments(account_id, draft.id, &ids, Utc::now())?;
+            if let Some(fresh) = store.draft_by_id(account_id, draft.id)? {
+                draft = fresh;
+            }
+        }
+        Ok(draft)
     })
     .await?;
     Ok((no_store(), Json(DraftView::from(draft))))
@@ -2146,6 +2601,11 @@ pub async fn get_stats(State(state): State<ApiState>) -> Result<impl IntoRespons
     // never happens quietly. Always present, so a client reads an answer rather
     // than absence — an old daemon omits the key, which is the `false` case.
     body["forwarding"] = json!(true);
+    // And for attachments: whether `attachment_ids` on a send and on a draft
+    // mean anything here. Same silent-failure shape as forwarding — an old
+    // daemon ignores the key and mails the words without the files — so the
+    // client gates the attach affordances on this.
+    body["compose_attachments"] = json!(true);
     Ok(Json(body))
 }
 
@@ -2309,7 +2769,9 @@ pub async fn get_usage(
                 state.stage2_price_in_per_mtok,
                 state.stage2_price_out_per_mtok,
             )
-        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY {
+        } else if name == squelch_core::metrics::NOTIFY_USAGE_CATEGORY
+            || name == squelch_core::triage::access::USAGE_CATEGORY
+        {
             (
                 state.notify_model.as_ref(),
                 state.notify_price_in_per_mtok,
@@ -2388,6 +2850,7 @@ pub async fn get_mail_activity(
                 "deadline": r.deadline,
                 "signal": r.signal,
                 "noise": r.noise,
+                "pending": r.pending,
             })
         })
         .collect();
@@ -2473,6 +2936,16 @@ async fn triage_config_body(state: &ApiState) -> Result<serde_json::Value, ApiEr
         "thread_daily_cap": thread,
         "sender_daily_cap": sender,
         "global_daily_cap": global,
+        "agent": {
+            "budget_unit": "bounded_investigation",
+            "daily_run_cap": state.triage_config.agent.daily_run_cap,
+            "effective_daily_run_cap": state.triage_config.agent.daily_run_cap,
+            "background_daily_run_cap": state.triage_config.agent.background_daily_run_cap,
+            "effective_background_daily_run_cap": state.triage_config.agent.effective_background_daily_run_cap(),
+            "reserved_arrival_runs": state.triage_config.agent.daily_run_cap - state.triage_config.agent.effective_background_daily_run_cap(),
+            "max_model_turns": state.triage_config.agent.max_model_turns,
+            "legacy_stage_caps_are_active_ceilings": false,
+        },
         "sources": {
             "thread_daily_cap": cap_source_str(overrides.thread_daily_cap.is_some(), src.thread_daily_cap),
             "sender_daily_cap": cap_source_str(overrides.sender_daily_cap.is_some(), src.sender_daily_cap),
@@ -2999,6 +3472,13 @@ pub struct SendBody {
     /// `GET /client/tracking-config`, not from a refused send.
     #[serde(default)]
     include_tracker: Option<bool>,
+    /// The staged files this send carries (see `/client/compose/attachments`),
+    /// in tray order. Every id must still resolve or the send is refused: the
+    /// tray the sender reviewed is the contract. Which of them go INLINE is not
+    /// stated here — a file is inline exactly when the body references its
+    /// `cid:`, decided once against the rendered html (`mark_inline`).
+    #[serde(default)]
+    attachment_ids: Vec<i64>,
 }
 
 /// ECHO the just-sent message into the local store so the thread view shows the
@@ -3270,6 +3750,7 @@ async fn finish_send(
     outcome: String,
     tracker: Option<(String, String)>,
     draft_id: Option<i64>,
+    attachment_ids: &[i64],
     target: Option<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     match client.send(raw, thread_id.as_deref()).await {
@@ -3280,6 +3761,7 @@ async fn finish_send(
             if let Some(draft_id) = draft_id {
                 discard_sent_draft(state, draft_id).await;
             }
+            discard_sent_attachments(state, attachment_ids.to_vec()).await;
             audit_action(state, "send", target.clone(), &outcome).await;
             let echo_message_id = echo_sent(state, client, target, &sent).await;
             if let (Some((token, _)), Some(message_id)) = (&tracker, echo_message_id) {
@@ -3387,7 +3869,17 @@ pub async fn action_send(
     //
     // ONE VERDICT FOR A FAN-OUT TOO: it is one composition, so it is asked about
     // once here and never again per recipient.
-    let matches = guard::scan_kinds(&body.body);
+    //
+    // THE FILES ARE READ FIRST, so a send naming a file that is gone is refused
+    // before the guard spends anything — and so the guard can read them: a
+    // text attachment is scanned exactly as a forward's would be.
+    let attachments = load_send_attachments(&state, &body.attachment_ids, target.clone()).await?;
+    let mut matches = guard::scan_kinds(&body.body);
+    for kind in attachment_text_kinds(&attachments) {
+        if !matches.contains(&kind) {
+            matches.push(kind);
+        }
+    }
     if body.forward_of_message_id.is_none()
         && let Some(err) =
             guard_verdict(&state, &matches, body.override_guard, target.clone()).await
@@ -3404,7 +3896,16 @@ pub async fn action_send(
     };
 
     if let Some(original_id) = body.forward_of_message_id {
-        return forward_send(&state, &body, &client, target, original_id, matches).await;
+        return forward_send(
+            &state,
+            &body,
+            &client,
+            target,
+            original_id,
+            matches,
+            attachments,
+        )
+        .await;
     }
 
     // A GROUP SEND resolves its audience here, once, after the guard has cleared
@@ -3417,7 +3918,7 @@ pub async fn action_send(
     if let Some(audience) = &audience
         && audience.mode == GroupMode::Individual
     {
-        return fan_out_send(&state, &body, audience).await;
+        return fan_out_send(&state, &body, audience, attachments).await;
     }
 
     let (parent, thread_id) = match body.reply_to_message_id {
@@ -3566,6 +4067,14 @@ pub async fn action_send(
     // Kept back for the group-send record, which is written after `subject` has
     // moved into the MIME parts.
     let subject_for_record = subject.clone();
+    let body_html = match body.body_format.as_deref() {
+        Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
+        _ => None,
+    };
+    // Inline exactly when the html points at it; decided here, once, against
+    // the html that actually goes out.
+    let mut attachments = attachments;
+    mark_inline(&mut attachments, body_html.as_deref());
     let parts = ReplyParts {
         to,
         cc: Some(cc).filter(|s| !s.trim().is_empty()),
@@ -3574,11 +4083,9 @@ pub async fn action_send(
         body: body.body.clone(),
         in_reply_to,
         references,
-        body_html: match body.body_format.as_deref() {
-            Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
-            _ => None,
-        },
+        body_html,
         pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
+        attachments,
     };
     let raw = match build_reply_rfc822(&parts) {
         Ok(r) => r,
@@ -3615,6 +4122,7 @@ pub async fn action_send(
         outcome,
         tracker,
         body.draft_id,
+        &body.attachment_ids,
         target,
     )
     .await;
@@ -3643,6 +4151,7 @@ async fn fan_out_send(
     state: &ApiState,
     body: &SendBody,
     audience: &group_send::GroupAudience,
+    attachments: Vec<MailAttachment>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let target = Some(audience.group_id.to_string());
     let subject = body
@@ -3668,7 +4177,14 @@ async fn fan_out_send(
             _ => None,
         },
         pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
+        attachments: Vec::new(),
     };
+    // One copy of the files for the whole batch, marked once against the one
+    // html every member gets.
+    let mut plan = plan;
+    let mut attachments = attachments;
+    mark_inline(&mut attachments, plan.body_html.as_deref());
+    plan.attachments = attachments;
     let recipients = plan.audience.addrs.len();
 
     let group_send_id = match group_send::start(state, plan).await {
@@ -3683,10 +4199,12 @@ async fn fan_out_send(
     };
 
     // The composition is away as far as the composer is concerned, so its draft
-    // goes with it — the same contract every other successful send has.
+    // goes with it — the same contract every other successful send has. The
+    // files too: the batch holds its own copy of their bytes.
     if let Some(draft_id) = body.draft_id {
         discard_sent_draft(state, draft_id).await;
     }
+    discard_sent_attachments(state, body.attachment_ids.clone()).await;
 
     Ok(Json(json!({
         "status": "sending",
@@ -3734,6 +4252,7 @@ async fn forward_send(
     target: Option<String>,
     original_id: i64,
     note_kinds: Vec<&'static str>,
+    attachments: Vec<MailAttachment>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Sealed and unknown ids are the same 404 every message-target route returns.
     let original_ref = match resolve_target(state, original_id).await {
@@ -3760,8 +4279,11 @@ async fn forward_send(
     };
     // A forward of a 25 MB message is a memory spike and then an opaque failure
     // (see [`MAX_FORWARD_RAW_BYTES`]). Checked on the DECODED length, before the
-    // parse allocates its own copy of every part.
-    if forward_raw_too_large(raw.len()) {
+    // parse allocates its own copy of every part — and counting the sender's
+    // own staged files, which ride in the same message and were each under
+    // the cap on their own.
+    let staged: usize = attachments.iter().map(|a| a.data.len()).sum();
+    if forward_raw_too_large(raw.len() + staged) {
         audit_action(state, "send", target, "rejected:too_large").await;
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -3842,6 +4364,18 @@ async fn forward_send(
     // Last thing before composing, so every rejection above costs no token.
     let tracker = mint_tracker(state, body.include_tracker.unwrap_or(false), target.clone()).await;
 
+    let note_html = match body.body_format.as_deref() {
+        Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
+        _ => None,
+    };
+    // THE SENDER'S OWN FILES RIDE BESIDE THE ORIGINAL'S, after them, as more
+    // parts of the same mixed. Inline is decided against the note's html — the
+    // original's own inline parts were flagged by the parser and are not
+    // re-judged.
+    let mut original = original;
+    let mut attachments = attachments;
+    mark_inline(&mut attachments, note_html.as_deref());
+    original.attachments.extend(attachments);
     let parts = ForwardParts {
         to,
         // Stated or nothing: a forward derives NOTHING about its audience from
@@ -3851,10 +4385,7 @@ async fn forward_send(
         bcc: body.bcc.clone().filter(|s| !s.trim().is_empty()),
         subject,
         note: body.body.clone(),
-        note_html: match body.body_format.as_deref() {
-            Some("markdown") => Some(crate::markdown::render_email_html(&body.body)),
-            _ => None,
-        },
+        note_html,
         pixel_url: tracker.as_ref().map(|(_, url)| url.clone()),
         original,
     };
@@ -3893,6 +4424,7 @@ async fn forward_send(
         outcome,
         tracker,
         body.draft_id,
+        &body.attachment_ids,
         target,
     )
     .await
@@ -4373,6 +4905,62 @@ pub async fn unsubscribe_resolution(
     )
     .await;
     Ok(Json(json!({ "sender": sender, "resolution": resolution })))
+}
+
+#[cfg(test)]
+mod upload_policy_tests {
+    use super::*;
+
+    #[test]
+    fn filenames_are_names_and_bounded() {
+        assert_eq!(clean_upload_filename("../../evil.txt"), "....evil.txt");
+        assert_eq!(clean_upload_filename("a\\b/c.pdf"), "abc.pdf");
+        assert_eq!(clean_upload_filename("  spaced.png  "), "spaced.png");
+        assert_eq!(clean_upload_filename("ctl\u{7}chars\n.txt"), "ctlchars.txt");
+        assert_eq!(clean_upload_filename(""), "attachment");
+        assert_eq!(clean_upload_filename("   "), "attachment");
+        assert_eq!(
+            clean_upload_filename("résumé.pdf"),
+            "résumé.pdf",
+            "unicode stays"
+        );
+        let long = "x".repeat(200) + ".pdf";
+        assert_eq!(clean_upload_filename(&long).chars().count(), 80);
+    }
+
+    #[test]
+    fn mimes_are_bare_media_types_or_a_blob() {
+        assert_eq!(clean_upload_mime(Some("image/PNG; charset=x")), "image/png");
+        assert_eq!(clean_upload_mime(None), "application/octet-stream");
+        assert_eq!(
+            clean_upload_mime(Some("nonsense")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            clean_upload_mime(Some("multipart/mixed; boundary=b")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            clean_upload_mime(Some("text/plain\r\nX: y")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            clean_upload_mime(Some("application/vnd.ms-excel")),
+            "application/vnd.ms-excel"
+        );
+    }
+
+    #[test]
+    fn content_ids_are_a_bounded_header_safe_alphabet() {
+        assert!(content_id_ok("a1b2-c3_d4.e5@passband"));
+        assert!(!content_id_ok(""));
+        assert!(!content_id_ok("a b"));
+        assert!(!content_id_ok("a\"b"));
+        assert!(!content_id_ok("a>b"));
+        assert!(!content_id_ok("a/b"));
+        assert!(content_id_ok(&"a".repeat(128)));
+        assert!(!content_id_ok(&"a".repeat(129)));
+    }
 }
 
 #[cfg(test)]

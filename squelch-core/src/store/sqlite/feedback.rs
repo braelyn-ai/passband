@@ -19,8 +19,7 @@ impl SqliteStore {
                         t.retriage_at
                  FROM triage t
                  JOIN messages m ON m.id = t.message_id
-                 WHERE t.account_id = ?1 AND t.message_id = ?2
-                   AND COALESCE(t.sensitivity, 'normal') = 'normal'",
+                 WHERE t.account_id = ?1 AND t.message_id = ?2",
                 params![account_id, message_id],
                 |r| {
                     Ok(TriageDebug {
@@ -137,142 +136,35 @@ impl SqliteStore {
             "matched_rule_id": matched_rule_id,
         });
 
-        // Apply the correction and stamp the row HUMAN-DECIDED: 'human' in the
-        // model columns takes it out of both LLM queue predicates, so a later
-        // pass cannot overwrite the person who corrected it and make the
-        // feedback dataset record corrections that never stuck.
+        // The compatibility endpoint expresses a direct user correction. Store
+        // only that field in the new decision; unrelated reasoning stays live.
+        let (field, value) = match axis {
+            TriageAxis::Tier => ("show_in_fye", serde_json::json!(to_value != "noise")),
+            TriageAxis::Sensitivity => ("external_access", serde_json::json!(to_value == "sealed")),
+            TriageAxis::Category => {
+                let kind = match to_value {
+                    "marketing" => "promotional",
+                    "invoice" | "autopay_bill" => "bill",
+                    "banking_statement" | "transaction_alert" => "financial_update",
+                    _ => "general",
+                };
+                ("kinds", serde_json::json!([kind]))
+            }
+        };
+        super::agent_triage::correct_agent_triage_conn(
+            &tx, account_id, message_id, field, &value, now,
+        )?;
+        // Retain compatibility diagnostics only. These columns never control
+        // placement or external access in the new pipeline.
         let column = match axis {
             TriageAxis::Tier => "tier",
             TriageAxis::Category => "category",
             TriageAxis::Sensitivity => "sensitivity",
         };
         tx.execute(
-            &format!(
-                "UPDATE triage
-                 SET {column} = ?3,
-                     stage1_model_used = 'human',
-                     model_used = 'human',
-                     needs_stage2 = 0
-                 WHERE account_id = ?1 AND message_id = ?2"
-            ),
+            &format!("UPDATE triage SET {column}=?3 WHERE account_id=?1 AND message_id=?2"),
             params![account_id, message_id, to_value],
         )?;
-
-        // SEALING has consequences beyond the one column: sealed rows carry a
-        // NULL category and the specialist tables hold no sealed rows BY
-        // CONSTRUCTION. Sealing a row that was already categorized and extracted
-        // would falsify both and leave the message in the Marketing/Banking zones
-        // while the Auth page also claims it, so drop the category and the
-        // extracted rows.
-        if matches!(axis, TriageAxis::Sensitivity) && to_value == "sealed" {
-            tx.execute(
-                "UPDATE triage SET category = NULL, extractor_model_used = NULL,
-                        ship_extract_model = NULL
-                 WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            tx.execute(
-                "DELETE FROM marketing WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            tx.execute(
-                "DELETE FROM banking WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            // AND THE RECEIPT, which was missing from this list. It is the same
-            // shape as the two above — a specialist row holding a merchant and
-            // an amount lifted straight out of the mail — and it renders on the
-            // Receipts zone of the Sitrep, so leaving it kept sealed-derived
-            // money on a card the seal exists to clear.
-            tx.execute(
-                "DELETE FROM receipts WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            // AND THE CALENDAR ROW, missing for the same reason and carrying the
-            // same kind of thing: an event title and an ORGANISER'S NAME lifted
-            // out of the mail, rendered by GET /client/calendar.
-            // `list_calendar_updates` still says "No sealed filter needed:
-            // detection never runs on sealed mail" — true of the first ingest
-            // and not of a message sealed afterwards, which is this block.
-            tx.execute(
-                "DELETE FROM calendar_updates WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            // Shipments are keyed by tracking number, not message, so the row
-            // outlives any one email — but its item name, status, and click
-            // target all came from the mail that fed it. When the row's latest
-            // feeder is the message being sealed, the whole row goes: nulling
-            // the pointer would keep sealed-derived content on a Sitrep card.
-            // Losing a card a legit earlier email also fed is the cost of the
-            // seal, same as the draft below.
-            tx.execute(
-                "DELETE FROM shipments WHERE account_id = ?1 AND last_message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            // AND THE NAMES IT MERELY DONATED. The delete above only reaches rows
-            // whose LATEST feeder is this message, but three extractor paths write
-            // an item name onto a row a DIFFERENT message feeds (a promoted staged
-            // order, the order-reference adoption, the thread adoption). Without
-            // this, text extracted from mail the user just called auth keeps
-            // rendering on the Sitrep and both doors — the exact leak the delete
-            // above exists to prevent. `item_name_msg` names the message whose
-            // extraction supplied the CURRENT name, so scrubbing by it is exact:
-            // the package survives (it is someone else's row), only the sealed
-            // mail's words go. `item_name_source` goes back to 'regex' with it:
-            // a source marker whose NAME is gone would otherwise lock the row
-            // out of ever taking a regex-extracted name again.
-            tx.execute(
-                "UPDATE shipments SET item_name = '', item_name_msg = NULL,
-                     item_name_source = 'regex'
-                 WHERE account_id = ?1 AND item_name_msg = ?2",
-                params![account_id, message_id],
-            )?;
-            // Staged orders go with them, for the same reason and with less to
-            // weigh: a `shipment_orders` row is nothing BUT mail-derived content
-            // (order reference, item name, thread) and carries no poll state.
-            tx.execute(
-                "DELETE FROM shipment_orders WHERE account_id = ?1 AND last_message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            // Same donation hole one table over: a staging row's pointer moves to
-            // the latest mail about that order, so a name an earlier one wrote
-            // outlives its seal unless it is scrubbed by provenance too.
-            tx.execute(
-                "UPDATE shipment_orders SET item_name = '', item_name_msg = NULL
-                 WHERE account_id = ?1 AND item_name_msg = ?2",
-                params![account_id, message_id],
-            )?;
-            // And the LOCAL DRAFT replying to it, for the same reason: `put_draft`
-            // refuses a sealed parent, so a draft keyed to one is a row the human
-            // door would never have accepted, and it quotes mail the user has just
-            // decided is auth. Discarding a composition is the cost of the seal.
-            tx.execute(
-                "DELETE FROM drafts WHERE account_id = ?1 AND reply_to_message_id = ?2",
-                params![account_id, message_id],
-            )?;
-            // And the NOTIFICATION EVENT, if one was already emitted: its
-            // sender + one_line snapshot replays to every client cursor forever,
-            // including onto a lock screen, and sealed content must not reach a
-            // notification surface.
-            //
-            // REDACT, NEVER DELETE. `events.id` is `INTEGER PRIMARY KEY` without
-            // AUTOINCREMENT, so it is the rowid and SQLite hands the largest free
-            // one to the next insert — deleting the newest event would let the
-            // next `append_event` REUSE that id, and every durable cursor already
-            // past it would skip that event permanently. The row stays and only
-            // its CONTENT goes; a replaying client renders its generic fallback.
-            //
-            // `sealed_kind` is deliberately NOT cleared: it carries no content
-            // at all (it is routing metadata, one of five constants) and its
-            // whole job is to point a tap at the reveal flow instead of a thread
-            // fetch the human door now 404s. NULLing it on the row a human just
-            // sealed would break exactly the case it exists for.
-            tx.execute(
-                "UPDATE events SET sender = '', one_line = '', deadline = NULL
-                 WHERE account_id = ?1 AND message_id = ?2",
-                params![account_id, message_id],
-            )?;
-        }
 
         let original_s = original.to_string();
         tx.execute(

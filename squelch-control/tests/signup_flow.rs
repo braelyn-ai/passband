@@ -81,6 +81,13 @@ struct MockTenant {
 /// actually received.
 #[derive(Default)]
 struct Recorder {
+    /// When set, the replace route records the install and then answers this
+    /// status instead of confirming the rollout: the warden's side of an
+    /// outcome control cannot settle (503), or one it must not retry (401).
+    reconnect_status_after_install: Option<u16>,
+    /// When set, the replace route takes this long to answer, so a test can
+    /// land a second consent while the first is in flight.
+    reconnect_delay: Option<Duration>,
     /// Form fields of the token exchange.
     token_form: Vec<(String, String)>,
     /// Bodies posted to `POST /v1/tenants` (call 1).
@@ -277,6 +284,10 @@ async fn spawn_warden(rec: Shared) -> String {
                  headers: HeaderMap,
                  body: String| async move {
                     let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let delay = rec.lock().unwrap().reconnect_delay;
+                    if let Some(delay) = delay {
+                        tokio::time::sleep(delay).await;
+                    }
                     let mut r = rec.lock().unwrap();
                     r.warden_bearers.push(bearer_of(&headers));
                     let account_email = str_field(&parsed, "account_email");
@@ -299,6 +310,12 @@ async fn spawn_warden(rec: Shared) -> String {
                         return json_status(StatusCode::CONFLICT, "not_serving");
                     }
                     r.credential_puts.push((label.clone(), parsed));
+                    if let Some(status) = r.reconnect_status_after_install {
+                        return json_status(
+                            StatusCode::from_u16(status).unwrap(),
+                            "rollout_pending",
+                        );
+                    }
                     (
                         StatusCode::OK,
                         Json(json!({
@@ -854,7 +871,7 @@ impl Harness {
     async fn run_reconnect(&self) -> (StatusCode, String) {
         let (consent, cookie) = self.start_reconnect().await;
         self.rec.lock().unwrap().expected_challenge = Some(query_param(&consent, "code_challenge"));
-        let (status, _, body) = self
+        let (status, headers, body) = self
             .get(
                 &format!(
                     "/oauth/callback?code=test-code&state={}",
@@ -863,7 +880,29 @@ impl Harness {
                 Some(&cookie),
             )
             .await;
-        (status, body)
+        if status != StatusCode::SEE_OTHER {
+            return (status, body);
+        }
+        let cookie = reconnect_cookie(&headers);
+        assert_eq!(headers[header::LOCATION], "/reconnect/status");
+        self.wait_for_reconnect(&cookie).await
+    }
+
+    /// Poll the status page the way a browser does until it stops refreshing.
+    /// No worker pass is run here: the callback handler started one, and its
+    /// jobs run detached, which is exactly what this waits out.
+    async fn wait_for_reconnect(&self, cookie: &str) -> (StatusCode, String) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (status, headers, body) = self.get("/reconnect/status", Some(cookie)).await;
+                if !headers.contains_key(header::REFRESH) {
+                    return (status, body);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconnect should finish")
     }
 
     /// Post the signup form and return `(consent url, cookie value)`.
@@ -2086,6 +2125,440 @@ async fn the_activation_poller_stamps_once_and_quiesces() {
 }
 
 // --- reconnect ---------------------------------------------------------------
+fn reconnect_cookie(headers: &HeaderMap) -> String {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with("pb_reconnect="))
+        .expect("reconnect progress cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+async fn enqueue_test_reconnect(h: &Harness, token: &str) {
+    let ciphertext = signup_ciphertext(h);
+    enqueue_ciphertext(h, token, &ciphertext).await;
+}
+
+/// The sealed blob signup installed: a real age armor the mock will accept.
+fn signup_ciphertext(h: &Harness) -> String {
+    let r = h.rec.lock().unwrap();
+    str_field(&r.credential_puts[0].1, "cred_read_ciphertext")
+}
+
+async fn enqueue_ciphertext(h: &Harness, token: &str, ciphertext: &str) {
+    squelch_control::reconnect::enqueue(&h.state, token, "ada", MAILBOX, ciphertext)
+        .await
+        .unwrap();
+}
+
+/// One worker pass, and every job it started run to its end. What the ticker
+/// does minus the detaching: a test wants the outcome, not the concurrency.
+async fn run_workers(state: &ControlState) {
+    for job in squelch_control::reconnect::run_pending(state).await {
+        job.await.unwrap();
+    }
+}
+
+async fn reconnect_page(h: &Harness, token: &str) -> (HeaderMap, String) {
+    let (_, headers, body) = h
+        .get("/reconnect/status", Some(&format!("pb_reconnect={token}")))
+        .await;
+    (headers, body)
+}
+
+/// `(status, ciphertext, attempts)` of the one job row.
+async fn job_row(h: &Harness) -> (String, Option<String>, i32) {
+    let row = common::raw_client(&h.db_url)
+        .await
+        .query_one(
+            "SELECT status, ciphertext, attempts FROM reconnect_jobs",
+            &[],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+async fn make_due(h: &Harness) {
+    common::raw_client(&h.db_url)
+        .await
+        .execute("UPDATE reconnect_jobs SET retry_at = now()", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_progress_survives_a_new_control_process_and_refresh() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let token = "a".repeat(43);
+    enqueue_test_reconnect(&h, &token).await;
+    let (headers, body) = reconnect_page(&h, &token).await;
+    assert_eq!(headers[header::REFRESH], "5; url=/reconnect/status");
+    assert!(body.contains("Reconnecting your mailbox"));
+    assert!(body.contains("You can close this page"));
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 1);
+
+    // Only the database survives into this fresh state; no pending task does.
+    let config = h.state.config().clone();
+    let warden = HttpWarden::new(
+        config.warden_url.clone(),
+        config.warden_token.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let fresh = ControlState::new(
+        config,
+        squelch_control::ControlStore::connect(&h.db_url)
+            .await
+            .unwrap(),
+        Arc::new(warden),
+    )
+    .unwrap();
+    run_workers(&fresh).await;
+    for _ in 0..2 {
+        let (headers, body) = reconnect_page(&h, &token).await;
+        assert!(!headers.contains_key(header::REFRESH));
+        assert!(body.contains("You’re reconnected"));
+        assert!(body.contains("Open Passband"));
+        assert!(!body.contains(REFRESH_TOKEN));
+    }
+    let (status, ciphertext, _) = job_row(&h).await;
+    assert_eq!(status, "complete");
+    assert!(
+        ciphertext.is_none(),
+        "finished work must discard ciphertext"
+    );
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 2);
+}
+
+#[tokio::test]
+async fn reconnect_retries_a_lost_result_without_another_google_grant() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let token = "b".repeat(43);
+    enqueue_test_reconnect(&h, &token).await;
+    h.rec.lock().unwrap().reconnect_status_after_install = Some(503);
+    run_workers(&h.state).await;
+    let (headers, body) = reconnect_page(&h, &token).await;
+    assert!(headers.contains_key(header::REFRESH));
+    assert!(body.contains("taking longer than usual"));
+    assert!(!body.contains("Nothing changed"));
+    assert!(!body.contains("Try again"));
+    assert!(!body.contains("You’re reconnected"));
+    // Repeated browser reads never re-run the credential install, and neither
+    // does a pass that arrives before the backoff is up.
+    run_workers(&h.state).await;
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 2);
+    h.rec.lock().unwrap().reconnect_status_after_install = None;
+    make_due(&h).await;
+    run_workers(&h.state).await;
+    let r = h.rec.lock().unwrap();
+    assert_eq!(r.credential_puts.len(), 3);
+    assert_eq!(
+        r.credential_puts[1], r.credential_puts[2],
+        "retry the identical ciphertext"
+    );
+    assert_eq!(r.credential_puts[2].1["pair"], false);
+}
+
+/// Two consents carrying the same blob share one job, and two passes racing
+/// for it install it once.
+#[tokio::test]
+async fn reconnect_coalesces_consent_and_serializes_workers() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    enqueue_test_reconnect(&h, &"c".repeat(43)).await;
+    enqueue_test_reconnect(&h, &"d".repeat(43)).await;
+    let (a, b) = tokio::join!(
+        squelch_control::reconnect::run_pending(&h.state),
+        squelch_control::reconnect::run_pending(&h.state)
+    );
+    for job in a.into_iter().chain(b) {
+        job.await.unwrap();
+    }
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 2);
+    for token in ["c".repeat(43), "d".repeat(43)] {
+        let (_, body) = reconnect_page(&h, &token).await;
+        assert!(body.contains("You’re reconnected"));
+    }
+}
+
+/// THE NEWEST CONSENT WINS, even over an install already in flight. Somebody
+/// impatient with a stuck job revokes Passband at Google - which kills every
+/// earlier refresh token - and re-consents; the blob that arrives second is
+/// the only live one, and the row must end up installing THAT, not confirming
+/// the dead one and reporting success.
+#[tokio::test]
+async fn a_second_consent_replaces_an_install_that_is_still_in_flight() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let first = signup_ciphertext(&h);
+    let second = format!("{}\nsecond-consent", squelch_control::seal::ARMOR_HEADER);
+    enqueue_ciphertext(&h, &"g".repeat(43), &first).await;
+
+    // The first install is on the wire when the second consent lands.
+    h.rec.lock().unwrap().reconnect_delay = Some(Duration::from_millis(300));
+    let in_flight = squelch_control::reconnect::run_pending(&h.state).await;
+    assert_eq!(in_flight.len(), 1, "the pass must have claimed the job");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    enqueue_ciphertext(&h, &"h".repeat(43), &second).await;
+    for job in in_flight {
+        job.await.unwrap();
+    }
+
+    // The first install "succeeded", and that success was about the wrong
+    // blob: the row is still pending, holding the second one.
+    let (status, ciphertext, attempts) = job_row(&h).await;
+    assert_eq!(status, "pending");
+    assert_eq!(ciphertext.as_deref(), Some(second.as_str()));
+    assert_eq!(attempts, 0, "a new consent starts its own attempt count");
+    let (headers, body) = reconnect_page(&h, &"g".repeat(43)).await;
+    assert!(headers.contains_key(header::REFRESH));
+    assert!(!body.contains("You’re reconnected"));
+
+    h.rec.lock().unwrap().reconnect_delay = None;
+    run_workers(&h.state).await;
+    let (status, ciphertext, _) = job_row(&h).await;
+    assert_eq!(status, "complete");
+    assert!(ciphertext.is_none());
+    let installed: Vec<String> = {
+        let r = h.rec.lock().unwrap();
+        r.credential_puts[1..]
+            .iter()
+            .map(|(_, body)| str_field(body, "cred_read_ciphertext"))
+            .collect()
+    };
+    assert_eq!(installed, [first, second], "both blobs, newest last");
+    for token in ["g".repeat(43), "h".repeat(43)] {
+        let (_, body) = reconnect_page(&h, &token).await;
+        assert!(body.contains("You’re reconnected"));
+    }
+}
+
+#[tokio::test]
+async fn reconnect_status_requires_its_private_unexpired_cookie() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let token = "e".repeat(43);
+    enqueue_test_reconnect(&h, &token).await;
+    for cookie in [None, Some("pb_reconnect=forged")] {
+        let (_, headers, body) = h.get("/reconnect/status", cookie).await;
+        assert!(!headers.contains_key(header::REFRESH));
+        assert!(body.contains("This reconnect page has expired"));
+        assert!(!body.contains(MAILBOX));
+    }
+    common::raw_client(&h.db_url)
+        .await
+        .execute(
+            "UPDATE reconnect_views SET expires_at = now() - interval '1 second'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (_, body) = reconnect_page(&h, &token).await;
+    assert!(body.contains("This reconnect page has expired"));
+}
+
+/// A refusal is terminal AND neutral. The warden saying "no such tenant" when
+/// the store said "active tenant" is the two records disagreeing about
+/// custody, which the pre-check in the handler already declines to explain to
+/// the browser; the worker's answer to the same disagreement must not explain
+/// it either, and must not send the user round the consent loop again.
+#[tokio::test]
+async fn a_refused_install_is_terminal_and_explains_nothing() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let token = "f".repeat(43);
+    enqueue_test_reconnect(&h, &token).await;
+    h.rec.lock().unwrap().tenants.remove("ada");
+    run_workers(&h.state).await;
+    let (headers, body) = reconnect_page(&h, &token).await;
+    assert!(!headers.contains_key(header::REFRESH));
+    assert!(body.contains("Your mailbox couldn’t be reconnected"));
+    assert!(body.contains("Open Passband"));
+    assert!(!body.contains("Try again"));
+    assert!(!body.contains("You’re reconnected"));
+    assert!(!body.contains("account"), "no hint about custody: {body}");
+    let (status, ciphertext, _) = job_row(&h).await;
+    assert_eq!(status, "refused");
+    assert!(ciphertext.is_none(), "a refusal discards the ciphertext");
+    // And it stays refused: the row is not due again, so the warden is not
+    // asked again. (The mock refuses before it records an install, so the
+    // call count is the bearer list, not the install list.)
+    let calls = h.rec.lock().unwrap().warden_bearers.len();
+    make_due(&h).await;
+    run_workers(&h.state).await;
+    assert_eq!(h.rec.lock().unwrap().warden_bearers.len(), calls);
+}
+
+/// RETRIES END. An outcome the warden never settles is retried with a backoff
+/// and then given up on, which NULLs the ciphertext and hands the user a fresh
+/// start rather than a page that refreshes until the view expires.
+#[tokio::test]
+async fn reconnect_gives_up_after_bounded_retries_and_offers_a_fresh_start() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let token = "i".repeat(43);
+    enqueue_test_reconnect(&h, &token).await;
+    h.rec.lock().unwrap().reconnect_status_after_install = Some(503);
+    let max = squelch_control::reconnect::MAX_ATTEMPTS;
+    for attempt in 1..=max {
+        make_due(&h).await;
+        run_workers(&h.state).await;
+        let (status, ciphertext, attempts) = job_row(&h).await;
+        assert_eq!(attempts, attempt);
+        if attempt < max {
+            assert_eq!(status, "pending", "attempt {attempt} must still retry");
+            assert!(ciphertext.is_some(), "a pending job keeps its blob");
+        } else {
+            assert_eq!(status, "gave_up");
+            assert!(ciphertext.is_none(), "giving up discards the ciphertext");
+        }
+    }
+    // Not one install more, however due the row looks.
+    make_due(&h).await;
+    run_workers(&h.state).await;
+    assert_eq!(
+        h.rec.lock().unwrap().credential_puts.len(),
+        1 + usize::try_from(max).unwrap()
+    );
+    let (headers, body) = reconnect_page(&h, &token).await;
+    assert!(!headers.contains_key(header::REFRESH));
+    assert!(body.contains("Reconnecting didn’t finish"));
+    assert!(body.contains("Try again"));
+    assert!(body.contains("href=\"/reconnect\""));
+    assert!(!body.contains("You’re reconnected"));
+}
+
+/// The backoff is real: a retried row is not due on the next pass.
+#[tokio::test]
+async fn a_retried_reconnect_waits_out_its_backoff() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    enqueue_test_reconnect(&h, &"j".repeat(43)).await;
+    h.rec.lock().unwrap().reconnect_status_after_install = Some(503);
+    run_workers(&h.state).await;
+    let due_in: f64 = common::raw_client(&h.db_url)
+        .await
+        .query_one(
+            "SELECT EXTRACT(EPOCH FROM retry_at - now())::float8 FROM reconnect_jobs",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        (50.0..=60.0).contains(&due_in),
+        "first backoff is a minute, got {due_in}"
+    );
+    run_workers(&h.state).await;
+    assert_eq!(
+        h.rec.lock().unwrap().credential_puts.len(),
+        2,
+        "not due yet"
+    );
+}
+
+/// A warden that refuses our bearer will refuse it every minute until an
+/// operator fixes the deployment. That is one loud log line and a terminal
+/// row, not a worker slot held for an hour.
+#[tokio::test]
+async fn an_unauthorized_warden_ends_the_job_on_the_first_attempt() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    let token = "k".repeat(43);
+    enqueue_test_reconnect(&h, &token).await;
+    h.rec.lock().unwrap().reconnect_status_after_install = Some(401);
+    run_workers(&h.state).await;
+    let (status, ciphertext, attempts) = job_row(&h).await;
+    assert_eq!((status.as_str(), attempts), ("gave_up", 1));
+    assert!(ciphertext.is_none());
+    let (headers, body) = reconnect_page(&h, &token).await;
+    assert!(!headers.contains_key(header::REFRESH));
+    assert!(body.contains("Reconnecting didn’t finish"));
+}
+
+/// A claimed row is invisible to the next pass for the length of its lease,
+/// and a process that dies mid-call leaves a lease that expires on its own.
+#[tokio::test]
+async fn a_leased_row_is_not_claimed_twice_until_the_lease_lapses() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    enqueue_test_reconnect(&h, &"l".repeat(43)).await;
+    let client = common::raw_client(&h.db_url).await;
+    // A worker somewhere else holds this row.
+    client
+        .execute(
+            "UPDATE reconnect_jobs SET lease_until = now() + interval '10 minutes'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        squelch_control::reconnect::run_pending(&h.state)
+            .await
+            .is_empty()
+    );
+    assert_eq!(h.rec.lock().unwrap().credential_puts.len(), 1);
+    // That worker died; its lease ran out.
+    client
+        .execute(
+            "UPDATE reconnect_jobs SET lease_until = now() - interval '1 second'",
+            &[],
+        )
+        .await
+        .unwrap();
+    run_workers(&h.state).await;
+    let (status, _, _) = job_row(&h).await;
+    assert_eq!(status, "complete");
+    let released: bool = client
+        .query_one("SELECT lease_until IS NULL FROM reconnect_jobs", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(released, "a finished job releases its lease");
+}
+
+/// Housekeeping is the sweeper's, and it keeps a finished job for as long as a
+/// browser can still ask about it.
+#[tokio::test]
+async fn the_sweep_drops_expired_views_and_then_the_jobs_nobody_can_see() {
+    let h = Harness::new().await;
+    h.complete_signup("ada").await;
+    enqueue_test_reconnect(&h, &"m".repeat(43)).await;
+    run_workers(&h.state).await;
+    let client = common::raw_client(&h.db_url).await;
+    client
+        .execute(
+            "UPDATE reconnect_jobs SET created_at = now() - interval '2 days'",
+            &[],
+        )
+        .await
+        .unwrap();
+    squelch_control::reconnect::sweep(&h.state).await;
+    let count =
+        |sql: &'static str| async { client.query_one(sql, &[]).await.unwrap().get::<_, i64>(0) };
+    assert_eq!(
+        count("SELECT count(*) FROM reconnect_jobs").await,
+        1,
+        "still viewable"
+    );
+    client
+        .execute(
+            "UPDATE reconnect_views SET expires_at = now() - interval '1 second'",
+            &[],
+        )
+        .await
+        .unwrap();
+    squelch_control::reconnect::sweep(&h.state).await;
+    assert_eq!(count("SELECT count(*) FROM reconnect_views").await, 0);
+    assert_eq!(count("SELECT count(*) FROM reconnect_jobs").await, 0);
+}
 //
 // A refresh token can stop working while everything else is healthy: revoked by
 // the user, or expired because the consent screen is still in Testing, where
@@ -2237,8 +2710,9 @@ async fn a_reconnect_cannot_finish_a_half_done_signup() {
         .provisioned = false;
     let installs_before = h.rec.lock().unwrap().credential_puts.len();
 
-    let (status, _) = h.run_reconnect().await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let (status, body) = h.run_reconnect().await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Your mailbox couldn’t be reconnected"));
 
     assert_eq!(
         h.rec.lock().unwrap().credential_puts.len(),

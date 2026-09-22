@@ -27,6 +27,7 @@ struct Avatar: View {
 
     private var resolved: SenderID.Resolved { SenderCache.resolved(sender) }
     private var domain: String? { domainOverride ?? resolved.faviconDomain }
+    private var practiceBrand: RehearsalNewsletterBrand? { RehearsalNewsletterBrand.matching(sender) }
 
     /// Prefer this frame's image, else a synchronous cache read: a row rebuilt
     /// because a selection flip switched which branch of a conditional modifier
@@ -38,7 +39,17 @@ struct Avatar: View {
 
     var body: some View {
         Group {
-            if let favicon = image, !failed {
+            if RehearsalMode.isEnabled, SenderID.parse(sender).addr.lowercased() == "maya@studio.example",
+               let portrait = Self.mayaPortrait {
+                Image(platformImage: portrait)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: size, height: size)
+                    .clipShape(Circle())
+                    .accessibilityLabel("Maya’s portrait")
+            } else if let practiceBrand {
+                RehearsalNewsletterLogo(brand: practiceBrand, size: size)
+            } else if let favicon = image, !failed {
                 Image(platformImage: favicon)
                     .resizable()
                     .interpolation(.high)
@@ -58,6 +69,13 @@ struct Avatar: View {
         .task(id: sender) { await loadFavicon() }
     }
 
+    private static let mayaPortrait: PlatformImage? = {
+        guard let url = Bundle.main.url(forResource: "rehearsal-maya", withExtension: "jpg")
+            ?? Bundle.main.url(forResource: "rehearsal-maya", withExtension: "jpg", subdirectory: "Resources"),
+              let data = try? Data(contentsOf: url) else { return nil }
+        return PlatformImage(data: data)
+    }()
+
     private var initialsAvatar: some View {
         let r = resolved
         let colors = Palette.avatarPalette[r.slot % Palette.avatarPalette.count]
@@ -69,6 +87,7 @@ struct Avatar: View {
     }
 
     private func loadFavicon() async {
+        guard !RehearsalMode.isEnabled else { return }
         guard let domain else { return }
         // A previously-failed domain never re-fetches.
         if FaviconCache.shared.verdict(domain) == .failed {

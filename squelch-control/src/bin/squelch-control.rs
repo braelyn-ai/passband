@@ -39,6 +39,11 @@ use tracing_subscriber::EnvFilter;
 /// removes expired entries, so this only bounds what an idle process holds.
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
+/// How often the reconnect worker looks for due rows. A consent starts its own
+/// pass, so this is the retry cadence and the restart recovery, not the
+/// latency a user sees.
+const RECONNECT_TICK: Duration = Duration::from_secs(5);
+
 /// How often the activation poller runs. NOT the session sweep's 60s: each
 /// candidate costs a `pods/exec` in the cluster, and the stamp it lands is
 /// analytics — minutes of latency are free, so the slower cadence buys a 5x
@@ -969,6 +974,19 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
     let state = ControlState::new(config, store, warden)?;
     let app = router(state.clone());
 
+    // The reconnect worker: a pass every RECONNECT_TICK claims due rows and
+    // starts a job per row. The handles are DROPPED, which detaches the jobs;
+    // awaiting them would park this loop on the slowest rollout.
+    let reconnect_worker = state.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RECONNECT_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            drop(squelch_control::reconnect::run_pending(&reconnect_worker).await);
+        }
+    });
+
     let sweeper = state.clone();
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SWEEP_EVERY);
@@ -979,6 +997,7 @@ async fn serve_async(config: Config) -> anyhow::Result<()> {
                 // PRIVACY: a count. Never which sessions went.
                 tracing::debug!(swept, "expired signup sessions swept");
             }
+            squelch_control::reconnect::sweep(&sweeper).await;
         }
     });
 

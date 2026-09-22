@@ -1563,3 +1563,18 @@ fn a_rebuild_that_cannot_run_leaves_the_old_index_serving() {
         .unwrap();
     assert!(created.contains("porter"), "rebuilt on retry: {created}");
 }
+
+#[test]
+fn event_auth_flag_migration_defaults_legacy_rows_without_inferring_urgency() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE events(id INTEGER PRIMARY KEY,kind TEXT); INSERT INTO events VALUES(1,'urgent');").unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap();
+    let is_auth: bool = conn
+        .query_row("SELECT is_auth FROM events WHERE id=1", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        !is_auth,
+        "legacy urgency alone does not prove authentication"
+    );
+}

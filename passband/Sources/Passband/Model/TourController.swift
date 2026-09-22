@@ -1,202 +1,307 @@
-// The first-run tour's state machine: seven steps over the real dashboard,
-// skippable from every one of them and replayable from Settings.
-//
-// IT OWNS NO MAIL. The practice email is this file's own `demoUpdate` (id -1),
-// rendered inside the tour card and NEVER injected into `store.sitrep` — the
-// poller rebuilds those bands wholesale every 10s, so anything parked there
-// would blink out mid-lesson, and every verb in the app would try to POST it.
-// For the same reason the rule the tour teaches is never saved and the `e` it
-// teaches never leaves the machine (see TourOverlay).
-
+// The guided practice inbox, then the live mailbox's summary — both inside
+// the one app. Practice is a MODE of the store (`AppStore.enterPractice`):
+// the same window, the same shell, fixture mail behind the same transport.
+// Leaving it swaps the live account back in under a veil and the summary
+// card reads the first real counts as they land.
 import Foundation
 import Observation
 import SwiftUI
 
-/// The seven steps, in order. `Int`-backed because the progress footer counts
-/// them and the analytics events report the step the user left on.
-enum TourStep: Int, CaseIterable, Sendable {
-    case welcome, records, newsletters, philosophy, demoRule, demoDone, wrap
-
-    /// 1-based position for the "N / 7" footer.
-    var position: Int { rawValue + 1 }
-}
-
-/// A dashboard region a coach mark can ring. The sitrep tags its real zones
-/// with these (see `tourTarget`), so the ring lands on whatever the current
-/// layout actually put on screen rather than on a hardcoded rectangle.
 enum TourTarget: Hashable, Sendable {
-    case records, newsletters, eyes
+    case records, reading, eyes, calendar, shipments, banking, receipts, brightly, maya
 }
 
-/// How far through the interactive demo the user is. Drives the copy on the two
-/// demo steps and nothing else.
-enum TourDemoPhase: Sendable {
-    case waiting, ruleSaved, done, undone
-}
+/// Which card the overlay shows. `practice` is the guide over fixture mail;
+/// `summary` is the one modal over the live board that ends onboarding.
+enum TourPhase: Sendable { case practice, summary }
+
+/// Where a run came from, for the funnel. `rehearsal` never leaves the
+/// machine (a standalone launch has no analytics client).
+enum TourSource: String, Sendable { case firstRun = "first_run", settings, rehearsal }
 
 @MainActor
 @Observable
 final class TourController {
-    /// Env escape hatch for development and screenshots: takes the tour past the
-    /// completed flag, not past the "must be on the sitrep, must have synced"
-    /// part of the gate.
     static let forced = ProcessInfo.processInfo.environment["PASSBAND_FORCE_TOUR"] == "1"
-
+    static let practiceRuleSender = "updates@brightly.example"
     private(set) var active = false
-    private(set) var step: TourStep = .welcome
-    private(set) var demoPhase: TourDemoPhase = .waiting
-
-    /// Measured region rects, in the tour's named coordinate space. Written
-    /// only while the tour is up — see `report`.
+    private(set) var preparingPractice = false
+    private(set) var phase: TourPhase = .practice
+    /// While non-nil the shell is veiled behind this line: the practice
+    /// inbox is being set up, or the live one is being put back.
+    private(set) var veil: String?
+    private(set) var practiceStep: PracticeTourStep = .welcome {
+        didSet { practiceRecordThreadID = nil }
+    }
+    private(set) var practiceRecordThreadID: String?
+    private(set) var practiceRunID = UUID()
+    private(set) var practiceDoneID: UUID?
+    private(set) var practiceRuleSaved = false
+    private(set) var practiceRuleMuted = false
+    /// Session-only: reconnecting after practice must not repeat the intro.
+    private(set) var hasLeftPractice = false
+    private var summaryAfterConnection = false
+    private var rehearsalConnectionPending = RehearsalMode.includesConnection
     private(set) var targets: [TourTarget: CGRect] = [:]
-
-    /// The same rects, kept fresh at ALL times and observed by nobody. The
-    /// sitrep measures its zones whether or not a tour is running, and an
-    /// observable write per layout pass would invalidate readers on every
-    /// window resize forever. This shadow copy is what makes the first coach
-    /// mark land: the tour starts long after the zones stopped moving, so
-    /// there is no later layout change to learn their positions from.
     @ObservationIgnored private var measured: [TourTarget: CGRect] = [:]
-
-    /// Set by skip/finish so a reconnect (which resets `lastRefresh`, the
-    /// trigger) cannot start the tour a second time in one session.
+    @ObservationIgnored private var replayTask: Task<Void, Never>?
+    @ObservationIgnored private var replayGeneration = UUID()
+    @ObservationIgnored private var leaving: Task<Void, Never>?
     private var dismissedThisSession = false
+    private var source: TourSource = .firstRun
 
-    /// The practice email. `id: -1` is deliberately not a real message id: the
-    /// tour's verbs are client-only, and anything that leaked to the API would
-    /// 404 loudly rather than act on somebody's actual mail.
-    static let demoUpdate = AttentionUpdate(
-        id: -1,
-        thread_id: "tour-demo",
-        tier: .noise,
-        importance: 12,
-        sender: "legal@brightly.example",
-        one_line: "We have updated our Terms of Service",
-        reason: "routine policy notice, no action required",
-        deadline: nil,
-        matched_rule: nil,
-        field_reasons: nil,
-        has_attachments: false,
-        from_name: "Brightly",
-        status: .new,
-        surfaced_at: ISO8601DateFormatter().string(from: Date()),
-        resolved_at: nil)
+    /// The welcome reveals the practice board; subsequent lessons point at it.
+    var wantsBlur: Bool { active && (phase == .summary || practiceStep == .welcome || practiceStep == .wrap) }
 
-    /// Blur belongs to the three steps that are MODALS. The coach marks point
-    /// at real regions, so blurring the board would hide the thing being
-    /// pointed at.
-    var wantsBlur: Bool {
-        active && (step == .welcome || step == .philosophy || step == .wrap)
+    /// Gate the first connected frame, before SwiftUI runs connection observers.
+    var blocksMailboxForPractice: Bool {
+        preparingPractice || (!active && !summaryAfterConnection &&
+            (rehearsalConnectionPending ||
+                (!dismissedThisSession && (!Prefs.shared.tourCompleted || Self.forced))))
     }
 
-    // MARK: - lifecycle
+    func prepareConnectionRehearsal() {
+        cancel()
+        hasLeftPractice = false
+        summaryAfterConnection = false
+        rehearsalConnectionPending = true
+    }
 
-    /// The trigger, called when the first sync of the session lands. Every
-    /// clause is a reason NOT to interrupt: already running, already dismissed,
-    /// already seen, or the user is somewhere other than the board the tour
-    /// talks about.
+    /// Start at connection, before live mail is rendered or fetched.
     func maybeStart() {
         let store = AppStore.shared
-        guard !active, !dismissedThisSession else { return }
-        guard !Prefs.shared.tourCompleted || Self.forced else { return }
-        guard store.activeView == .sitrep, !store.daemonDown else { return }
-        start()
-    }
-
-    /// Settings' "replay the tour": bypasses the completed flag AND the
-    /// once-a-session rule, and lands on the sitrep first, since four of the
-    /// seven steps are about what is on that page.
-    ///
-    /// The start is deferred a beat, and that beat is load-bearing. Leaving
-    /// Settings mounts the sitrep in the same render pass that would mount the
-    /// tour, and two key contexts pushed in one pass stack in whatever order
-    /// SwiftUI runs their onAppear. If the sitrep's push lands on top, every
-    /// tour key is shadowed: Enter, Escape, the nav holds, all dead. On the
-    /// first-run trigger the board is mounted long before the tour, which is
-    /// exactly the ordering this delay recreates.
-    func replay(store: AppStore) {
-        dismissedThisSession = false
-        store.setView(.sitrep)
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(120))
-            self.start()
+        guard !active, !preparingPractice, store.connStatus == .connected else { return }
+        if rehearsalConnectionPending {
+            rehearsalConnectionPending = false
+            replay(store: store, source: .rehearsal)
+            return
         }
+        if summaryAfterConnection {
+            showLiveSummary()
+            return
+        }
+        guard !dismissedThisSession, !Prefs.shared.tourCompleted || Self.forced else { return }
+        replay(store: AppStore.shared, source: .firstRun)
     }
 
-    private func start() {
-        step = .welcome
-        demoPhase = .waiting
+    /// Settings' "try the practice inbox", the first-run trigger and the
+    /// tester's Start fresh all come through here. On the phone there is no
+    /// practice inbox yet, so the run is the summary alone.
+    func replay(store: AppStore, source: TourSource = .settings, preloading: Bool = false) {
+        cancelReplay()
+        dismissedThisSession = false
+        self.source = source
+        summaryAfterConnection = false
+        store.setView(.sitrep)
+        #if os(macOS)
+            preparingPractice = true
+            if !preloading { veil = "Setting up your practice inbox…" }
+            let generation = replayGeneration
+            replayTask = Task { @MainActor in
+                // A cancel that lands before this body runs must not wipe the
+                // live board for a practice nobody is going to see.
+                guard !Task.isCancelled, self.replayGeneration == generation else { return }
+                await store.enterPractice()
+                guard !Task.isCancelled, self.replayGeneration == generation else {
+                    // Cancelled after the swap: the store is in practice mode
+                    // with no guide to leave it by. Unless a newer replay is
+                    // already queued to take the fixtures over, put the live
+                    // account back rather than strand a board nobody can exit.
+                    if RehearsalMode.isEnabled, !self.active, self.replayTask == nil {
+                        await store.exitPractice()
+                    }
+                    return
+                }
+                self.startPractice()
+                await store.warmPractice()
+                guard !Task.isCancelled, self.replayGeneration == generation else { return }
+                self.preparingPractice = false
+                self.veil = nil
+                Analytics.capture("tour_started", ["source": source.rawValue])
+            }
+        #else
+            showLiveSummary()
+        #endif
+    }
+
+    /// The intro joins the existing preparation instead of starting it again.
+    func waitForPracticePreparation() async {
+        await replayTask?.value
+    }
+
+    private func cancelReplay() {
+        replayTask?.cancel()
+        replayTask = nil
+        replayGeneration = UUID()
+        preparingPractice = false
+        veil = nil
+    }
+
+    private func startPractice() {
+        practiceStep = .welcome
+        practiceRunID = UUID()
+        practiceDoneID = nil
+        practiceRuleSaved = false
+        practiceRuleMuted = false
         targets = measured
+        phase = .practice
         active = true
     }
 
-    func advance() {
-        guard let next = TourStep(rawValue: step.rawValue + 1) else {
-            finish()
-            return
-        }
-        step = next
+    func showLiveSummary() {
+        cancelReplay()
+        summaryAfterConnection = false
+        phase = .summary
+        active = true
+        AppStore.shared.setView(.sitrep)
     }
 
     func back() {
-        guard let prev = TourStep(rawValue: step.rawValue - 1) else { return }
-        step = prev
+        guard let previous = PracticeTourStep(rawValue: practiceStep.rawValue - 1) else { return }
+        practiceStep = previous
     }
 
+    /// The wrap card's button: the guide was seen through to its end.
+    func completePractice() {
+        guard active, phase == .practice, leaving == nil else { return }
+        Analytics.capture("tour_completed", ["step": practiceStep.rawValue + 1])
+        exploreInbox()
+    }
+
+    /// Skip during practice leaves for the live inbox; skip on the summary
+    /// is the same as taking it. A press while the veil is already up counts
+    /// nothing twice.
     func skip() {
         guard active else { return }
-        Analytics.capture("tour_skipped", ["step": step.position])
-        end()
-        AppStore.shared.pushToast("tour skipped · replay it any time from Settings", .info)
+        if phase == .practice {
+            guard leaving == nil else { return }
+            Analytics.capture("tour_skipped", ["step": practiceStep.rawValue + 1])
+            exploreInbox()
+        } else {
+            finish()
+        }
+    }
+
+    /// Leave practice for the live inbox. Idempotent: a second press while
+    /// the veil is up joins the departure already under way.
+    func exploreInbox() {
+        guard RehearsalMode.isEnabled, active, phase == .practice, leaving == nil else { return }
+        // Veiled on the press itself, not a tick later: the button has to
+        // read as having done something before the departure's first await.
+        veil = "Opening your inbox…"
+        leaving = Task { @MainActor in
+            await self.leavePractice()
+            self.leaving = nil
+        }
+    }
+
+    private func leavePractice() async {
+        let store = AppStore.shared
+        // Long enough for the zoom-out to read as leaving somewhere.
+        try? await Task.sleep(for: .milliseconds(650))
+        releaseHeldUndo()
+        // The summary is what mounts when the live shell comes back, so it
+        // is the phase BEFORE the swap: a frame of the guide over a board it
+        // cannot find would otherwise open Maya's reader on the real mail.
+        phase = .summary
+        hasLeftPractice = true
+        await store.exitPractice()
+        if store.connStatus == .connected {
+            active = true
+            store.setView(.sitrep)
+        } else {
+            // If the account cannot be restored, connect directly without
+            // repeating the intro. Continue with the summary once connected.
+            cancel()
+            summaryAfterConnection = true
+        }
+        veil = nil
+    }
+
+    /// Start fresh and view teardown: drop the guide without ending
+    /// onboarding. Practice itself is the store's to leave.
+    func cancel() {
+        cancelReplay()
+        releaseHeldUndo()
+        active = false
+        phase = .practice
+        practiceRecordThreadID = nil
+        dismissedThisSession = true
     }
 
     func finish() {
-        guard active else { return }
-        Analytics.capture("tour_completed", ["step": step.position])
-        end()
-    }
-
-    private func end() {
-        // The practice undo dies WITH the lesson. Its chip is a real one on a
-        // real stack, and one left behind outlives the controller it reverts
-        // into: a click a second after "skip" would revert nothing, visibly.
-        AppStore.shared.undos.removeAll { $0.messageId == Self.demoUpdate.id }
-        active = false
-        dismissedThisSession = true
+        cancel()
         Prefs.shared.tourCompleted = true
     }
 
-    // MARK: - demo state
-
-    // All three note* callbacks arrive from things that outlive the step that
-    // armed them — a saved editor, a 5s undo chip — so each one checks that the
-    // tour is still on the step it belongs to. Without that, an undo fired from
-    // the wrap step advances past the end and finishes the tour silently.
-
-    func noteRuleSaved() {
-        guard active, step == .demoRule else { return }
-        demoPhase = .ruleSaved
-        advance()
+    func advancePractice() {
+        guard active, RehearsalMode.isEnabled else { return }
+        guard let next = PracticeTourStep(rawValue: practiceStep.rawValue + 1) else {
+            completePractice()
+            return
+        }
+        practiceStep = next
     }
 
-    func noteDone() {
-        guard active, step == .demoDone else { return }
-        demoPhase = .done
+    /// Skipping an interaction skips its dependent lesson too, without
+    /// displaying a success that did not happen. The done lesson's undo chip
+    /// waits for the learner (see `AppStore.pushUndo`), so skipping past it
+    /// is what retires the chip.
+    func skipPracticeStep() {
+        guard active, RehearsalMode.isEnabled else { return }
+        switch practiceStep {
+        case .openMaya, .done, .undo:
+            releaseHeldUndo()
+            practiceStep = .calendar
+        case .openBrightly, .rule: practiceStep = .wrap
+        default: advancePractice()
+        }
     }
 
-    /// The undo landed (from the real chip, or from the fallback after its 5s
-    /// window closed). Advancing from here is what makes `u` feel like the last
-    /// beat of the lesson rather than a dead end.
-    func noteUndone() {
-        guard active, step == .demoDone else { return }
-        demoPhase = .undone
-        advance()
+    /// The undo entry appears only after the actual Done API call succeeds.
+    /// A second done (Back to the lesson, `e` again) replaces the chip rather
+    /// than stacking a second immortal one beside it.
+    func notePracticeDone(_ undoID: UUID) {
+        guard active, RehearsalMode.isEnabled, practiceStep == .done else { return }
+        if let held = practiceDoneID, held != undoID {
+            AppStore.shared.undos.removeAll { $0.id == held }
+        }
+        practiceDoneID = undoID
     }
 
-    // MARK: - measured regions
+    private func releaseHeldUndo() {
+        guard let held = practiceDoneID else { return }
+        AppStore.shared.undos.removeAll { $0.id == held }
+        practiceDoneID = nil
+    }
 
-    /// A sitrep zone reporting where it is. The observable copy is written only
-    /// while the tour is up; the shadow copy always is (see `measured`).
+    func notePracticeRuleSaved(run: UUID, muted: Bool = false) {
+        guard active, RehearsalMode.isEnabled, practiceRunID == run,
+            practiceStep == .rule else { return }
+        practiceRuleSaved = true
+        practiceRuleMuted = muted
+        advancePractice()
+    }
+
+    /// Reading any example in the highlighted category arms the return
+    /// lesson. Only closing that loaded reader completes it; unrelated mail,
+    /// failed loads, and callbacks from a prior run cannot advance the tour.
+    func observePracticeRecordReader(
+        threadID: String?, loadedThreadID: String?, category: TourTarget?, run: UUID
+    ) {
+        guard active, RehearsalMode.isEnabled, practiceRunID == run,
+              let expected = practiceStep.recordCategory else { return }
+        guard let threadID else {
+            if practiceRecordThreadID != nil { advancePractice() }
+            return
+        }
+        if practiceRecordThreadID != threadID { practiceRecordThreadID = nil }
+        if loadedThreadID == threadID, category == expected {
+            practiceRecordThreadID = threadID
+        }
+    }
+
+    // Geometry follows the real dashboard in both window sizes.
     func report(_ id: TourTarget, _ rect: CGRect) {
         measured[id] = rect
         guard active, targets[id] != rect else { return }

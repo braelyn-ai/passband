@@ -1,8 +1,7 @@
 // WHAT THE AGENT CAN DO, and the one place it is allowed to do it: the tool
 // definitions the model sees, plus the dispatcher that answers them. Every call
-// goes through the human door (APIClient), so sealed mail is structurally
-// absent from every result here — the assistant cannot read a 2FA code because
-// the door it knocks on has none.
+// uses APIClient with an explicit agent audience. The server excludes pending
+// and restricted sources even though the human reader can open them.
 //
 // THREE TIERS, and the descriptions say which is which because the model reads
 // them:
@@ -171,7 +170,7 @@ enum AgentTools {
     ) async -> Verification {
         let view: ClientThreadView
         do {
-            view = try await APIClient.shared.getThread(threadId)
+            view = try await APIClient.shared.getThread(threadId, forAgent: true)
         } catch {
             return .refused(
                 failure(errText(error, "could not read thread \(threadId)"), summary: summary))
@@ -207,7 +206,7 @@ enum AgentTools {
             return failure("empty query", summary: "search failed")
         }
         let limit = min(max(int(input, "limit") ?? 8, 1), 20)
-        let page = try await APIClient.shared.search(query, limit: limit, mode: .hybrid)
+        let page = try await APIClient.shared.search(query, limit: limit, mode: .hybrid, forAgent: true)
         let rows = page.items.map { hit -> [String: Any] in
             cite(
                 ToolCitation(
@@ -232,7 +231,7 @@ enum AgentTools {
         guard let id = string(input, "thread_id") else {
             return failure("missing thread_id", summary: "read failed")
         }
-        let view = try await APIClient.shared.getThread(id)
+        let view = try await APIClient.shared.getThread(id, forAgent: true)
         if let first = view.messages.first {
             cite(
                 ToolCitation(
@@ -257,52 +256,26 @@ enum AgentTools {
     private static func getUpdates(
         _ input: [String: JSONValue], cite: (ToolCitation) -> Void
     ) async throws -> ToolOutcome {
-        var params = UpdatesParams()
-        if let tier = string(input, "tier") { params.tier = Tier(rawValue: tier) }
-        if let status = string(input, "status") { params.status = AttentionStatus(rawValue: status) }
-        if let days = int(input, "since_days"), days > 0 {
-            params.since = iso(Date().addingTimeInterval(-Double(days) * 86400))
-        }
-        params.limit = min(max(int(input, "limit") ?? 20, 1), 50)
-
-        // PEEK IS ALWAYS TRUE ON THIS PATH. `/client/updates` stamps a
-        // seen-ledger for the caller, because the UI showing a row IS the
-        // surfacing event — but the agent reads far more than it repeats back,
-        // and marking mail seen that the user never laid eyes on would empty
-        // their sitrep on the agent's behalf. See APIClient.getUpdates.
-        let page = try await APIClient.shared.getUpdates(params, peek: true)
-        let rows = page.items.map { update -> [String: Any] in
-            cite(
-                ToolCitation(
-                    threadId: update.thread_id,
-                    // Attention rows carry no header subject — `one_line` is the
-                    // triage summary, and it is the best title on offer here.
-                    subject: update.one_line,
-                    sender: update.from_name ?? update.sender,
-                    date: update.surfaced_at ?? ""))
+        let destination = string(input, "destination") ?? "fye"
+        let limit = min(max(int(input, "limit") ?? 20, 1), 50)
+        let page = try await APIClient.shared.getAgentFeed(destination: destination, limit: limit)
+        let rows = page.items.map { item -> [String: Any] in
+            cite(ToolCitation(threadId: item.thread_id, subject: item.subject,
+                sender: item.from_addr, date: item.received_at))
             return row([
-                "message_id": update.id,
-                "thread_id": update.thread_id,
-                "from": update.from_name ?? update.sender,
-                "one_line": update.one_line,
-                "tier": update.tier.rawValue,
-                "importance": update.importance,
-                "deadline": update.deadline,
-                "status": update.status.rawValue,
-                "date": update.surfaced_at,
+                "message_id": item.message_id, "thread_id": item.thread_id,
+                "from": item.from_addr, "subject": item.subject,
+                "summary": item.decision.summary, "kinds": item.decision.kinds,
+                "destinations": item.decision.destinations,
+                "attention": item.attention.summary, "state": item.attention.state,
+                "date": item.received_at,
             ])
         }
-        return ok(["updates": rows], summary: "checked the attention list")
+        return ok(["updates": rows], summary: "checked \(destination)")
     }
 
-    /// Why ONE message landed where it did: the triage row behind it.
-    ///
-    /// NO CARD AND NO `verify`. This is a read on the authed human door of the
-    /// user's own metadata about their own mail — the membership ceremony
-    /// exists to stop an invented message id riding under a card somebody taps,
-    /// and there is nothing here to tap and nothing to undo. A sealed message
-    /// is structurally absent from this door like every other, so it arrives
-    /// the same way a wrong id does: a 404.
+    /// Read only the agent-safe decision projection. Human debug access is a
+    /// separate audience and cannot be reused by the embedded assistant.
     @MainActor
     private static func explainTriage(
         _ input: [String: JSONValue], cite: (ToolCitation) -> Void
@@ -310,56 +283,17 @@ enum AgentTools {
         guard let messageId = int(input, "message_id") else {
             return failure("missing message_id", summary: "triage lookup failed")
         }
-        let info: TriageDebug
         do {
-            info = try await APIClient.shared.getTriageDebug(messageId)
-        } catch let error as APIError where error.kind == .notFound {
-            return failure(
-                "no triage record for message \(messageId): either that id isn't one of the "
-                    + "user's messages, or it is mail Passband keeps sealed (auth codes and the "
-                    + "like), which never reaches this door at all",
-                summary: "no triage record")
+            let inspection = try await APIClient.shared.getTriageDebug(messageId, forAgent: true)
+            guard case .object(let fields) = inspection, let decision = fields["decision"] else {
+                return failure("triage decision unavailable", summary: "no triage record")
+            }
+            let bytes = try JSONEncoder().encode(decision)
+            return ToolOutcome(content: String(decoding: bytes, as: UTF8.self),
+                isError: false, summary: "explained the triage")
         } catch {
-            return failure(
-                errText(error, "could not read the triage record"), summary: "triage lookup failed")
+            return failure("triage decision unavailable", summary: "triage lookup failed")
         }
-        // "Why is this here" is an answer ABOUT one email, so it earns a source
-        // the user can open — without one this was the single tool whose answers
-        // arrived with nothing to click. Guarded on non-empty because the
-        // column is TEXT NOT NULL and a row can carry "", and optional because
-        // an older daemon sends no thread_id at all.
-        //
-        // NO SENDER: the triage record has none, and finding one would mean
-        // reading the thread — which this tool's whole contract says it does
-        // not do. The row renders from the subject alone.
-        if let threadId = info.thread_id, !threadId.isEmpty {
-            cite(
-                ToolCitation(
-                    threadId: threadId, subject: info.subject.displaySubject,
-                    sender: "", date: info.surfaced_at ?? info.created_at))
-        }
-        // The model markers (which stage ran, which model, needs_stage2) are
-        // left out: they are the dev inspector's plumbing, and none of them
-        // answers "why is this in my inbox".
-        return ok(
-            row([
-                "message_id": info.message_id,
-                "subject": info.subject,
-                "tier": info.tier,
-                "importance": info.importance,
-                "category": info.category,
-                "one_line": info.one_line,
-                "reason": info.reason,
-                "why_importance": info.field_reasons?.importance,
-                "why_deadline": info.field_reasons?.deadline,
-                "why_tier": info.field_reasons?.tier,
-                "deadline": info.deadline,
-                "matched_rule": info.matched_rule_id.map {
-                    "a sender rule decided this, rule id \($0)"
-                },
-                "status": info.status,
-            ]),
-            summary: "explained the triage")
     }
 
     /// How many cards one show_emails call may put on screen. Past this the
@@ -390,7 +324,7 @@ enum AgentTools {
         var unavailable: [String] = []
         for id in unique.prefix(showCap) {
             do {
-                let view = try await APIClient.shared.getThread(id)
+                let view = try await APIClient.shared.getThread(id, forAgent: true)
                 // messages[0] is the NEWEST (the reader's j/k order) — the card
                 // previews where the thread currently stands.
                 guard let latest = view.messages.first else {
@@ -434,78 +368,12 @@ enum AgentTools {
         guard let kind = string(input, "kind") else {
             return failure("missing kind", summary: "records failed")
         }
-        let days = int(input, "days")
-        let rows: [[String: Any]]
-        switch kind {
-        case "shipments":
-            let includeDelivered = bool(input, "include_delivered") ?? false
-            rows = try await APIClient.shared.getShipments(includeDelivered: includeDelivered)
-                .map { shipment in
-                    // NO tracking_url: it is a link lifted out of email, and a
-                    // model-emitted one is a prompt-injection lever (the same
-                    // reason MarketingOffer carries none on the wire).
-                    row([
-                        "item": shipment.item_name,
-                        "carrier": shipment.carrier.rawValue,
-                        "status": shipment.status.rawValue,
-                        "tracking_number": shipment.tracking_number,
-                        "last_update": shipment.last_update,
-                    ])
-                }
-        case "receipts":
-            rows = try await APIClient.shared.getReceipts(days: days).map { receipt in
-                row([
-                    "message_id": receipt.message_id,
-                    "thread_id": receipt.thread_id,
-                    "from": receipt.from_name ?? receipt.from_addr,
-                    "amount": receipt.amount,
-                    "currency": receipt.currency,
-                    "date": receipt.received_at,
-                ])
-            }
-        case "calendar":
-            let hours = int(input, "hours")
-            rows = try await APIClient.shared.getCalendar(hours: hours).map { event in
-                row([
-                    "message_id": event.message_id,
-                    "thread_id": event.thread_id,
-                    "kind": event.kind.rawValue,
-                    "title": event.event_title,
-                    "starts_at": event.starts_at,
-                    "organizer": event.organizer,
-                ])
-            }
-        case "banking":
-            rows = try await APIClient.shared.getBanking().map { record in
-                row([
-                    "message_id": record.message_id,
-                    "thread_id": record.thread_id,
-                    "kind": record.kind.rawValue,
-                    "institution": record.institution,
-                    "amount": record.amount,
-                    "currency": record.currency,
-                    "account_hint": record.account_hint,
-                    "date": record.received_at,
-                ])
-            }
-        case "marketing":
-            rows = try await APIClient.shared.getMarketing(days: days).map { offer in
-                row([
-                    "message_id": offer.message_id,
-                    "thread_id": offer.thread_id,
-                    "from": offer.sender,
-                    "subject": offer.subject,
-                    "brand": offer.brand,
-                    "offer": offer.offer,
-                    "discount": offer.discount,
-                    "code": offer.code,
-                    "expires_at": offer.expires_at,
-                ])
-            }
-        default:
-            return failure("unknown record kind \(kind)", summary: "records failed")
-        }
-        return ok([kind: rows], summary: "checked \(kind)")
+        let result = try await APIClient.shared.getAgentRecords(kind: kind,
+            days: int(input, "days"), hours: int(input, "hours"),
+            includeDelivered: bool(input, "include_delivered") ?? false)
+        let bytes = try JSONEncoder().encode(result)
+        return ToolOutcome(content: String(decoding: bytes, as: UTF8.self),
+            isError: false, summary: "checked \(kind)")
     }
 
     @MainActor
@@ -944,41 +812,23 @@ enum AgentTools {
         Wire.ToolDef(
             name: Tool.getUpdates.rawValue,
             description: """
-                The triaged attention list: what Passband decided is worth the user's \
-                time, newest first, with each row's tier, importance, deadline and \
-                status. Use this for "what needs me", "what's overdue", "what came in \
-                today"; use search_mail when looking for one particular message. \
-                Reading this does NOT mark anything as seen.
+                Read the agent-curated For your eyes, Reading, or Records feed.
+                For your eyes is one server-ordered list using urgency, action needed,
+                personal relevance and recency. Kinds and destinations are independent.
+                Reading this does not acknowledge mail as opened.
                 """,
-            input_schema: .init(
-                properties: [
-                    "tier": .init(
-                        type: "string",
-                        description:
-                            "Narrow to one tier. past_due and deadline are dated obligations.",
-                        values: ["past_due", "deadline", "signal", "noise"]),
-                    "status": .init(
-                        type: "string", description: "Narrow to one lifecycle state.",
-                        values: ["new", "open", "done"]),
-                    "since_days": .init(
-                        type: "integer", description: "Only rows from the last N days."),
-                    "limit": .init(type: "integer", description: "Max rows (default 20, max 50)."),
-                ],
-                required: nil)),
+            input_schema: .init(properties: [
+                "destination": .init(type: "string", description: "Which feed (default fye).",
+                    values: ["fye", "reading", "records"]),
+                "limit": .init(type: "integer", description: "Max rows (default 20, max 50)."),
+            ], required: nil)),
 
         Wire.ToolDef(
             name: Tool.explainTriage.rawValue,
             description: """
-                Why Passband triaged ONE message the way it did. Returns that \
-                message's tier, importance, category, deadline and status, the \
-                one-line summary, and the reasoning behind each of them, plus the \
-                sender rule that decided it, if one did. This is the tool for "why \
-                is this in my inbox", "why was this flagged past due", "why did you \
-                call this noise". Takes a message_id (the newest message of the \
-                thread on screen, or one from an earlier result). It opens no \
-                message body and changes nothing: the subject and one-line summary \
-                it returns come from the stored triage verdict, so reach for \
-                get_thread when the question is about what the message SAYS.
+                Explain a message's current kinds, placements, attention state, and
+                evidence-backed rule exceptions. Reads the current agent-safe decision;
+                pending or restricted mail is unavailable. Use get_thread for its body.
                 """,
             input_schema: .init(
                 properties: [
@@ -1001,7 +851,7 @@ enum AgentTools {
                 properties: [
                     "kind": .init(
                         type: "string", description: "Which record set to read.",
-                        values: ["shipments", "receipts", "calendar", "banking", "marketing"]),
+                        values: ["shipments", "receipts", "bills", "calendar", "banking", "marketing"]),
                     "days": .init(
                         type: "integer",
                         description: "Look-back window for receipts and marketing."),

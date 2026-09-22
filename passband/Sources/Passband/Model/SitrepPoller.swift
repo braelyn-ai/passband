@@ -55,6 +55,10 @@ final class SitrepPoller {
 
     func stop() {
         resident.stop()
+        // A new mailbox must never join a request for the mailbox just left.
+        // Cancellation alone is insufficient: transports may still finish.
+        inFlight?.cancel()
+        inFlight = nil
         if let focusObserver { NotificationCenter.default.removeObserver(focusObserver) }
         focusObserver = nil
     }
@@ -86,9 +90,12 @@ final class SitrepPoller {
     /// notices the reconnect.
     @discardableResult
     func pull() async -> Bool {
+        guard !Task.isCancelled, store.connStatus == .connected else { return true }
         if let inFlight { return await inFlight.value }
-        guard store.connStatus == .connected else { return true }
-        let task = Task { await self.performPull() }
+        // Capture before scheduling: a queued task must not adopt a newer
+        // mailbox epoch when it eventually starts.
+        let e = store.epoch
+        let task = Task { await self.performPull(epoch: e) }
         inFlight = task
         let ok = await task.value
         if inFlight == task { inFlight = nil }
@@ -103,11 +110,7 @@ final class SitrepPoller {
     /// sitrep has news — and because this can fire per sealed message, which is
     /// a rate the full pull has no business being run at.
     ///
-    /// It writes the read model and stops there: `AuthArrival` is driven by the
-    /// CHANGE to `store.sitrep.sealed` (see ShellWatchers), so the ring, the
-    /// audited auto-reveal and the code modal all come out of the same one door
-    /// whether a poll or an event found the mail. Calling `observe` from here
-    /// as well would be a second writer of one seen-set for no gain.
+    /// Updates explicit Auth lookup without triggering notifications or modals.
     ///
     /// Silent on every failure, and it does not touch `refreshError`: this is
     /// an opportunistic extra ask, and the poll loop above is what decides
@@ -141,28 +144,24 @@ final class SitrepPoller {
     }
 
     /// Returns whether the daemon answered; the caller decides what a failure costs.
-    private func performPull() async -> Bool {
+    private func performPull(epoch e: Int) async -> Bool {
         // The account this pull is ABOUT. A switch bumps the store's epoch, and
         // everything below writes the read model the whole app renders — bands
         // keyed by per-daemon message ids most of all. A stale answer reports
         // `true`: nothing was asked of the NEW daemon, so there is nothing for
         // the backoff loop to back off from (and that loop is stopped by the
         // switch anyway).
-        let e = store.epoch
+        guard !Task.isCancelled, store.isCurrent(e), store.connStatus == .connected else { return true }
         do {
-            async let standing = APIClient.shared.getUpdates(
-                UpdatesParams(band: .standing, limit: Self.pageLimit))
-            async let fresh = APIClient.shared.getUpdates(
-                UpdatesParams(band: .new, limit: Self.pageLimit))
-            async let open = APIClient.shared.getUpdates(
-                UpdatesParams(band: .open, limit: Self.pageLimit))
+            async let feed = APIClient.shared.getFeed(destination: "fye", limit: Self.pageLimit)
             async let stats = APIClient.shared.getStats()
             async let sealed = APIClient.shared.listSealed()
-
-            let (s, f, o, st, sl) = try await (standing, fresh, open, stats, sealed)
-            guard store.isCurrent(e) else { return true }
+            let (page, st, sl) = try await (feed, stats, sealed)
+            guard !Task.isCancelled, store.isCurrent(e) else { return true }
+            // One ordered list. The older bands remain empty until the shared
+            // reader state no longer needs their compatibility fields.
             let next = SitrepData(
-                standing: s.items, new: f.items, open: o.items, stats: st, sealed: sl)
+                standing: page.items.map(\.row), new: [], open: [], stats: st, sealed: sl, totalCount: page.total_count)
             // ASSIGN ONLY ON CHANGE: @Observable notifies on assignment, not on
             // value difference, so writing an identical read model every 10s
             // re-lays out the whole dashboard for nothing.
@@ -185,7 +184,7 @@ final class SitrepPoller {
             //
             // Counted off `next` rather than the store: identical in either
             // branch, and this is the value we just got from the daemon.
-            Badge.refresh(next.standing)
+            Badge.set(next.totalCount ?? next.standing.count)
             // FIRST SIGHT OF THE MAILBOX = the first chance to know the human's
             // name well enough to guess. Here rather than at connect time
             // because this is where the address arrives, and unconditional
@@ -242,7 +241,7 @@ final class SitrepPoller {
             await store.refreshZones()
             return true
         } catch {
-            guard store.isCurrent(e) else { return true }
+            guard !Task.isCancelled, store.isCurrent(e) else { return true }
             // Transition only, before the error lands — count outages, not
             // every failing poll of one.
             if store.refreshError == nil { Analytics.capture("connection_lost") }

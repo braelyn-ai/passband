@@ -46,22 +46,22 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("signal {signal}"),
+            format!("For your eyes {signal}"),
             Style::default().fg(Color::Green),
         ),
         Span::raw(" / "),
         Span::styled(
-            format!("noise {noise}"),
+            format!("other mail {noise}"),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw("   "),
         Span::styled(
-            format!("sealed {}", app.sealed.len()),
+            format!("auth {}", app.sealed.len()),
             Style::default().fg(Color::Magenta),
         ),
         Span::raw("   "),
         Span::styled(
-            format!("[squelch: {}]", app.min_importance),
+            "[server order]",
             Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
@@ -189,14 +189,14 @@ fn render_row(
         Row::SquelchLine => {
             let dashes = "\u{2500}".repeat(width.saturating_sub(15).max(3));
             Line::from(Span::styled(
-                format!("  \u{2500}\u{2500} squelch {dashes}"),
+                format!("  \u{2500}\u{2500} other mail {dashes}"),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ))
         }
         Row::NoiseSummary(n) => Line::from(Span::styled(
-            format!("  \u{00b7} {n} below the line (press s to show)"),
+            format!("  \u{00b7} {n} other messages (press s to show)"),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM),
@@ -213,7 +213,7 @@ fn render_row(
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.mode {
         Mode::List => {
-            " j/k move  Enter thread  t rule  T rules  +/- squelch  g refresh  s noise  r reveal  q quit "
+            " j/k move  Enter thread  t rule  T rules  g refresh  s other mail  r reveal  q quit "
         }
         Mode::Detail { .. } => " j/k scroll  Esc/q back ",
         Mode::RuleEdit(_) => " Tab field  Ctrl-S save  Esc cancel ",
@@ -226,7 +226,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn render_detail(f: &mut Frame, view: Option<&squelch_core::types::ThreadView>, scroll: u16) {
+fn render_detail(f: &mut Frame, view: Option<&squelch_core::types::ClientThreadView>, scroll: u16) {
     let area = centered_rect(78, 70, f.area());
     f.render_widget(Clear, area);
 

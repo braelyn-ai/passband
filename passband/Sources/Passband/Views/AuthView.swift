@@ -457,7 +457,7 @@ private struct FocusPanel: View {
             return "Revealed, but no code could be read from this one. Open it to read it yourself."
         }
         return
-            "Nothing is read until you ask. Revealing fetches the body once and records an audit entry."
+            "Select a message to view its code or link. These messages are also available in your email."
     }
 }
 

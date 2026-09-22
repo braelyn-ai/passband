@@ -261,9 +261,6 @@ struct SearchView: View {
             if threadId == nil {
                 focused = true
                 store.search.expanded = true
-                // Reading may have changed done status, including via undo.
-                store.search.nextCursor = nil
-                store.search.revision &+= 1
             }
         }
         // The remembered query lands selected, so `/` serves both callers: arrow
@@ -291,7 +288,7 @@ struct SearchView: View {
         Button { store.requestDeeperSearch() } label: {
             HStack(spacing: 5) {
                 Image(systemName: "sparkles")
-                Text(store.searchLane.running ? "Searching…" : "Ask agent")
+                Text((store.searchLane.running || store.preparingSearchEvidence) ? "Searching…" : "Ask agent")
                 if store.search.expanded { Kbd("⌘↩") }
             }
             .font(.system(size: 12, weight: .medium))
@@ -299,7 +296,7 @@ struct SearchView: View {
         .buttonStyle(.plain)
         .foregroundStyle(Palette.accentInk)
         .disabled(!DeeperSearchPolicy.canRequest(query: store.search.query,
-            choice: prefs.deeperSearch, running: store.searchLane.running))
+            choice: prefs.deeperSearch, running: store.searchLane.running || store.preparingSearchEvidence))
         .help(prefs.deeperSearch == .off
             ? "Enable deeper search in Settings to use the agent."
             : "Ask the agent to search and read your mail. ⌘Return")
@@ -352,6 +349,16 @@ struct SearchView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.horizontal, expanded ? 24 : 8)
                 .padding(.bottom, 14)
+            }
+            .onAppear {
+                if let hit = store.search.hits[safe: store.search.index] {
+                    proxy.scrollTo(hit.id, anchor: .center)
+                }
+            }
+            .onChange(of: expanded) { _, _ in
+                if let hit = store.search.hits[safe: store.search.index] {
+                    proxy.scrollTo(hit.id, anchor: .center)
+                }
             }
             .onChange(of: store.search.index) { _, i in
                 guard let hit = store.search.hits[safe: i] else { return }
@@ -564,7 +571,11 @@ struct SearchView: View {
             // words to it as a "refinement".
             guard !Task.isCancelled, term == store.search.query.trimmed,
                   revision == store.search.revision, related == prefs.searchIncludeRelated else { return }
-            store.search.hits = page.items
+            store.search.hits = page.items.map { hit in
+                var hit = hit
+                hit.displaySnippet = SearchPreview.clean(hit.snippet)
+                return hit
+            }
             store.search.diagnostics = page.diagnostics
             store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
@@ -680,6 +691,8 @@ struct SearchView: View {
             // break the ForEach.
             var seen = Set(store.search.hits.map(\.id))
             for hit in page.items where seen.insert(hit.id).inserted {
+                var hit = hit
+                hit.displaySnippet = SearchPreview.clean(hit.snippet)
                 store.search.hits.append(hit)
             }
             store.search.nextCursor = page.next_cursor
@@ -763,7 +776,7 @@ private struct HitRow: View {
     }
 
     private var preview: some View {
-        Text(highlight(SearchPreview.clean(hit.snippet),
+        Text(highlight(hit.displaySnippet ?? hit.snippet,
                        matches: hit.snippet_matches ?? terms))
             .font(.system(size: 12))
             .foregroundStyle(Palette.inkDim)

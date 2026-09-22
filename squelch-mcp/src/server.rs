@@ -1,13 +1,12 @@
 //! Transport-agnostic MCP server: the [`SquelchServer`] handler and its tools.
 //!
-//! Sealed (auth-related) mail is excluded structurally in SQL by `squelch-core`;
-//! this layer re-checks as defense in depth, and `get_thread` collapses a sealed
-//! and an unknown thread into one indistinguishable `resource_not_found`.
-//! See docs/SECURITY.md.
+//! External reads require a current allowed assessment for every consumed source.
+//! Pending and actionable auth content stays unavailable; informational login
+//! alerts may be allowed. The human reader uses separate unrestricted methods.
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -18,8 +17,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use squelch_core::config::ShipmentListPolicy;
 use squelch_core::error::CoreError;
+use squelch_core::store::agent_triage::AgentTriageStore;
 use squelch_core::store::{NewAuditEntry, SearchSort, SqliteStore, Store};
-use squelch_core::types::{AccountId, Disposition, SenderRule, ThreadView, Update};
+use squelch_core::triage::agent_config::RankingConfig;
+use squelch_core::triage::decision::{
+    EmailKind, MessageDestination, RecordProposal, SupportedTime, ThreadAttentionDecision,
+};
+use squelch_core::types::{AccountId, Disposition, SenderRule, ThreadView};
 
 /// The squelch MCP server. Single-account: the account is resolved once at
 /// construction, though every row already carries `account_id`.
@@ -38,6 +42,7 @@ pub struct SquelchServer {
     /// four more failures, and one who set `10` had live packages hidden from it
     /// at five. Two doors, one view.
     shipment_policy: ShipmentListPolicy,
+    ranking_config: RankingConfig,
     // Read only by the macro-generated `ServerHandler`, so dead-code analysis
     // can't see the use.
     #[allow(dead_code)]
@@ -49,7 +54,7 @@ pub struct SquelchServer {
 pub struct GetInboxUpdatesParams {
     /// Only return updates received at or after this UTC timestamp (RFC 3339).
     pub since: DateTime<Utc>,
-    /// Optional minimum importance (0-255). Omit to use the store default.
+    /// Deprecated compatibility argument. FYE membership is decided by the agent, not this score.
     #[serde(default)]
     pub min_importance: Option<u8>,
 }
@@ -101,6 +106,34 @@ pub struct GetDeadlinesParams {
     pub within_days: Option<u32>,
 }
 
+/// Explicit due facts; a date-only source stays a date rather than invented midnight.
+#[derive(Debug, serde::Serialize)]
+pub struct DeadlineHit {
+    pub id: i64,
+    pub account_id: AccountId,
+    pub message_id: i64,
+    pub thread_id: String,
+    pub kind: String,
+    pub amount: Option<f64>,
+    pub currency: Option<String>,
+    pub due_at: String,
+    pub timezone: Option<String>,
+    pub past_due: bool,
+    pub source: String,
+}
+
+fn due_in_window(due: &SupportedTime, now: DateTime<Utc>, days: Option<u32>) -> Option<bool> {
+    let cutoff =
+        days.and_then(|days| now.checked_add_signed(chrono::Duration::days(i64::from(days))));
+    if let Ok(at) = DateTime::parse_from_rfc3339(&due.value) {
+        return cutoff.is_none_or(|cutoff| at <= cutoff).then_some(at < now);
+    }
+    let date = NaiveDate::parse_from_str(&due.value, "%Y-%m-%d").ok()?;
+    cutoff
+        .is_none_or(|cutoff| date <= cutoff.date_naive())
+        .then_some(date < now.date_naive())
+}
+
 /// Parameters for `get_shipments`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetShipmentsParams {
@@ -109,7 +142,7 @@ pub struct GetShipmentsParams {
     pub include_delivered: Option<bool>,
 }
 
-/// One `get_shipments` result. Shipments are only ever built from non-sealed mail.
+/// A delivery fact with optional carrier observations, guarded by source provenance.
 #[derive(Debug, serde::Serialize)]
 pub struct ShipmentHit {
     pub item_name: String,
@@ -178,10 +211,15 @@ pub struct StandingInstruction {
 /// additive change to the agent door's wire shape.
 #[derive(Debug, serde::Serialize)]
 pub struct InboxUpdate {
-    #[serde(flatten)]
-    pub update: Update,
-    /// Absent (not null) when this sender has no rule, or has one that carries
-    /// no instruction text.
+    pub message_id: i64,
+    pub thread_id: String,
+    pub sender: String,
+    pub received_at: String,
+    pub summary: String,
+    pub kinds: Vec<EmailKind>,
+    pub destinations: Vec<MessageDestination>,
+    pub attention: ThreadAttentionDecision,
+    pub score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub standing_instruction: Option<StandingInstruction>,
 }
@@ -210,6 +248,7 @@ impl SquelchServer {
             store,
             account_id,
             shipment_policy: ShipmentListPolicy::default(),
+            ranking_config: RankingConfig::default(),
             tool_router: Self::tool_router(),
         })
     }
@@ -236,15 +275,18 @@ impl SquelchServer {
         }
     }
 
-    /// Defense-in-depth guard, and the single choke point for it: re-queries the
-    /// store's local-only sealed set to guarantee no thread we are about to
-    /// surface overlaps a sealed thread.
-    fn thread_is_sealed(&self, thread_id: &str) -> Result<bool, ErrorData> {
-        let sealed = self
-            .store
-            .sealed_messages(self.account_id)
-            .map_err(Self::map_err)?;
-        Ok(sealed.iter().any(|m| m.thread_id == thread_id))
+    pub fn with_ranking_config(mut self, config: RankingConfig) -> Self {
+        self.ranking_config = config;
+        self
+    }
+
+    /// Pending, restricted, missing, and stale source assessments all block the
+    /// thread. The store repeats this check inside the full-thread read lock.
+    fn thread_is_unavailable(&self, thread_id: &str) -> Result<bool, ErrorData> {
+        self.store
+            .external_thread_allowed(self.account_id, thread_id)
+            .map(|allowed| !allowed)
+            .map_err(Self::map_err)
     }
 
     /// Number of registered MCP tools (for smoke tests / introspection).
@@ -360,56 +402,47 @@ impl SquelchServer {
                        the account owner's own standing words about what they \
                        want from that sender ({match_pattern, want}). It is an \
                        instruction about WHAT TO REPORT, not a verdict about \
-                       whether to report: follow it when you write up that \
-                       message, and never let it talk you out of raising \
-                       something the update's own tier says is urgent. \
-                       Auth/verification emails are structurally absent from \
+                       whether to report: consider it alongside the attention \
+                       assessment and explain meaningful exceptions. \
+                       Pending assessments and actionable authentication secrets are absent from \
                        results."
     )]
     async fn get_inbox_updates(
         &self,
         Parameters(params): Parameters<GetInboxUpdatesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let updates: Vec<Update> = self
+        let updates = self
             .store
-            .ranked_updates(self.account_id, params.since, params.min_importance)
+            .external_agent_fye(self.account_id, 1000, &self.ranking_config, Utc::now())
             .map_err(Self::map_err)?;
-
-        // Defense in depth: drop any update whose thread overlaps a sealed thread.
-        let mut safe = Vec::with_capacity(updates.len());
-        for u in updates {
-            if !self.thread_is_sealed(&u.thread_id)? {
-                safe.push(u);
-            }
-        }
-
-        // ISSUE #21: THE RULE RIDES WITH THE MAIL. An `Update` carries
-        // `matched_rule`, which is a bare row id — not text, and not even
-        // populated on the case the ask was written about (a bill; see
-        // `instruction_for`). One rules read for the whole batch, then a Rust
-        // glob per sender.
-        //
-        // READ BEFORE THE LEDGER IS STAMPED, deliberately. Everything that can
-        // fail this call now happens ahead of `mark_surfaced`, so a store error
-        // cannot leave a row marked as seen by an agent that was handed an error
-        // instead of the mail.
         let rules = self.sender_rules()?;
-
-        // SEEN-LEDGER: the agent door stamps too (surfaced_at=now if NULL,
-        // new->open), so the ledger answers "did ANYONE see this" across both
-        // doors. mark_surfaced re-guards sensitivity, so sealed is never stamped.
-        let ids: Vec<i64> = safe.iter().map(|u| u.id).collect();
-        self.store
-            .mark_surfaced(self.account_id, &ids)
-            .map_err(Self::map_err)?;
-
-        let out: Vec<InboxUpdate> = safe
-            .into_iter()
-            .map(|u| InboxUpdate {
-                standing_instruction: Self::instruction_for(&u.sender, &rules),
-                update: u,
-            })
-            .collect();
+        let mut out = Vec::new();
+        for item in updates {
+            let received_at = DateTime::parse_from_rfc3339(&item.received_at)
+                .map_err(|_| ErrorData::internal_error("invalid received timestamp", None))?;
+            if received_at.with_timezone(&Utc) < params.since
+                || !self
+                    .store
+                    .agent_access_allowed(self.account_id, item.message_id)
+                    .map_err(Self::map_err)?
+                || self.thread_is_unavailable(&item.thread_id)?
+            {
+                continue;
+            }
+            out.push(InboxUpdate {
+                standing_instruction: Self::instruction_for(&item.from_addr, &rules),
+                message_id: item.message_id,
+                thread_id: item.thread_id,
+                sender: item.from_addr,
+                received_at: item.received_at,
+                summary: item.decision.summary,
+                kinds: item.decision.kinds,
+                destinations: item.decision.destinations,
+                attention: item.attention,
+                score: item.score,
+            });
+        }
+        // Returning data to an agent is not a human opening or resolving mail.
         Self::ok_json(out)
     }
 
@@ -424,18 +457,13 @@ impl SquelchServer {
                        to its thread. `standing_instructions` carries the account \
                        owner's own standing words about the people in the thread \
                        ({match_pattern, want}); follow them when you report what \
-                       the thread says. Unknown or auth-sealed ids return an \
+                       the thread says. Unknown, pending, or restricted ids return an \
                        identical not-found error."
     )]
     async fn get_thread(
         &self,
         Parameters(params): Parameters<GetThreadParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Re-check before the store path so the two rejections are indistinguishable.
-        if self.thread_is_sealed(&params.id)? {
-            return Err(ErrorData::resource_not_found("not found", None));
-        }
-
         // PATH 1: treat `id` as a thread id.
         match self.store.thread_view(self.account_id, &params.id) {
             Ok(view) => self.thread_with_instructions(view),
@@ -457,7 +485,7 @@ impl SquelchServer {
                 };
                 // Re-guard the resolved thread: an unsealed message may have a
                 // sealed sibling, which seals the whole thread.
-                if self.thread_is_sealed(&thread_id)? {
+                if self.thread_is_unavailable(&thread_id)? {
                     return Err(ErrorData::resource_not_found("not found", None));
                 }
                 let view: ThreadView = self
@@ -470,66 +498,215 @@ impl SquelchServer {
         }
     }
 
-    /// Deadlines/bills within a window. Bypasses the squelch threshold; sealed
-    /// rows are still excluded.
+    /// Explicit bill due dates and unresolved attention deadlines.
     #[tool(
         name = "get_deadlines",
-        description = "Bills and deadlines due within N days (default: all). \
-                       Bypasses the squelch importance threshold."
+        description = "Agent-assessed bill due dates and unresolved action deadlines within N days (default all). Date-only facts remain dates; no importance threshold."
     )]
     async fn get_deadlines(
         &self,
         Parameters(params): Parameters<GetDeadlinesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let deadlines = self
+        let now = Utc::now();
+        let records = self
             .store
-            .deadlines(self.account_id, params.within_days)
+            .external_agent_records_with_query(
+                self.account_id,
+                usize::MAX,
+                &squelch_core::store::agent_triage::AgentListQuery {
+                    since: None,
+                    include_done: false,
+                },
+            )
             .map_err(Self::map_err)?;
-        Self::ok_json(deadlines)
+        let mut out = Vec::new();
+        for item in records {
+            for record in item.decision.records {
+                if let RecordProposal::Bill {
+                    merchant,
+                    amount,
+                    currency,
+                    due: Some(due),
+                    ..
+                } = record
+                    && let Some(past_due) = due_in_window(&due, now, params.within_days)
+                {
+                    out.push(DeadlineHit {
+                        id: item.message_id,
+                        account_id: self.account_id,
+                        message_id: item.message_id,
+                        thread_id: item.thread_id.clone(),
+                        kind: "bill".into(),
+                        amount,
+                        currency,
+                        due_at: due.value,
+                        timezone: due.timezone,
+                        past_due,
+                        source: merchant,
+                    });
+                }
+            }
+        }
+        let attention = self
+            .store
+            .external_agent_fye(self.account_id, usize::MAX, &self.ranking_config, now)
+            .map_err(Self::map_err)?;
+        for item in attention {
+            let mut times: Vec<(&SupportedTime, &str)> = item
+                .attention
+                .actions
+                .iter()
+                .filter(|action| !action.resolved)
+                .filter_map(|action| {
+                    action
+                        .due
+                        .as_ref()
+                        .map(|due| (due, action.description.as_str()))
+                })
+                .collect();
+            if times.is_empty()
+                && let Some(due) = &item.attention.factors.attention_at
+            {
+                times.push((due, &item.attention.summary));
+            }
+            for (due, description) in times {
+                if out
+                    .iter()
+                    .any(|row| row.thread_id == item.thread_id && row.due_at == due.value)
+                {
+                    continue;
+                }
+                if let Some(past_due) = due_in_window(due, now, params.within_days) {
+                    out.push(DeadlineHit {
+                        id: item.message_id,
+                        account_id: self.account_id,
+                        message_id: item.message_id,
+                        thread_id: item.thread_id.clone(),
+                        kind: "action".into(),
+                        amount: None,
+                        currency: None,
+                        due_at: due.value.clone(),
+                        timezone: due.timezone.clone(),
+                        past_due,
+                        source: description.into(),
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            a.due_at
+                .cmp(&b.due_at)
+                .then_with(|| a.message_id.cmp(&b.message_id))
+        });
+        Self::ok_json(out)
     }
 
-    /// Packages in transit (and, optionally, delivered ones). Never built from
-    /// sealed mail, so sealed content can't appear here.
+    /// Model-proposed deliveries, enriched by retained carrier observations.
     #[tool(
         name = "get_shipments",
-        description = "Tracked packages/shipments. Returns en-route packages by \
-                       default (item_name, carrier, status, tracking_number, \
-                       tracking_url, last_update, eta, carrier_status_raw); pass \
-                       include_delivered=true to also include delivered ones. \
-                       eta and carrier_status_raw come from the carrier's own API \
-                       and are null until the package has been polled. Extracted \
-                       from shipping mail; auth/verification emails are never \
-                       represented."
+        description = "Agent-assessed deliveries and tracked packages, including deliveries without a tracking number. Delivered packages are omitted unless include_delivered=true. Carrier observations enrich known tracking numbers; unavailable tracking details remain empty/null."
     )]
     async fn get_shipments(
         &self,
         Parameters(params): Parameters<GetShipmentsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let include_delivered = params.include_delivered.unwrap_or(false);
-        // No sealed row to filter: detection never runs on sealed mail. The
-        // OPERATOR'S listing policy does the rest — phantom digit-runs the
-        // carrier keeps rejecting, rows nothing has happened to for
-        // `stale_after_days`, and rows the user cleared — and it is the SAME
-        // value the human door holds, so an agent and its user see the same
-        // packages. Every hide is read-side: the rows keep being polled and come
-        // back on their own.
+        let records = self
+            .store
+            .external_agent_records_with_query(
+                self.account_id,
+                usize::MAX,
+                &squelch_core::store::agent_triage::AgentListQuery {
+                    since: None,
+                    include_done: false,
+                },
+            )
+            .map_err(Self::map_err)?;
         let shipments = self
             .store
-            .list_shipments(self.account_id, include_delivered, self.shipment_policy)
+            .external_shipments(self.account_id, true)
             .map_err(Self::map_err)?;
-        let out: Vec<ShipmentHit> = shipments
-            .into_iter()
-            .map(|s| ShipmentHit {
-                item_name: s.item_name,
-                carrier: s.carrier,
-                status: s.status,
-                tracking_number: s.tracking_number,
-                tracking_url: s.tracking_url,
-                last_update: s.last_update,
-                eta: s.eta,
-                carrier_status_raw: s.carrier_status_raw,
-            })
-            .collect();
+        let mut out: Vec<ShipmentHit> = Vec::new();
+        let mut represented = std::collections::HashSet::new();
+        for item in records {
+            for record in item.decision.records {
+                let RecordProposal::Delivery {
+                    carrier,
+                    tracking_number,
+                    status,
+                    ..
+                } = record
+                else {
+                    continue;
+                };
+                let number = tracking_number
+                    .map(|raw| {
+                        squelch_core::triage::extract::shipments::sanitize_tracking_number(
+                            Some(&raw),
+                            None,
+                        )
+                        .unwrap_or(raw)
+                    })
+                    .unwrap_or_default();
+                if !number.is_empty() && !represented.insert(number.clone()) {
+                    continue;
+                }
+                if !number.is_empty()
+                    && self
+                        .store
+                        .agent_shipment_is_cleared(self.account_id, &number)
+                        .map_err(Self::map_err)?
+                {
+                    continue;
+                }
+                let mut hit = ShipmentHit {
+                    item_name: item.decision.summary.clone(),
+                    carrier: carrier.unwrap_or_default(),
+                    status,
+                    tracking_number: number,
+                    tracking_url: None,
+                    last_update: DateTime::parse_from_rfc3339(&item.received_at)
+                        .map_err(|error| Self::map_err(CoreError::Other(error.into())))?
+                        .with_timezone(&Utc),
+                    eta: None,
+                    carrier_status_raw: None,
+                };
+                if let Some(observation) = shipments
+                    .iter()
+                    .find(|shipment| shipment.tracking_number == hit.tracking_number)
+                {
+                    hit.tracking_url = observation.tracking_url.clone();
+                    hit.eta = observation.eta;
+                    hit.carrier_status_raw = observation.carrier_status_raw.clone();
+                    if observation.carrier_status_raw.is_some() {
+                        hit.status = observation.status.clone();
+                        hit.last_update = observation.last_update;
+                    }
+                }
+                if include_delivered || hit.status != "delivered" {
+                    out.push(hit);
+                }
+            }
+        }
+        // Legacy tracked packages keep their carrier observations during cutover.
+        for shipment in shipments {
+            if represented.contains(&shipment.tracking_number)
+                || (!include_delivered && shipment.status == "delivered")
+            {
+                continue;
+            }
+            out.push(ShipmentHit {
+                item_name: shipment.item_name,
+                carrier: shipment.carrier,
+                status: shipment.status,
+                tracking_number: shipment.tracking_number,
+                tracking_url: shipment.tracking_url,
+                last_update: shipment.last_update,
+                eta: shipment.eta,
+                carrier_status_raw: shipment.carrier_status_raw,
+            });
+        }
+        out.sort_by(|a, b| b.last_update.cmp(&a.last_update));
         Self::ok_json(out)
     }
 
@@ -644,55 +821,19 @@ impl SquelchServer {
             None => SearchSort::default(),
         };
 
-        // hybrid_search excludes sealed rows in BOTH the keyword and vector legs
-        // (and never embedded sealed mail in the first place). Degrades to
-        // keyword-only when no embedder is attached. No operator filter and no
-        // window-fullness on this door: the agent asks for top-k, not pages.
-        //
-        // OFF THE RUNTIME, the way `squelch-api`'s `blocking` runs its store
-        // calls: the vector leg runs an ONNX embed of the query, which is tens
-        // of milliseconds on a loaded session and ~200 ms when it has to reload
-        // one first. Inline, that is a tokio worker parked on CPU work. The
-        // per-hit seal check below stays inline: it is a point lookup, and it
-        // was never the thing holding a worker.
+        // Search expands its recall window until access filtering leaves the
+        // requested number of readable results, or the corpus is exhausted.
         let store = self.store.clone();
         let account_id = self.account_id;
         let query = query.to_string();
-        let (hits, _window_full) = tokio::task::spawn_blocking(move || {
-            // `partial: false` — an agent sends settled words, so nothing is
-            // matched as a prefix. The as-you-type widening belongs to a human
-            // still typing (the panel's `partial=1`), and applying it here
-            // would rank `passwordless` beside a query for `password`.
-            //
-            // `want_windows: false` — this door builds its result from the
-            // SUBJECT and never reads the snippet, and windowing is one extra
-            // FTS query per hydrated hit, up to `k`. The legs come back too and
-            // are dropped: `hybrid_search_legs` is the shape that lets a caller
-            // say what it does not need.
-            store
-                .hybrid_search_legs(
-                    account_id,
-                    &query,
-                    &Default::default(),
-                    sort,
-                    false,
-                    false,
-                    k,
-                )
-                .map(|(hits, full)| (hits.into_iter().map(|h| h.hit).collect::<Vec<_>>(), full))
-        })
-        .await
-        .map_err(|_| ErrorData::internal_error("internal error", None))?
-        .map_err(Self::map_err)?;
+        let hits =
+            tokio::task::spawn_blocking(move || store.external_search(account_id, &query, sort, k))
+                .await
+                .map_err(|_| ErrorData::internal_error("internal error", None))?
+                .map_err(Self::map_err)?;
 
-        // Defense in depth: drop any hit whose thread overlaps a sealed thread,
-        // exactly like get_inbox_updates. Relevance is the fused rank (1-based)
-        // over the SURVIVING set so the client sees a dense 1..N ordering.
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
-            if self.thread_is_sealed(&hit.thread_id)? {
-                continue;
-            }
             let sender = match &hit.from_name {
                 Some(name) if !name.trim().is_empty() => {
                     format!("{} <{}>", name.trim(), hit.from_addr)
@@ -724,8 +865,8 @@ impl ServerHandler for SquelchServer {
                  transit. When mail arrives from a sender the account owner has \
                  written a rule for, get_inbox_updates and get_thread deliver \
                  that rule's instruction text with it — obey it when you report \
-                 that mail. Auth/2FA/verification emails are never exposed through \
-                 these tools.",
+                 that mail. Pending assessments and actionable auth secrets are \
+                 unavailable. Informational login and security alerts may be readable.",
         )
     }
 }
@@ -734,97 +875,8 @@ impl ServerHandler for SquelchServer {
 mod tests {
     use super::*;
     use rmcp::handler::server::wrapper::Parameters;
-    use squelch_core::store::{SpamScope, Store};
-    use squelch_core::types::{AttentionStatus, SealedKind, Sensitivity, Tier};
+    use squelch_core::store::Store;
 
-    /// A read through the AGENT DOOR (`get_inbox_updates`) stamps the seen-ledger
-    /// exactly like the human door: surfaced_at set, new->open. The response shape
-    /// is unchanged (still an `Update` set) — this asserts the side effect.
-    #[tokio::test]
-    async fn mcp_fetch_stamps_the_ledger() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-
-        // One normal message + one sealed OTP.
-        let mut normal = squelch_core::types::NewMessage {
-            account_id: acct,
-            gmail_msg_id: "g1".into(),
-            thread_id: "t1".into(),
-            from_addr: "alice@example.com".into(),
-            from_name: None,
-            subject: "hi".into(),
-            received_at: Utc::now(),
-            snippet: "".into(),
-            body: "".into(),
-            body_html: None,
-            is_sent: false,
-            is_spam: false,
-            to_addrs: None,
-            list_unsubscribe: None,
-            list_unsub_one_click: false,
-            auth_pass: None,
-        };
-        let nid = store.upsert_message(&normal).unwrap();
-        store
-            .set_triage(
-                nid,
-                acct,
-                80,
-                Tier::Signal,
-                Sensitivity::Normal,
-                None,
-                "",
-                "",
-                None,
-            )
-            .unwrap();
-        normal.gmail_msg_id = "g2".into();
-        normal.thread_id = "t2".into();
-        normal.subject = "code".into();
-        let sid = store.upsert_message(&normal).unwrap();
-        store
-            .set_triage(
-                sid,
-                acct,
-                90,
-                Tier::Noise,
-                Sensitivity::Sealed,
-                Some(SealedKind::Otp),
-                "",
-                "",
-                None,
-            )
-            .unwrap();
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let since = Utc::now() - chrono::Duration::days(1);
-        let _ = server
-            .get_inbox_updates(Parameters(GetInboxUpdatesParams {
-                since,
-                min_importance: None,
-            }))
-            .await
-            .unwrap();
-
-        // The normal row is now surfaced+open; the sealed row is untouched.
-        let rows = store
-            .attention_updates(acct, since, None, None, None, false, SpamScope::Exclude)
-            .unwrap();
-        assert_eq!(rows.len(), 1, "sealed never surfaces");
-        assert_eq!(rows[0].update.id, nid);
-        assert_eq!(rows[0].status, AttentionStatus::Open);
-        assert!(rows[0].surfaced_at.is_some());
-
-        // Sealed row: still status='new', surfaced_at NULL (never stamped).
-        let stats = store
-            .stats(acct, chrono::Utc::now() - chrono::Duration::days(30))
-            .unwrap();
-        assert_eq!(stats.sealed, 1);
-    }
-
-    /// The AGENT DOOR write (`set_sender_rule`) appends an audit row: actor
-    /// "agent", action "rule.set", target = the match_pattern, detail carrying the
-    /// disposition + truncated want text. This is the highest-value ledger entry.
     #[tokio::test]
     async fn set_sender_rule_writes_audit_row() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -859,550 +911,6 @@ mod tests {
         assert!(detail.chars().count() <= 132, "detail too long: {detail}");
         assert!(detail.ends_with('…'), "truncation marker missing: {detail}");
     }
-
-    /// Seed one non-sealed message with a triage row, returning its local id.
-    fn seed_msg(
-        store: &SqliteStore,
-        acct: AccountId,
-        gmail: &str,
-        thread: &str,
-        subject: &str,
-        sensitivity: Sensitivity,
-        kind: Option<SealedKind>,
-    ) -> i64 {
-        let msg = squelch_core::types::NewMessage {
-            account_id: acct,
-            gmail_msg_id: gmail.into(),
-            thread_id: thread.into(),
-            from_addr: "alice@example.com".into(),
-            from_name: Some("Alice".into()),
-            subject: subject.into(),
-            received_at: Utc::now(),
-            snippet: subject.into(),
-            body: subject.into(),
-            body_html: None,
-            is_sent: false,
-            is_spam: false,
-            to_addrs: None,
-            list_unsubscribe: None,
-            list_unsub_one_click: false,
-            auth_pass: None,
-        };
-        let id = store.upsert_message(&msg).unwrap();
-        store
-            .set_triage(id, acct, 80, Tier::Signal, sensitivity, kind, "", "", None)
-            .unwrap();
-        id
-    }
-
-    /// [`seed_msg`] with an explicit body and arrival time, for the tests that
-    /// are about RANKING rather than about what a message contains.
-    fn seed_dated(
-        store: &SqliteStore,
-        acct: AccountId,
-        gmail: &str,
-        thread: &str,
-        subject: &str,
-        body: &str,
-        received_at: DateTime<Utc>,
-    ) -> i64 {
-        let msg = squelch_core::types::NewMessage {
-            account_id: acct,
-            gmail_msg_id: gmail.into(),
-            thread_id: thread.into(),
-            from_addr: "alice@example.com".into(),
-            from_name: Some("Alice".into()),
-            subject: subject.into(),
-            received_at,
-            snippet: subject.into(),
-            body: body.into(),
-            body_html: None,
-            is_sent: false,
-            is_spam: false,
-            to_addrs: None,
-            list_unsubscribe: None,
-            list_unsub_one_click: false,
-            auth_pass: None,
-        };
-        let id = store.upsert_message(&msg).unwrap();
-        store
-            .set_triage(
-                id,
-                acct,
-                80,
-                Tier::Signal,
-                Sensitivity::Normal,
-                None,
-                "",
-                "",
-                None,
-            )
-            .unwrap();
-        id
-    }
-
-    /// search_mail returns SUMMARIES ONLY, excludes sealed mail, and its
-    /// thread_id round-trips to get_thread.
-    #[tokio::test]
-    async fn search_mail_returns_summaries_and_excludes_sealed() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        seed_msg(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "quarterly invoice from acme",
-            Sensitivity::Normal,
-            None,
-        );
-        // A sealed OTP that also matches the query token — must never surface.
-        seed_msg(
-            &store,
-            acct,
-            "g2",
-            "t2",
-            "your acme verification code",
-            Sensitivity::Sealed,
-            Some(SealedKind::Otp),
-        );
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let res = server
-            .search_mail(Parameters(SearchMailParams {
-                query: "acme".into(),
-                k: None,
-                sort: None,
-            }))
-            .await
-            .unwrap();
-
-        // Pull the JSON payload back out and assert on it.
-        let text = res.content[0].as_text().unwrap().text.as_str();
-        let value: serde_json::Value = serde_json::from_str(text).unwrap();
-        let hits = value.as_array().unwrap();
-        assert_eq!(hits.len(), 1, "sealed hit must be absent");
-        let hit = &hits[0];
-        assert_eq!(hit["thread_id"], "t1");
-        assert_eq!(hit["relevance"], 1);
-        assert!(
-            hit["sender"]
-                .as_str()
-                .unwrap()
-                .contains("alice@example.com")
-        );
-        // SUMMARY ONLY: the one_line is the subject; there is no `body` field.
-        assert_eq!(hit["one_line"], "quarterly invoice from acme");
-        assert!(
-            hit.get("body").is_none(),
-            "search_mail must never emit a body"
-        );
-    }
-
-    /// The agent can turn the recency tilt off, and cannot invent a third order.
-    #[tokio::test]
-    async fn search_mail_takes_a_sort_and_refuses_an_invented_one() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-
-        // A stronger match from long ago against a weaker one from today, so
-        // the two orders genuinely disagree about which comes first. Seeded
-        // through `upsert_message` rather than by UPDATE: `messages_fts` is a
-        // plain fts5 table written by the upsert, so a raw UPDATE would leave
-        // the index holding the old text.
-        seed_dated(
-            &store,
-            acct,
-            "g-old",
-            "t-old",
-            "contract",
-            "contract",
-            Utc::now() - chrono::Duration::days(500),
-        );
-        seed_dated(
-            &store,
-            acct,
-            "g-new",
-            "t-new",
-            "weekly digest",
-            "A stray mention of a contract sits far down this roundup of newsletter \
-             items, among gardening tips, local events, recipes, and a reader letter \
-             about compost.",
-            Utc::now(),
-        );
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let top = |res: CallToolResult| -> String {
-            let text = res.content[0].as_text().unwrap().text.clone();
-            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-            value.as_array().unwrap()[0]["thread_id"]
-                .as_str()
-                .unwrap()
-                .to_string()
-        };
-
-        let recent = server
-            .search_mail(Parameters(SearchMailParams {
-                query: "contract".into(),
-                k: None,
-                sort: None,
-            }))
-            .await
-            .unwrap();
-        assert_eq!(top(recent), "t-new", "the default tilts toward recent mail");
-
-        let best = server
-            .search_mail(Parameters(SearchMailParams {
-                query: "contract".into(),
-                k: None,
-                sort: Some("best_match".into()),
-            }))
-            .await
-            .unwrap();
-        assert_eq!(top(best), "t-old", "best_match ranks on relevance alone");
-
-        // An invented value is an error the model can see and correct, never a
-        // silent fallback that teaches it the argument works.
-        let bad = server
-            .search_mail(Parameters(SearchMailParams {
-                query: "contract".into(),
-                k: None,
-                sort: Some("newest".into()),
-            }))
-            .await;
-        assert!(bad.is_err(), "an unknown sort must be invalid_params");
-    }
-
-    /// get_thread forgiveness: a MESSAGE id resolves to its thread; a sealed
-    /// message id returns the SAME not-found as a nonexistent id (no leak).
-    #[tokio::test]
-    async fn get_thread_resolves_message_id_and_seals_indistinguishably() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        let mid = seed_msg(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "hello there",
-            Sensitivity::Normal,
-            None,
-        );
-        let sealed_mid = seed_msg(
-            &store,
-            acct,
-            "g2",
-            "t2",
-            "code 123",
-            Sensitivity::Sealed,
-            Some(SealedKind::Otp),
-        );
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-
-        // Thread id works (path 1).
-        assert!(
-            server
-                .get_thread(Parameters(GetThreadParams { id: "t1".into() }))
-                .await
-                .is_ok()
-        );
-
-        // Message id resolves to its thread (path 2, forgiveness).
-        let by_msg = server
-            .get_thread(Parameters(GetThreadParams {
-                id: mid.to_string(),
-            }))
-            .await
-            .unwrap();
-        let text = by_msg.content[0].as_text().unwrap().text.as_str();
-        let view: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(view["thread_id"], "t1");
-
-        // A SEALED message id and a nonexistent id both 404 identically.
-        let sealed_err = server
-            .get_thread(Parameters(GetThreadParams {
-                id: sealed_mid.to_string(),
-            }))
-            .await
-            .unwrap_err();
-        let missing_err = server
-            .get_thread(Parameters(GetThreadParams {
-                id: "999999".into(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(sealed_err.code, missing_err.code);
-        assert_eq!(sealed_err.message, missing_err.message);
-        // And the sealed THREAD id itself is also an identical 404.
-        let sealed_thread_err = server
-            .get_thread(Parameters(GetThreadParams { id: "t2".into() }))
-            .await
-            .unwrap_err();
-        assert_eq!(sealed_thread_err.code, missing_err.code);
-    }
-
-    /// get_shipments returns en-route packages by default and includes delivered
-    /// ones only when asked, and carries the carrier's ETA + verbatim status for
-    /// a polled row. Shipments are structurally sealed-free (never built from
-    /// sealed mail), so there is no sealed row to exclude here.
-    #[tokio::test]
-    async fn get_shipments_en_route_by_default_and_delivered_with_flag() {
-        use squelch_core::triage::{CarrierTrack, ShipmentInfo, ShipmentStatus};
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        let mid = seed_msg(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "shipped",
-            Sensitivity::Normal,
-            None,
-        );
-        let eta = Utc::now() + chrono::Duration::hours(6);
-        let ups = store
-            .upsert_shipment(
-                acct,
-                mid,
-                &ShipmentInfo {
-                    carrier: "ups".into(),
-                    tracking_number: "1Z999AA10123456784".into(),
-                    item_name: "Headphones".into(),
-                    status: ShipmentStatus::Shipped,
-                    tracking_url: Some("https://www.ups.com/track?tracknum=1Z".into()),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-        store
-            .apply_carrier_track(
-                acct,
-                ups,
-                &CarrierTrack {
-                    status: None,
-                    carrier_status_raw: "Held at customs".into(),
-                    eta: Some(eta),
-                    delivered_at: None,
-                },
-                Utc::now(),
-            )
-            .unwrap();
-        store
-            .upsert_shipment(
-                acct,
-                mid,
-                &ShipmentInfo {
-                    carrier: "usps".into(),
-                    tracking_number: "9400111899223817428490".into(),
-                    item_name: "Book".into(),
-                    status: ShipmentStatus::Delivered,
-                    tracking_url: None,
-                },
-                Utc::now(),
-            )
-            .unwrap();
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-
-        // Default: en-route only.
-        let res = server
-            .get_shipments(Parameters(GetShipmentsParams {
-                include_delivered: None,
-            }))
-            .await
-            .unwrap();
-        let text = res.content[0].as_text().unwrap().text.as_str();
-        let v: serde_json::Value = serde_json::from_str(text).unwrap();
-        let hits = v.as_array().unwrap();
-        assert_eq!(hits.len(), 1, "delivered excluded by default");
-        assert_eq!(hits[0]["status"], "shipped");
-        assert_eq!(hits[0]["tracking_number"], "1Z999AA10123456784");
-        // The carrier's own words survive a status it does not map onto our
-        // ladder ("Held at customs" left the row `shipped`), and the ETA rides
-        // out as a timestamp the agent can parse back.
-        assert_eq!(hits[0]["carrier_status_raw"], "Held at customs");
-        assert_eq!(
-            hits[0]["eta"]
-                .as_str()
-                .unwrap()
-                .parse::<DateTime<Utc>>()
-                .unwrap(),
-            eta
-        );
-        // SUMMARY-ONLY shape: no body key. The agent door stays minimal — no
-        // thread_id, no ids, nothing to pivot into a message with.
-        assert!(hits[0].get("body").is_none());
-        assert!(hits[0].get("thread_id").is_none());
-
-        // With the flag: both.
-        let res = server
-            .get_shipments(Parameters(GetShipmentsParams {
-                include_delivered: Some(true),
-            }))
-            .await
-            .unwrap();
-        let text = res.content[0].as_text().unwrap().text.as_str();
-        let v: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(v.as_array().unwrap().len(), 2);
-    }
-
-    /// Read the tracking numbers `get_shipments` returned, for the policy test.
-    async fn agent_door_numbers(server: &SquelchServer) -> Vec<String> {
-        let res = server
-            .get_shipments(Parameters(GetShipmentsParams {
-                include_delivered: Some(true),
-            }))
-            .await
-            .unwrap();
-        let text = res.content[0].as_text().unwrap().text.as_str();
-        let v: serde_json::Value = serde_json::from_str(text).unwrap();
-        v.as_array()
-            .unwrap()
-            .iter()
-            .map(|h| h["tracking_number"].as_str().unwrap().to_string())
-            .collect()
-    }
-
-    /// DEFECT (P1): the agent door hardcoded the BUILT-IN retirement cap and
-    /// ignored the operator's `[carriers] max_failures`, so with `max_failures=1`
-    /// an agent kept reporting phantoms four failures after the human door had
-    /// retired them, and with `10` it lost live packages the human door still
-    /// showed. Now it carries the policy, and both doors are asserted to agree
-    /// given the same one.
-    #[tokio::test]
-    async fn get_shipments_honors_a_non_default_policy_and_matches_the_human_door() {
-        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        let mid = seed_msg(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "shipped",
-            Sensitivity::Normal,
-            None,
-        );
-
-        // An AMBIGUOUS bare digit-run with ONE permanent rejection against it.
-        let ambiguous = store
-            .upsert_shipment(
-                acct,
-                mid,
-                &ShipmentInfo {
-                    carrier: "fedex".into(),
-                    tracking_number: "123456789012".into(),
-                    item_name: "Maybe a package".into(),
-                    status: ShipmentStatus::Shipped,
-                    tracking_url: None,
-                },
-                Utc::now(),
-            )
-            .unwrap();
-        store
-            .record_poll_outcome(acct, ambiguous, Utc::now(), true)
-            .unwrap();
-
-        // A TIGHT policy (retire at 1) must hide it on the agent door too. The
-        // default cap of 5 is what the old code used, and under it this row is
-        // still visible — so a stale hardcode fails this assertion.
-        let tight = ShipmentListPolicy {
-            suppress_failed_ambiguous_at: 1,
-            stale_after_days: 0,
-        };
-        let server = SquelchServer::new(store.clone(), "me@localhost")
-            .unwrap()
-            .with_shipment_policy(tight);
-        assert!(
-            agent_door_numbers(&server).await.is_empty(),
-            "the operator's max_failures=1 must retire the phantom on the agent door"
-        );
-
-        // TWO DOORS, ONE VIEW: same policy, same rows, whichever door asks.
-        let human = store.list_shipments(acct, true, tight).unwrap();
-        assert!(
-            human.is_empty(),
-            "the human door hides it under the same policy"
-        );
-
-        // And a LOOSE policy keeps it, on both doors.
-        let loose = ShipmentListPolicy {
-            suppress_failed_ambiguous_at: 10,
-            stale_after_days: 0,
-        };
-        let server = SquelchServer::new(store.clone(), "me@localhost")
-            .unwrap()
-            .with_shipment_policy(loose);
-        assert_eq!(agent_door_numbers(&server).await, vec!["123456789012"]);
-        assert_eq!(
-            store
-                .list_shipments(acct, true, loose)
-                .unwrap()
-                .into_iter()
-                .map(|s| s.tracking_number)
-                .collect::<Vec<_>>(),
-            vec!["123456789012"],
-            "and the human door agrees under that one too"
-        );
-    }
-
-    /// The staleness half of the same contract: an agent must not report a
-    /// package nothing has happened to for longer than the operator's window.
-    #[tokio::test]
-    async fn get_shipments_hides_a_stale_package_from_the_agent_too() {
-        use squelch_core::triage::{ShipmentInfo, ShipmentStatus};
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        let mid = seed_msg(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "shipped",
-            Sensitivity::Normal,
-            None,
-        );
-        let ship = |number: &str| ShipmentInfo {
-            carrier: "ups".into(),
-            tracking_number: number.into(),
-            item_name: "Headphones".into(),
-            status: ShipmentStatus::Shipped,
-            tracking_url: None,
-        };
-        store
-            .upsert_shipment(
-                acct,
-                mid,
-                &ship("1Z999AA10123456784"),
-                Utc::now() - chrono::Duration::days(8),
-            )
-            .unwrap();
-        store
-            .upsert_shipment(
-                acct,
-                mid,
-                &ship("1Z999AA10123456785"),
-                Utc::now() - chrono::Duration::days(6),
-            )
-            .unwrap();
-
-        let policy = ShipmentListPolicy {
-            suppress_failed_ambiguous_at: u32::MAX,
-            stale_after_days: 7,
-        };
-        let server = SquelchServer::new(store.clone(), "me@localhost")
-            .unwrap()
-            .with_shipment_policy(policy);
-        assert_eq!(
-            agent_door_numbers(&server).await,
-            vec!["1Z999AA10123456785"],
-            "8 days silent is hidden, 6 days silent is not"
-        );
-    }
-
-    /// FAIL-CLOSED: an invalid disposition never reaches the store, so no rule and
-    /// no audit row is written — the tool errors out clean.
     #[tokio::test]
     async fn set_sender_rule_bad_disposition_writes_nothing() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -1421,355 +929,365 @@ mod tests {
         assert_eq!(store.list_audit(acct, 10).unwrap().len(), 0);
     }
 
-    // ---- issue #21: the rule rides with the mail --------------------------
-
-    /// [`seed_msg`] with a chosen SENDER and tier, for the standing-instruction
-    /// tests — which are entirely about which address a rule's pattern matches,
-    /// and so cannot use the shared `alice@example.com`.
-    ///
-    /// Triage is written the way `set_triage` writes it: `matched_rule_id` NULL.
-    /// That is not a shortcut, it is the case under test — see
-    /// `a_bill_carries_its_rule_though_no_rule_decided_it`.
-    fn seed_from(
-        store: &SqliteStore,
-        acct: AccountId,
-        gmail: &str,
-        thread: &str,
-        subject: &str,
-        from_addr: &str,
-        tier: Tier,
-    ) -> i64 {
-        let msg = squelch_core::types::NewMessage {
-            account_id: acct,
-            gmail_msg_id: gmail.into(),
-            thread_id: thread.into(),
-            from_addr: from_addr.into(),
-            from_name: None,
-            subject: subject.into(),
-            received_at: Utc::now(),
-            snippet: subject.into(),
-            body: subject.into(),
-            body_html: None,
-            is_sent: false,
-            is_spam: false,
-            to_addrs: None,
-            list_unsubscribe: None,
-            list_unsub_one_click: false,
-            auth_pass: None,
+    fn seed(store: &SqliteStore, account: i64, thread: &str, text: &str) -> i64 {
+        use squelch_core::sync::ingest::{RawFetched, ingest_with_rules};
+        let now = Utc::now();
+        let raw = RawFetched {
+            account_id: account,
+            gmail_msg_id: format!("{thread}-{text}"),
+            gmail_thread_id: Some(thread.into()),
+            raw: format!("From: alerts@example.com\r\nTo: me@localhost\r\nSubject: {text}\r\nDate: {}\r\n\r\n{text}", now.to_rfc2822()).into_bytes(),
+            internal_date: Some(now), is_sent: false, is_spam: false,
+            account_addr: "me@localhost".into(),
         };
-        let id = store.upsert_message(&msg).unwrap();
-        store
-            .set_triage(
-                id,
-                acct,
-                80,
-                tier,
-                Sensitivity::Normal,
-                None,
-                subject,
-                "",
-                None,
-            )
-            .unwrap();
-        id
+        let message = ingest_with_rules(&raw, &Default::default(), now, &[], |_| false);
+        store.ingest_message(&message).unwrap()
     }
 
-    /// Decode a `get_inbox_updates` payload into its JSON array.
-    fn updates_json(res: &CallToolResult) -> Vec<serde_json::Value> {
-        let text = res.content[0].as_text().unwrap().text.as_str();
-        serde_json::from_str::<serde_json::Value>(text)
+    fn decide(
+        store: &SqliteStore,
+        account: i64,
+        id: i64,
+        restricted: bool,
+        extra_source: Option<i64>,
+    ) {
+        use squelch_core::store::agent_triage::AgentCommitOutcome;
+        use squelch_core::triage::decision::MessageDecision;
+        store
+            .enqueue_agent_triage(account, id, "test", false)
+            .unwrap();
+        // Ingest may have already queued an arrival; finish all jobs for this message.
+        while let Some(job) = store
+            .claim_agent_job(account, "triage", Utc::now(), 120)
             .unwrap()
-            .as_array()
-            .unwrap()
-            .clone()
-    }
-
-    async fn fetch_updates(server: &SquelchServer) -> Vec<serde_json::Value> {
-        let res = server
-            .get_inbox_updates(Parameters(GetInboxUpdatesParams {
-                since: Utc::now() - chrono::Duration::days(1),
-                min_importance: None,
-            }))
-            .await
-            .unwrap();
-        updates_json(&res)
-    }
-
-    /// ISSUE #21, the whole of it: a sender the owner has written a rule for
-    /// delivers that rule's WORDS beside their mail, so the agent reporting the
-    /// message knows what to say about it. The existing keys are untouched (the
-    /// wrapper flattens), and the DISPOSITION is deliberately not on the wire.
-    #[tokio::test]
-    async fn standing_instruction_rides_with_the_mail() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        store
-            .set_sender_rule(
-                acct,
-                "*@chase.com",
-                "the statement total, not the minimum payment",
-                Disposition::Filtered,
-            )
-            .unwrap();
-        seed_from(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "Your statement is ready",
-            "statements@chase.com",
-            Tier::Deadline,
-        );
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let rows = fetch_updates(&server).await;
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-
-        let instruction = &row["standing_instruction"];
-        assert_eq!(
-            instruction["want"],
-            "the statement total, not the minimum payment"
-        );
-        assert_eq!(instruction["match_pattern"], "*@chase.com");
-        // The VERDICT stays off the agent door: it is already spent as `tier`.
-        assert!(
-            instruction.get("disposition").is_none(),
-            "a verdict must not travel with the instruction: {instruction}"
-        );
-
-        // Additive: every key an agent already reads is still where it was.
-        assert_eq!(row["thread_id"], "t1");
-        assert_eq!(row["tier"], "deadline");
-        assert_eq!(row["one_line"], "Your statement is ready");
-    }
-
-    /// THE REASON THIS RESOLVES BY ADDRESS AND NOT BY `matched_rule_id`.
-    ///
-    /// Rung 1 of Stage-1 (bill/payment) runs BEFORE sender rules and returns
-    /// `matched_rule: None` — it reads a rule only to decide whether to trust
-    /// the sender's "past due" (`triage::mod`'s own tests pin this: "bill rung
-    /// wins over the squelch rule"). A credit-card statement is a bill, so the
-    /// issue's motivating example is precisely the mail whose triage row carries
-    /// NO rule id. A `LEFT JOIN sender_rules ON sr.id = t.matched_rule_id` would
-    /// deliver nothing here.
-    ///
-    /// The same assertion covers the other half: a rule written AFTER the mail
-    /// was triaged — the common shape, since the user says what they want
-    /// because of a message they were just shown — never marks the existing row
-    /// either.
-    #[tokio::test]
-    async fn a_bill_carries_its_rule_though_no_rule_decided_it() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        // Mail first, rule second, and the triage row keeps matched_rule_id NULL
-        // throughout — exactly what Rung 1 leaves behind.
-        seed_from(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "Your statement is ready",
-            "statements@chase.com",
-            Tier::Deadline,
-        );
-        store
-            .set_sender_rule(
-                acct,
-                "*@chase.com",
-                "the statement total, not the minimum payment",
-                Disposition::Filtered,
-            )
-            .unwrap();
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let rows = fetch_updates(&server).await;
-        assert_eq!(rows.len(), 1);
-        assert!(
-            rows[0]["matched_rule"].is_null(),
-            "the fixture is only meaningful while no rule decided the row: {}",
-            rows[0]
-        );
-        assert_eq!(
-            rows[0]["standing_instruction"]["want"], "the statement total, not the minimum payment",
-            "an id join would have delivered nothing here"
-        );
-    }
-
-    /// A BARE VERDICT SAYS NOTHING. Only a `filtered` rule is required to carry
-    /// want text; a surface/squelch rule with none is a decision about where the
-    /// mail goes, not an instruction about how to describe it, and an empty
-    /// string on the wire is an instruction the agent has to interpret. The key
-    /// is absent, not null, not "".
-    #[tokio::test]
-    async fn a_rule_with_no_words_delivers_no_instruction() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        store
-            .set_sender_rule(acct, "*@chase.com", "   ", Disposition::Squelch)
-            .unwrap();
-        seed_from(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "statement",
-            "statements@chase.com",
-            Tier::Noise,
-        );
-        // ...and an entirely unruled sender, which must read the same way.
-        seed_from(
-            &store,
-            acct,
-            "g2",
-            "t2",
-            "lunch?",
-            "bob@example.com",
-            Tier::Signal,
-        );
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        for row in fetch_updates(&server).await {
-            assert!(
-                row.get("standing_instruction").is_none(),
-                "absent, never null or empty: {row}"
+        {
+            assert_eq!(
+                job.message_id, id,
+                "test fixtures assess one message at a time"
+            );
+            let context = store.load_agent_context(&job).unwrap();
+            let mut decision = MessageDecision {
+                summary: "A meaningful update".into(),
+                ..Default::default()
+            };
+            decision.external_access.restricted = restricted;
+            decision.attention.show_in_fye = true;
+            decision.attention.summary = "An update worth reading".into();
+            decision.attention.relevant_message_ids = vec![id];
+            let mut sources = vec![context.message.source.clone()];
+            if let Some(source) = extra_source {
+                sources.push(store.agent_read_message(account, source).unwrap().source);
+            }
+            assert_eq!(
+                store
+                    .commit_agent_decision(&job, &context, &decision, &sources)
+                    .unwrap(),
+                AgentCommitOutcome::Applied
             );
         }
     }
 
-    /// get_thread carries the instructions for the people in the thread, ONCE
-    /// each: one rule matching three messages is one ask, not three. Both of
-    /// get_thread's resolution paths are covered — the thread id here, the
-    /// message id below — because the instruction must not ride on one and not
-    /// the other.
     #[tokio::test]
-    async fn get_thread_carries_each_instruction_once() {
+    async fn canonical_bill_and_delivery_reach_existing_tools_with_date_precision_and_guards() {
+        use squelch_core::store::agent_triage::AgentCommitOutcome;
+        use squelch_core::triage::decision::MessageDecision;
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
+        let account = store.ensure_account("me@localhost").unwrap();
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let id = seed(&store, account, "records", "Bill and shipping confirmation");
+        let job = store
+            .claim_agent_job(account, "triage", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        let context = store.load_agent_context(&job).unwrap();
+        let due = (Utc::now() + chrono::Duration::days(2))
+            .format("%Y-%m-%d")
+            .to_string();
+        let decision = MessageDecision {
+            summary: "Order and payment details".into(),
+            destinations: vec![MessageDestination::Records],
+            records: vec![
+                RecordProposal::Bill {
+                    merchant: "Shop".into(),
+                    amount: Some(42.0),
+                    currency: Some("USD".into()),
+                    due: Some(SupportedTime {
+                        value: due.clone(),
+                        source_message_id: id,
+                        ..Default::default()
+                    }),
+                    autopay: None,
+                    evidence: vec![],
+                },
+                RecordProposal::Delivery {
+                    carrier: Some("ups".into()),
+                    tracking_number: Some(" 1z999 aa10 1234 56784 ".into()),
+                    status: "shipped".into(),
+                    evidence: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .commit_agent_decision(
+                    &job,
+                    &context,
+                    &decision,
+                    std::slice::from_ref(&context.message.source)
+                )
+                .unwrap(),
+            AgentCommitOutcome::Applied
+        );
+        let bills = values(
+            &server
+                .get_deadlines(Parameters(GetDeadlinesParams {
+                    within_days: Some(3),
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(bills.as_array().unwrap().len(), 1);
+        assert_eq!(bills[0]["due_at"], due, "date-only facts remain date-only");
+        assert_eq!(bills[0]["amount"], 42.0);
+        assert!(
+            values(
+                &server
+                    .get_deadlines(Parameters(GetDeadlinesParams {
+                        within_days: Some(1)
+                    }))
+                    .await
+                    .unwrap()
+            )
+            .as_array()
+            .unwrap()
+            .is_empty()
+        );
+        let polling_row = store.external_shipments(account, true).unwrap().remove(0);
+        assert_eq!(polling_row.tracking_number, "1Z999AA10123456784");
         store
-            .set_sender_rule(
-                acct,
-                "*@chase.com",
-                "the statement total, not the minimum payment",
-                Disposition::Filtered,
+            .apply_carrier_track(
+                account,
+                polling_row.id,
+                &squelch_core::triage::CarrierTrack {
+                    status: Some(squelch_core::triage::ShipmentStatus::OutForDelivery),
+                    carrier_status_raw: "Out for delivery".into(),
+                    eta: Some(Utc::now() + chrono::Duration::days(1)),
+                    delivered_at: None,
+                },
+                Utc::now(),
             )
             .unwrap();
-        // Two DIFFERENT addresses under the one pattern, plus an unruled third
-        // party on the same thread.
-        let seed =
-            |g, subject, from| seed_from(&store, acct, g, "t1", subject, from, Tier::Deadline);
-        seed("g1", "statement", "statements@chase.com");
-        seed("g2", "re: statement", "alerts@chase.com");
-        let mid = seed("g3", "re: statement", "bob@example.com");
-
-        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let read = |id: String| {
-            let server = server.clone();
-            async move {
-                let res = server
-                    .get_thread(Parameters(GetThreadParams { id }))
-                    .await
-                    .unwrap();
-                let text = res.content[0].as_text().unwrap().text.clone();
-                serde_json::from_str::<serde_json::Value>(&text).unwrap()
-            }
-        };
-
-        let by_thread = read("t1".to_string()).await;
-        let list = by_thread["standing_instructions"].as_array().unwrap();
-        assert_eq!(list.len(), 1, "one rule, one ask: {by_thread}");
-        assert_eq!(
-            list[0]["want"],
-            "the statement total, not the minimum payment"
+        let deliveries = values(
+            &server
+                .get_shipments(Parameters(GetShipmentsParams {
+                    include_delivered: None,
+                }))
+                .await
+                .unwrap(),
         );
-        assert_eq!(list[0]["match_pattern"], "*@chase.com");
-        // Flatten kept the thread itself intact.
-        assert_eq!(by_thread["thread_id"], "t1");
-        assert_eq!(by_thread["messages"].as_array().unwrap().len(), 3);
-
-        // PATH 2: the same thread reached by a MESSAGE id — and by the message
-        // of the UNRULED sender, so a per-message shortcut would answer empty.
-        let by_message = read(mid.to_string()).await;
-        assert_eq!(
-            by_message["standing_instructions"], by_thread["standing_instructions"],
-            "both get_thread paths deliver the same instructions"
+        assert_eq!(deliveries.as_array().unwrap().len(), 1);
+        assert_eq!(deliveries[0]["tracking_number"], "1Z999AA10123456784");
+        assert_eq!(deliveries[0]["status"], "out_for_delivery");
+        assert_eq!(deliveries[0]["carrier_status_raw"], "Out for delivery");
+        assert!(
+            !deliveries[0]["eta"].is_null(),
+            "spaced canonical number receives compact-row carrier observations"
+        );
+        store
+            .clear_shipment(account, polling_row.id, Utc::now())
+            .unwrap();
+        assert!(
+            values(
+                &server
+                    .get_shipments(Parameters(GetShipmentsParams {
+                        include_delivered: Some(true)
+                    }))
+                    .await
+                    .unwrap()
+            )
+            .as_array()
+            .unwrap()
+            .is_empty(),
+            "canonical delivery cannot resurrect an explicitly cleared tracking number"
+        );
+        store
+            .correct_agent_triage(
+                account,
+                id,
+                "external_access",
+                &serde_json::json!(true),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            values(
+                &server
+                    .get_deadlines(Parameters(GetDeadlinesParams { within_days: None }))
+                    .await
+                    .unwrap()
+            )
+            .as_array()
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            values(
+                &server
+                    .get_shipments(Parameters(GetShipmentsParams {
+                        include_delivered: Some(true)
+                    }))
+                    .await
+                    .unwrap()
+            )
+            .as_array()
+            .unwrap()
+            .is_empty()
         );
     }
 
-    /// A thread nobody is ruled for carries no key at all, rather than an empty
-    /// list the agent has to reason about.
-    #[tokio::test]
-    async fn an_unruled_thread_carries_no_instruction_key() {
-        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        seed_from(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "lunch?",
-            "bob@example.com",
-            Tier::Signal,
-        );
+    fn values(result: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result.content[0].as_text().unwrap().text).unwrap()
+    }
 
+    async fn search(server: &SquelchServer, query: &str) -> serde_json::Value {
+        values(
+            &server
+                .search_mail(Parameters(SearchMailParams {
+                    query: query.into(),
+                    k: Some(50),
+                    sort: None,
+                }))
+                .await
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_and_restricted_mail_fail_closed_but_human_can_read() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
         let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let res = server
-            .get_thread(Parameters(GetThreadParams { id: "t1".into() }))
+        let restricted = seed(&store, account, "auth", "password reset");
+        decide(&store, account, restricted, true, None);
+        let pending = seed(&store, account, "pending", "unassessed message");
+        for id in [
+            restricted.to_string(),
+            pending.to_string(),
+            "unknown".into(),
+        ] {
+            let error = server
+                .get_thread(Parameters(GetThreadParams { id }))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code,
+                ErrorData::resource_not_found("not found", None).code
+            );
+        }
+        assert!(
+            search(&server, "password")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            search(&server, "unassessed")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.thread_view_with_html(account, "auth").is_ok());
+        assert!(store.thread_view_with_html(account, "pending").is_ok());
+    }
+
+    #[tokio::test]
+    async fn informational_login_alert_is_readable_after_allowed_assessment() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let id = seed(&store, account, "login", "new login alert");
+        decide(&store, account, id, false, None);
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        assert_eq!(search(&server, "login").await.as_array().unwrap().len(), 1);
+        let view = server
+            .get_thread(Parameters(GetThreadParams { id: id.to_string() }))
             .await
             .unwrap();
-        let text = res.content[0].as_text().unwrap().text.clone();
-        let view: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert!(
-            view.get("standing_instructions").is_none(),
-            "absent, never []: {view}"
-        );
-        assert_eq!(view["thread_id"], "t1");
+        assert_eq!(values(&view)["thread_id"], "login");
     }
 
-    /// The pattern is matched with the SAME glob triage runs — case-insensitive,
-    /// `*` the only metacharacter — not with a SQL `GLOB`/`LIKE` re-spelling.
-    /// `?` is a literal here and case does not matter; under SQLite's `GLOB` the
-    /// first is a wildcard and the second decides the answer.
     #[tokio::test]
-    async fn the_glob_is_the_rust_one() {
+    async fn restricted_sibling_blocks_full_thread_and_search_projection() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
-        let acct = store.ensure_account("me@localhost").unwrap();
-        store
-            .set_sender_rule(acct, "*@CHASE.com", "totals only", Disposition::Filtered)
-            .unwrap();
-        store
-            .set_sender_rule(acct, "a?b@example.com", "never", Disposition::Filtered)
-            .unwrap();
-        seed_from(
-            &store,
-            acct,
-            "g1",
-            "t1",
-            "statement",
-            "Statements@chase.com",
-            Tier::Deadline,
-        );
-        seed_from(
-            &store,
-            acct,
-            "g2",
-            "t2",
-            "hi",
-            "axb@example.com",
-            Tier::Signal,
-        );
-
+        let account = store.ensure_account("me@localhost").unwrap();
+        let first = seed(&store, account, "mixed", "ordinary conversation");
+        decide(&store, account, first, false, None);
+        let secret = seed(&store, account, "mixed", "reset token");
+        decide(&store, account, secret, true, None);
         let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
-        let rows = fetch_updates(&server).await;
-        let by_thread = |t: &str| rows.iter().find(|r| r["thread_id"] == t).unwrap().clone();
-        assert_eq!(
-            by_thread("t1")["standing_instruction"]["want"],
-            "totals only",
-            "the glob folds case on both sides"
+        assert!(
+            server
+                .get_thread(Parameters(GetThreadParams {
+                    id: first.to_string()
+                }))
+                .await
+                .is_err()
         );
         assert!(
-            by_thread("t2").get("standing_instruction").is_none(),
-            "`?` is a literal, not a single-character wildcard"
+            search(&server, "ordinary")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_summary_cannot_disclose_a_restricted_source() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let secret = seed(&store, account, "secret", "reset code");
+        decide(&store, account, secret, true, None);
+        let derived = seed(&store, account, "derived", "public update");
+        decide(&store, account, derived, false, Some(secret));
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        assert!(!store.external_thread_allowed(account, "derived").unwrap());
+        assert!(
+            search(&server, "public")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn inbox_uses_agent_membership_and_does_not_acknowledge_human_reading() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let id = seed(&store, account, "attention", "please reply");
+        decide(&store, account, id, false, None);
+        let server = SquelchServer::new(store.clone(), "me@localhost").unwrap();
+        let result = server
+            .get_inbox_updates(Parameters(GetInboxUpdatesParams {
+                since: Utc::now() - chrono::Duration::days(1),
+                min_importance: Some(100),
+            }))
+            .await
+            .unwrap();
+        let output = values(&result);
+        assert_eq!(output.as_array().unwrap().len(), 1);
+        assert_eq!(output[0]["message_id"], id);
+        assert!(output[0].get("tier").is_none());
+        assert!(output[0].get("notification").is_none());
+        assert!(
+            store
+                .agent_read_message(account, id)
+                .unwrap()
+                .opened_at
+                .is_none()
         );
     }
 }

@@ -27,11 +27,16 @@ import SwiftUI
 /// invite provisions a tenant and this person's tenant is already running.
 ///
 /// SIGN UP is the invite-code form, and it is the only place a code is asked
-/// for. The two are one screen apart here for the same reason they are two
-/// routes over there: they answer different questions about the same person.
+/// for. Both actions share the connection chooser and open their browser route.
 private enum Hosted {
-    static let signIn = "https://signup.passband.app/app/auth"
-    static let signUp = "https://signup.passband.app"
+    // Send the rendered appearance, including a resolved system preference.
+    // The account site preserves this choice through OAuth and pairing (#214).
+    static func signIn(theme: ColorScheme) -> String {
+        "https://signup.passband.app/app/auth?theme=\(theme == .dark ? "dark" : "light")"
+    }
+    static func signUp(theme: ColorScheme) -> String {
+        "https://signup.passband.app?theme=\(theme == .dark ? "dark" : "light")"
+    }
 }
 
 /// Which way in the screen is showing.
@@ -45,8 +50,8 @@ private enum HostingChoice: Hashable { case hosted, selfHosted }
 /// Progressive disclosure for the first account. Add Account deliberately
 /// skips this — someone adding a second daemon already knows what Passband is.
 private enum ConnectGateStep: Hashable {
+    case introduction
     case welcome
-    case route(HostingChoice)
     case selfHostGuide
     /// nil means a complete pair link brought us here. Its URL is authoritative,
     /// but it does not reliably reveal whether the daemon is hosted.
@@ -70,13 +75,14 @@ private enum ConnectField: Hashable { case url, code, device, token, name, submi
 struct ConnectView: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Defaults to the gate, so the two shells that mount it as the whole
     /// window say nothing about it.
     var purpose: ConnectPurpose = .gate
 
     @State private var mode: ConnectMode = .pair
-    @State private var gateStep: ConnectGateStep = .welcome
+    @State private var gateStep: ConnectGateStep = .introduction
     @State private var url = "http://127.0.0.1:8848"
     @State private var code = ""
     @State private var deviceName = Pairing.defaultDeviceName()
@@ -89,6 +95,7 @@ struct ConnectView: View {
     /// for this, but adding deliberately never moves it — the shell behind the
     /// sheet is standing on it.
     @State private var adding = false
+    @State private var retryingSavedConnection = false
     /// The failure from an add. Kept out of `store.connError`, which belongs to
     /// the gate and would still be sitting there next time one opened.
     @State private var addError: String?
@@ -108,6 +115,13 @@ struct ConnectView: View {
     /// A deep link filled the form and stopped. Rings the button that is
     /// waiting for the press the link will never make for the user.
     @State private var linkArmed = false
+    @State private var arrivedViaPairLink = false
+    @State private var showingPairingDetails = false
+    /// The gate was mounted because a saved connection could not be restored
+    /// after the practice inbox. Fixed at mount: the retry it offers is about
+    /// the keychain, not about whatever error the form shows later, so it
+    /// must outlive the form's own habit of clearing `store.connError`.
+    @State private var savedConnectionFailed = false
     /// The analytics id a hosted deep link carried, held until the pairing it
     /// belongs to actually LANDS. It is a claim about who this person is, and
     /// the only proof of that claim is a successful connect to the daemon the
@@ -119,7 +133,7 @@ struct ConnectView: View {
     @State private var pairingHelp = false
     @FocusState private var focus: ConnectField?
 
-    private var busy: Bool { claiming || adding || store.connStatus == .connecting }
+    private var busy: Bool { claiming || adding || retryingSavedConnection || store.connStatus == .connecting }
 
     /// One error line, whichever half produced it. A pairing failure wins: it is
     /// the more recent thing the user did.
@@ -151,30 +165,90 @@ struct ConnectView: View {
         // A link can arrive before this view mounts (the app was launched by
         // one, or the sheet is being opened BY one) or while it is up, so both
         // entry points are covered.
-        .task { applyPairLink(store.pairLink) }
+        .task {
+            // Commit the initial route before the form can edit/clear an
+            // error. Later error changes must never send it back to welcome.
+            if purpose == .gate {
+                if case .introduction = gateStep, store.tour.hasLeftPractice, store.connError != nil {
+                    // The saved account's own host goes in the form, so a
+                    // hosted person is not handed a localhost self-host form
+                    // with a pairing-link instruction for a link that never came.
+                    savedConnectionFailed = true
+                    if let host = Self.savedHost {
+                        url = (Self.isHostedHost(host) ? "https://" : "http://") + host
+                    } else {
+                        url = ""
+                    }
+                }
+                gateStep = effectiveGateStep
+            }
+            applyPairLink(store.pairLink)
+        }
         .onChange(of: store.pairLink) { _, link in applyPairLink(link) }
+        // A link that arrived while the form was busy stayed parked on the
+        // store; it is applied the moment the form can take it.
+        .onChange(of: busy) { _, nowBusy in
+            if !nowBusy { applyPairLink(store.pairLink) }
+        }
+    }
+
+    /// A practice exit may need credentials, but never the intro again.
+    private var effectiveGateStep: ConnectGateStep {
+        if case .introduction = gateStep, store.tour.hasLeftPractice {
+            // A saved connection that failed to restore needs the form and
+            // its existing error, not the first-time hosting introduction —
+            // and the form for the KIND of daemon that account was.
+            guard store.connError != nil else { return .welcome }
+            guard let host = Self.savedHost else { return .credentials(nil) }
+            return .credentials(Self.isHostedHost(host) ? .hosted : .selfHosted)
+        }
+        return gateStep
+    }
+
+    /// The live account's host as the index remembers it, for a gate that
+    /// exists because that account's credentials could not be read.
+    private static var savedHost: String? {
+        let host = AccountManager.shared.active?.displayHost ?? ""
+        return host.isEmpty ? nil : host
+    }
+
+    private static func isHostedHost(_ host: String) -> Bool {
+        host.hasSuffix("passband.email")
+    }
+
+    /// The welcome screen's retry, only when there is a saved connection to
+    /// retry. Built here rather than inline: an optional closure conjured by
+    /// a ternary inside the view builder is more than the type checker will
+    /// resolve in one expression.
+    private var savedRetry: (() -> Void)? {
+        guard savedConnectionFailed else { return nil }
+        return { retrySavedConnection() }
     }
 
     private var gateBody: some View {
         ZStack {
-            switch gateStep {
+            switch effectiveGateStep {
+            case .introduction:
+                OnboardingIntroView { gateStep = .welcome }
             case .welcome:
-                WelcomeGate { choice in
-                    url = choice == .selfHosted ? "http://127.0.0.1:8848" : ""
-                    gateStep = .route(choice)
-                }
-            case .route(let choice):
-                RouteGate(
-                    choice: choice,
-                    back: { gateStep = .welcome },
-                    continueToForm: {
+                WelcomeGate(
+                    retrySaved: savedRetry,
+                    retrying: retryingSavedConnection,
+                    login: {
+                        url = ""
                         mode = .pair
-                        gateStep = .credentials(choice)
+                        arrivedViaPairLink = false
+                        gateStep = .credentials(.hosted)
+                        Opener.open(Hosted.signIn(theme: colorScheme))
                     },
-                    showSelfHostGuide: { gateStep = .selfHostGuide })
+                    selfHostedLogin: {
+                        url = "http://127.0.0.1:8848"
+                        mode = .pair
+                        gateStep = .credentials(.selfHosted)
+                    })
             case .selfHostGuide:
                 SelfHostGuide(
-                    back: { gateStep = .route(.selfHosted) },
+                    back: { gateStep = .welcome },
                     continueToForm: {
                         mode = .pair
                         gateStep = .credentials(.selfHosted)
@@ -206,6 +280,14 @@ struct ConnectView: View {
                         .foregroundStyle(Palette.danger)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.top, 12)
+                }
+
+                if purpose == .gate, savedConnectionFailed {
+                    Button(retryingSavedConnection ? "Trying saved connection…" : "Try saved connection again") {
+                        retrySavedConnection()
+                    }
+                    .disabled(busy || store.accountActionsBlocked)
+                    .padding(.top, 12)
                 }
 
                 bottomActions.padding(.top, 20)
@@ -249,19 +331,35 @@ struct ConnectView: View {
         return choice
     }
 
+    /// Re-read the index and the keychain the way boot does. The gate is up
+    /// because that read failed once (a denied access panel, most often), and
+    /// a second answer is a click away without re-pairing anything.
+    private func retrySavedConnection() {
+        guard !busy, !store.accountActionsBlocked else { return }
+        retryingSavedConnection = true
+        Task { @MainActor in
+            await store.loadSettings()
+            retryingSavedConnection = false
+        }
+    }
+
     private var headerTitle: String {
         guard purpose == .gate else { return "add account" }
+        if arrivedViaPairLink { return "Make yourself at home." }
         switch hostingChoice {
-        case .hosted: return "connect hosted"
+        case .hosted: return "Connect your account."
         case .selfHosted: return "connect self-hosted"
         case nil: return "pair this device"
         }
     }
 
     private var headerSubtitle: String {
+        if purpose == .gate, arrivedViaPairLink {
+            return "Give this device and account names that feel familiar."
+        }
         switch hostingChoice {
         case .hosted:
-            return "Sign in with the Google account your mailbox belongs to, and we will connect this device."
+            return "Finish logging in in your browser. If you aren’t brought back automatically, enter your server URL and pairing code below."
         case .selfHosted:
             return "Run squelchd pair on your server, then enter what it prints."
         case nil:
@@ -270,39 +368,8 @@ struct ConnectView: View {
     }
 
     @ViewBuilder private var credentialContent: some View {
-        if hostingChoice == .hosted {
-            // THE WHOLE HOSTED SIGN IN. It leaves the app because Google's
-            // consent has to run in a real browser the user can inspect, and it
-            // comes back on its own: the page at the end of it carries a
-            // `passband://pair` link, which lands in `applyPairLink` below and
-            // fills the form under this button. Nothing is asked for here in the
-            // meantime, which is the point — an existing account has no invite
-            // code to find and no pairing code to go and mint.
-            Button("sign in with google") {
-                Opener.open(Hosted.signIn)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(Palette.accent)
-            .controlSize(.large)
-            .frame(maxWidth: .infinity)
-
-            Text("Your browser opens, you pick your Google account, and the page it lands on brings you back here.")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.inkFaintest)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.top, 9)
-
-            HStack(spacing: 10) {
-                Rectangle().fill(Palette.hairline).frame(height: 0.75)
-                Text("or")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Palette.inkFaintest)
-                Rectangle().fill(Palette.hairline).frame(height: 0.75)
-            }
-            .padding(.vertical, 15)
-
-            hostedManualForm
+        if arrivedViaPairLink && mode == .pair {
+            linkedPairForm
         } else {
             if purpose == .addAccount || hostingChoice == .selfHosted {
                 GlassSegmented(
@@ -316,6 +383,20 @@ struct ConnectView: View {
             case .token: tokenForm
             }
             nameField.padding(.top, 14)
+            if hostingChoice == .hosted {
+                Button("Open login in browser again") { Opener.open(Hosted.signIn(theme: colorScheme)) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.inkDim)
+                    .padding(.top, 14)
+            }
+            if purpose == .gate, hostingChoice == .selfHosted {
+                Button("Need help setting up a server?") { gateStep = .selfHostGuide }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.inkFaint)
+                    .padding(.top, 14)
+            }
         }
     }
 
@@ -342,11 +423,21 @@ struct ConnectView: View {
 
     private func goBack() {
         guard purpose == .gate else { dismiss(); return }
+        // The whole of a link's claim goes with the screen it filled: a code
+        // and a held token belong to the daemon the link named, and the
+        // analytics id it carried is a claim about a pairing that did not
+        // happen. Leaving any of them behind would let the self-hosted form
+        // present a hosted link's code, ringed and ready, against localhost.
+        arrivedViaPairLink = false
+        showingPairingDetails = false
+        code = ""
+        heldToken = nil
+        linkArmed = false
+        linkAid = nil
         pairError = nil
         addError = nil
         store.connError = nil
-        if let choice = hostingChoice { gateStep = .route(choice) }
-        else { gateStep = .welcome }
+        gateStep = .welcome
     }
 
     /// The account's name, optional in both purposes. It matters most in the
@@ -363,6 +454,68 @@ struct ConnectView: View {
     }
 
     // MARK: - forms
+
+    private var linkedPairForm: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Field(label: "Device name") {
+                TextField("This Mac", text: $deviceName)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 16, weight: .medium))
+                    .autocorrectionDisabled()
+                    .focused($focus, equals: .device)
+                    .onSubmit { focus = .name }
+            }
+            Field(label: "Account name") {
+                TextField("Personal, work, or something else", text: $accountLabel)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 16, weight: .medium))
+                    .autocorrectionDisabled()
+                    .focused($focus, equals: .name)
+                    .onSubmit { submit() }
+            }
+            Text("Account name is optional. You can rename it later.")
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.inkFaint)
+                .padding(.top, -10)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Label(URL(string: url)?.host ?? url, systemImage: "link")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.inkDim)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                DisclosureGroup("Pairing details", isExpanded: $showingPairingDetails) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Field(label: "Server URL") {
+                            TextField("Server URL", text: urlBinding)
+                                .textFieldStyle(.plain)
+                                .autocorrectionDisabled()
+                                .focused($focus, equals: .url)
+                        }
+                        Field(label: "Pairing code") {
+                            TextField("XXXX-XXXX", text: codeBinding)
+                                .textFieldStyle(.plain)
+                                .font(Typo.mono(12))
+                                .autocorrectionDisabled()
+                                .focused($focus, equals: .code)
+                                .onSubmit { submit() }
+                        }
+                    }
+                    .padding(.top, 10)
+                    // A rejected code is corrected HERE, so the fields it
+                    // lives in open the moment there is something to correct.
+                    .onChange(of: pairError) { _, error in
+                        if error != nil { showingPairingDetails = true }
+                    }
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(Palette.inkFaint)
+            }
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Palette.canvas.opacity(0.3)))
+        }
+    }
 
     private var pairForm: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -413,33 +566,6 @@ struct ConnectView: View {
                     .textFieldStyle(.plain)
                     .autocorrectionDisabled()
                     .focused($focus, equals: .device)
-                    .onSubmit { submit() }
-            }
-        }
-    }
-
-    /// Hosted's manual escape hatch, for the cases the sign in above cannot
-    /// cover: a browser that will not open app links, a sign in finished on a
-    /// phone for a Mac, or a code from the console's own Add Device button.
-    /// Device and account names keep their safe defaults; hiding those optional
-    /// fields makes this visibly secondary to the browser handoff instead of
-    /// presenting another full setup ceremony.
-    private var hostedManualForm: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Field(label: "server url") {
-                TextField("https://username.passband.email", text: urlBinding)
-                    .textFieldStyle(.plain)
-                    .textContentType(.URL)
-                    .autocorrectionDisabled()
-                    .focused($focus, equals: .url)
-                    .onSubmit { focus = .code }
-            }
-            Field(label: "pairing code") {
-                TextField("XXXX-XXXX", text: codeBinding)
-                    .textFieldStyle(.plain)
-                    .font(Typo.mono(13))
-                    .autocorrectionDisabled()
-                    .focused($focus, equals: .code)
                     .onSubmit { submit() }
             }
         }
@@ -640,9 +766,13 @@ struct ConnectView: View {
     /// a filled form with the button ringed, and no further.
     private func applyPairLink(_ link: PairLink?) {
         guard let link else { return }
+        // Busy means a claim, an add or a saved-connection retry is mid-
+        // flight, and a form edited under it would be claimed against the
+        // wrong host. The link stays PARKED on the store rather than consumed:
+        // `onChange(of: busy)` applies it the moment the form is free.
+        guard !busy else { return }
         store.pairLink = nil
         if purpose == .gate { gateStep = .credentials(nil) }
-        guard !busy else { return }
         mode = .pair
         url = link.serverURL
         code = Pairing.formatted(link.code)
@@ -655,6 +785,8 @@ struct ConnectView: View {
         addError = nil
         store.connError = nil
         linkArmed = true
+        arrivedViaPairLink = true
+        showingPairingDetails = false
         // At the gate the form is the whole screen and Return is the natural
         // next act. The Add Account sheet is raised OVER whatever the human
         // was doing, and focusing submit there would let a Return already in
@@ -664,108 +796,71 @@ struct ConnectView: View {
     }
 }
 
-/// The calm first screen: one product sentence and the only decision needed to
-/// tailor what follows. Credentials stay off-screen until a route is chosen.
+/// One connection choice: hosted login/signup, with self-hosting secondary.
 private struct WelcomeGate: View {
-    let choose: (HostingChoice) -> Void
+    @Environment(\.colorScheme) private var colorScheme
+    /// Present only when the gate is up because a saved connection could
+    /// not be restored: the retry belongs on this screen too, since back
+    /// from the form lands here.
+    var retrySaved: (() -> Void)? = nil
+    var retrying = false
+    let login: () -> Void
+    let selfHostedLogin: () -> Void
+    @State private var browserOpened = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("welcome to passband")
+            Text("Welcome to Passband.")
                 .font(Typo.serif(40, weight: .medium))
                 .foregroundStyle(Palette.ink)
-            Text("A private, focused way to read and act on your inbox.")
-                .font(.system(size: 14))
-                .foregroundStyle(Palette.inkFaint)
-                .padding(.top, 6)
-
-            Text("Where should your mail service run?")
-                .font(.system(size: 13, weight: .semibold))
+            Text("Log in to your account or get started.")
+                .font(.system(size: 15))
                 .foregroundStyle(Palette.inkDim)
-                .padding(.top, 30)
+                .padding(.top, 8)
 
-            VStack(spacing: 12) {
-                ChoiceCard(
-                    symbol: "cloud",
-                    title: "use hosted passband",
-                    detail: "We run it for you. No server or terminal required.",
-                    action: { choose(.hosted) })
-                ChoiceCard(
-                    symbol: "server.rack",
-                    title: "self-host",
-                    detail: "Run squelchd on this Mac, a NAS, or your own server.",
-                    action: { choose(.selfHosted) })
+            HStack(spacing: 14) {
+                RouteOption(symbol: "person.crop.circle", title: "Log in", action: login)
+                RouteOption(symbol: "person.badge.plus", title: "Sign up") {
+                    browserOpened = true
+                    Opener.open(Hosted.signUp(theme: colorScheme))
+                }
             }
-            .padding(.top, 12)
+            .padding(.top, 30)
 
-            Text("Both paths use the same Passband app and support per-device pairing.")
-                .font(.system(size: 11))
-                .foregroundStyle(Palette.inkFaintest)
-                .padding(.top, 18)
+            Button(action: selfHostedLogin) {
+                Text("Self-hosted login")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(Palette.inkDim)
+                    .frame(maxWidth: .infinity, minHeight: 42)
+                    .contentShape(Rectangle())
+            }
+                .buttonStyle(.plain)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Palette.canvas.opacity(0.3)))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Palette.hairline, lineWidth: 0.5))
+                .padding(.top, 14)
+
+            if browserOpened {
+                Text("Continue in your browser. You’ll return here when you’re ready.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.inkDim)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 10)
+            }
+
+            if let retrySaved {
+                Button(retrying ? "Trying saved connection…" : "Try saved connection again", action: retrySaved)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Palette.inkDim)
+                    .disabled(retrying)
+                    .padding(.top, 18)
+            }
         }
         .padding(34)
         #if os(macOS)
             .frame(width: 600)
         #else
             .frame(maxWidth: 600)
-        #endif
-        .passbandGlass(.chrome, cornerRadius: 24, tint: Palette.glassTint.opacity(0.35))
-        .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
-    }
-}
-
-/// The route-specific fork before credentials. These are decisions, not tabs:
-/// one continues in-app and the other opens the setup surface that must finish
-/// before a credential can exist.
-private struct RouteGate: View {
-    let choice: HostingChoice
-    let back: () -> Void
-    let continueToForm: () -> Void
-    let showSelfHostGuide: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(choice == .hosted ? "hosted passband" : "self-hosted")
-                .font(Typo.serif(34, weight: .medium))
-                .foregroundStyle(Palette.ink)
-            Text(choice == .hosted
-                ? "Connect an existing account or create a new one."
-                : "Connect a running squelch server or set one up first.")
-                .font(.system(size: 13))
-                .foregroundStyle(Palette.inkFaint)
-                .padding(.top, 5)
-
-            HStack(alignment: .top, spacing: 12) {
-                if choice == .hosted {
-                    RouteOption(
-                        symbol: "person.crop.circle",
-                        title: "Login",
-                        action: continueToForm)
-                    RouteOption(
-                        symbol: "person.badge.plus",
-                        title: "Sign up",
-                        action: { Opener.open(Hosted.signUp) })
-                } else {
-                    RouteOption(
-                        symbol: "checkmark.circle",
-                        title: "i have a squelch server running",
-                        action: continueToForm)
-                    RouteOption(
-                        symbol: "server.rack",
-                        title: "i need to set up my server",
-                        action: showSelfHostGuide)
-                }
-            }
-            .padding(.top, 24)
-
-            Button("back", action: back)
-                .padding(.top, 22)
-        }
-        .padding(34)
-        #if os(macOS)
-            .frame(width: 680)
-        #else
-            .frame(maxWidth: 680)
         #endif
         .passbandGlass(.chrome, cornerRadius: 24, tint: Palette.glassTint.opacity(0.35))
         .shadow(color: .black.opacity(0.3), radius: 50, y: 24)
@@ -781,18 +876,18 @@ private struct RouteOption: View {
         Button(action: action) {
             HStack(spacing: 11) {
                 Image(systemName: symbol)
-                    .font(.system(size: 25, weight: .medium))
+                    .font(.system(size: 21, weight: .medium))
                     .foregroundStyle(Palette.accent)
                     .frame(width: 30)
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(Palette.ink)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
             .padding(.horizontal, 15)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -932,48 +1027,6 @@ private struct SetupThemeToggle: View {
         .glassCapsule(tint: Palette.glassTint.opacity(0.35))
         .help(isDark ? "use light mode" : "use dark mode")
         .accessibilityLabel(isDark ? "Use light mode" : "Use dark mode")
-    }
-}
-
-private struct ChoiceCard: View {
-    let symbol: String
-    let title: String
-    let detail: String
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 15) {
-                Image(systemName: symbol)
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundStyle(Palette.accent)
-                    .frame(width: 32)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(title)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Palette.ink)
-                    Text(detail)
-                        .font(.system(size: 12))
-                        .foregroundStyle(Palette.inkFaint)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 12)
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Palette.inkFaintest)
-            }
-            .padding(18)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Palette.canvas.opacity(0.62))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .strokeBorder(Palette.hairline, lineWidth: 0.75)
-        )
     }
 }
 

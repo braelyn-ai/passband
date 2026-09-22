@@ -8,10 +8,8 @@ use super::*;
 /// `kind`/`tier` falls back to the least-alarming value rather than erroring:
 /// refusing to serve a stored row would stall a client's cursor at it forever.
 ///
-/// `sealed_kind` follows the same rule for the same reason, and lands on the
-/// same side: an unrecognized kind reads as `None`, i.e. an ordinary event. That
-/// costs a tap the reveal route and never the other way round, which is the
-/// direction that cannot leak.
+/// Legacy `sealed_kind` remains optional; new clients use the explicit `is_auth`
+/// snapshot for presentation and open the human message reader for every event.
 fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     Ok(Event {
         id: r.get(0)?,
@@ -27,6 +25,7 @@ fn map_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             .get::<_, Option<String>>(9)?
             .and_then(|s| SealedKind::parse(&s)),
         created_at: dt(r, 10)?,
+        is_auth: r.get(11)?,
     })
 }
 
@@ -49,12 +48,18 @@ impl SqliteStore {
     pub(super) fn append_event(&self, ev: &NewEvent) -> Result<Option<i64>> {
         let inserted = {
             let conn = self.lock()?;
-            // INSERT OR IGNORE on UNIQUE(message_id): one event per message ever,
-            // so a re-ingest or a second refined verdict stays silent (0 rows).
+            // One statement arbitrates the unique arrival and current explicit
+            // user state atomically. A model finishing after open/done/snooze
+            // cannot create a delayed interruption, even for auth.
             let n = conn.execute(
                 "INSERT OR IGNORE INTO events(account_id, message_id, thread_id, kind, tier,
-                     importance, sender, one_line, deadline, sealed_kind, created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                     importance, sender, one_line, deadline, sealed_kind, created_at, is_auth)
+                 SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12
+                 FROM messages m LEFT JOIN triage t ON t.message_id=m.id AND t.account_id=m.account_id
+                 WHERE m.account_id=?1 AND m.id=?2
+                   AND (?4='opened' OR (m.is_sent=0 AND m.is_spam=0
+                     AND t.opened_at IS NULL AND COALESCE(t.status,'new')!='done'
+                     AND t.remind_at IS NULL))",
                 params![
                     ev.account_id,
                     ev.message_id,
@@ -67,6 +72,7 @@ impl SqliteStore {
                     ev.deadline,
                     ev.sealed_kind.map(|k| k.as_str()),
                     Utc::now().to_rfc3339(),
+                    ev.is_auth,
                 ],
             )?;
             if n == 0 {
@@ -80,6 +86,24 @@ impl SqliteStore {
             let _ = tx.send(inserted);
         }
         Ok(Some(inserted))
+    }
+
+    /// Recheck immediately before delivery: user actions can happen after the
+    /// event was committed but while an adapter was offline or retrying.
+    pub(super) fn notification_delivery_allowed(
+        &self,
+        account: AccountId,
+        event: i64,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events e JOIN messages m ON m.account_id=e.account_id AND m.id=e.message_id
+             LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id
+             WHERE e.account_id=?1 AND e.id=?2
+               AND (e.kind='opened' OR (m.is_sent=0 AND m.is_spam=0
+                 AND t.opened_at IS NULL AND COALESCE(t.status,'new')!='done' AND t.remind_at IS NULL)))",
+            params![account, event], |row| row.get(0),
+        )?)
     }
 
     pub(super) fn message_has_event(&self, account_id: AccountId, message_id: i64) -> Result<bool> {
@@ -107,7 +131,7 @@ impl SqliteStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
-                    deadline, sealed_kind, created_at
+                    deadline, sealed_kind, created_at, is_auth
              FROM events
              WHERE account_id = ?1 AND id > ?2
              ORDER BY id ASC
@@ -124,7 +148,7 @@ impl SqliteStore {
         let row = conn
             .query_row(
                 "SELECT id, message_id, thread_id, kind, tier, importance, sender, one_line,
-                        deadline, sealed_kind, created_at
+                        deadline, sealed_kind, created_at, is_auth
                  FROM events
                  WHERE account_id = ?1 AND id = ?2",
                 params![account_id, id],

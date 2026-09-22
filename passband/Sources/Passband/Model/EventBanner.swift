@@ -26,6 +26,8 @@ enum EventBanner {
     /// string rather than as a UUID.
     static let threadKey = "passband.thread_id"
     static let eventKey = "passband.event_id"
+    static let messageKey = "passband.message_id"
+    static let authKey = "passband.is_auth"
     /// The posting account's uuid, as a string (userInfo has to survive being
     /// written to disk by the system and read back into a later launch).
     static let accountKey = "passband.account_id"
@@ -39,6 +41,20 @@ enum EventBanner {
     /// a tap on it is not a human opening their mail and must not be counted
     /// as one.
     static let testRoute = "test"
+
+    /// The relay's original push survives when device enrichment times out.
+    /// Keep its account-qualified event handle so a tap can resolve the email.
+    struct UnresolvedPush: Equatable, Sendable {
+        var accountId: UUID
+        var eventId: Int
+    }
+
+    static func unresolvedPush(_ raw: String?) -> UnresolvedPush? {
+        guard let raw, let colon = raw.lastIndex(of: ":"),
+            let account = UUID(uuidString: String(raw[..<colon])),
+            let event = Int(raw[raw.index(after: colon)...]), event > 0 else { return nil }
+        return UnresolvedPush(accountId: account, eventId: event)
+    }
 
     // MARK: - routing
 
@@ -54,7 +70,7 @@ enum EventBanner {
         /// carries no subject and its `created_at` is when triage emitted it,
         /// not when the mail arrived, so nothing about the banner may be built
         /// from it beyond the kind and the sender. `/client/sealed` is the
-        /// source of truth and `AuthSeenSet` is the one dedup.
+        /// source of truth for this legacy lookup route.
         case authSignal(SealedKind)
     }
 
@@ -70,6 +86,10 @@ enum EventBanner {
         return .authSignal(kind)
     }
 
+    static func shouldPresentForeground(appActive: Bool, windowVisible: Bool, isTest: Bool, isAuth: Bool) -> Bool {
+        isTest || isAuth || !(appActive && windowVisible)
+    }
+
     // MARK: - content mapping
 
     /// The display copy for one event. Pure: same event in, same banner out.
@@ -81,11 +101,13 @@ enum EventBanner {
         var sound: Bool
     }
 
-    static func copy(for event: Event, now: Date = Date()) -> Copy {
-        // "Sarah Chen <sarah@acme.com>" is not a notification title.
-        let sender = flatten(SenderID.displayName(event.sender), max: 64)
+    static func copy(for event: Event) -> Copy {
+        // "Sarah Chen <sarah@acme.com>" is not a notification title, and
+        // neither is "bounce-1234@em.brand.com": `readableName` never answers
+        // with an address, which is the one promise a bold line on a lock
+        // screen has to keep. The exact address is one tap away in the thread.
+        let sender = flatten(SenderID.readableName(event.sender), max: 64)
         let summary = flatten(event.one_line, max: 240)
-        let due = Fmt.deadlineChip(event.deadline, now: now)?.text ?? ""
         // Coalescing key: events on one thread stack into ONE group. The
         // fallback must be unique, or an empty thread id would glue unrelated
         // mail together.
@@ -108,10 +130,14 @@ enum EventBanner {
 
         let subtitle: String
         switch event.kind {
-        // Urgent is the dated-obligation tiers. When there is a real date, SAY it —
-        // "2d PAST DUE" is why the banner is worth interrupting for.
-        case .urgent: subtitle = due.isEmpty ? "needs attention" : due
-        case .deadline: subtitle = due
+        // The time-bound kinds get a second line saying WHY the banner is worth
+        // the interruption, but NOT the date. The event's deadline is a
+        // snapshot taken at triage, and a banner sits on a lock screen for
+        // hours: "due today" read tomorrow morning is wrong, and "2d PAST DUE"
+        // on mail the human already handled is a nag. The thread has the live
+        // chip; the banner says only that there is one.
+        case .urgent: subtitle = "needs attention"
+        case .deadline: subtitle = "has a deadline"
         // No second line for the ordinary case: a subtitle on every
         // notification is a subtitle that means nothing. `.opened` returned
         // above and is listed only to keep this switch exhaustive.
@@ -127,7 +153,7 @@ enum EventBanner {
             threadIdentifier: group,
             // Sound only for the time-bound kinds — a chime per surfaced email
             // is how a notification stream gets muted wholesale.
-            sound: event.kind != .surfaced)
+            sound: event.isAuth || event.kind != .surfaced)
     }
 
     /// The AUTH banner's copy: a mailbox has just been sent a login code (or a
@@ -156,7 +182,7 @@ enum EventBanner {
         // is the app's one vocabulary for the other half ("sealed" is internal
         // jargon and never reaches a human).
         let label = AuthCopy.label(kind)
-        let who = flatten(SenderID.displayName(sender), max: 64)
+        let who = flatten(SenderID.readableName(sender), max: 64)
         return Copy(
             title: accountName.map { "\(label) · \($0)" } ?? label,
             subtitle: "",
@@ -182,5 +208,37 @@ enum EventBanner {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return Fmt.truncate(flat, max)
+    }
+}
+
+/// Keeps the most recent explicit tap until credentials and the account are ready.
+/// A tap arriving during bootstrap must not be rejected against an unloaded index.
+struct NotificationTapQueue<Target> {
+    struct Tap {
+        var target: Target
+        var accountId: UUID?
+    }
+    private(set) var pending: Tap?
+    private var parked = false
+
+    mutating func enqueue(_ target: Target, accountId: UUID?) {
+        pending = Tap(target: target, accountId: accountId)
+        parked = false
+    }
+
+    /// Failed switches wait for a successful connection or another explicit tap.
+    /// A newer tap that arrived during the switch is already a fresh request.
+    mutating func park(_ tap: Tap) {
+        guard pending == nil else { return }
+        pending = tap
+        parked = true
+    }
+
+    mutating func connectionBecameReady() { parked = false }
+
+    mutating func take(connected: Bool) -> Tap? {
+        guard connected, !parked else { return nil }
+        defer { pending = nil }
+        return pending
     }
 }

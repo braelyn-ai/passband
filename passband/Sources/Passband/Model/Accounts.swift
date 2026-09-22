@@ -20,8 +20,7 @@
 // `AccountManager` at the bottom is the live, observable view of all that — the
 // list the UI renders, the id everything account-scoped derives its keys from,
 // the entry point to a switch, and the owner of the permanently per-account
-// objects: an `EventStream` per record, live account or not, and a
-// `BackgroundAuthWatch` for every record that is NOT live.
+// objects: an `EventStream` per record, live account or not.
 
 import Foundation
 import Observation
@@ -576,7 +575,6 @@ final class AccountManager {
         // account is by definition one of the inactive ones. (`addAccount`
         // switches to it a moment later, and that switch stops this watch.)
         startStream(record.id)
-        startWatch(record.id)
         return record
     }
 
@@ -618,7 +616,6 @@ final class AccountManager {
         // daemon this install has just forgotten, and would write the cursor
         // (or the seen-set) straight back under the id that was removed.
         stopStream(id)
-        stopWatch(id)
         // The daemon is told to stop pushing while the credentials that
         // authorize saying so are still here: after the clear below there is
         // nothing left to present, and the registration would outlive the
@@ -644,21 +641,8 @@ final class AccountManager {
     /// that everything deriving a key from `activeId` (the 2FA seen-set, the
     /// decisions ledger) flips in the same breath as the connection does.
     func markActive(_ id: UUID) {
-        let previous = activeId
         AccountIndex.setActive(id)
         activeId = id
-        // THE AUTH WATCHERS TRADE PLACES, here, at the one moment the live
-        // account changes — and here rather than in the caller so that no
-        // future switch path can forget to. The account arriving on screen
-        // hands its auth mail to SitrepPoller → AuthArrival, which would
-        // otherwise be a second writer of the same seen-set; the one leaving
-        // picks up the background watch it had no use for while it was live.
-        //
-        // `startWatch` refuses an id the index no longer holds, which is the
-        // case that matters here: removing the LIVE account switches to a
-        // survivor, and the account being left behind is the one just deleted.
-        stopWatch(id)
-        if let previous, previous != id { startWatch(previous) }
     }
 
     /// Make another account the live one.
@@ -697,32 +681,12 @@ final class AccountManager {
     /// the store is only ever the ACTIVE account's world.
     private var streams: [UUID: EventStream] = [:]
 
-    /// The other ear, and the exact COMPLEMENT of the streams above: one
-    /// background auth watcher per account that is NOT live. A sealed event now
-    /// DOES ride the feed (docs/NOTIFY.md §11.6) but it carries no subject and
-    /// no received-at worth trusting, so it is a doorbell and not the answer —
-    /// the only way to learn what landed is still to ask, which is what these
-    /// do. The live account has no entry: its auth mail comes through
-    /// SitrepPoller → AuthArrival, which runs the whole richer flow (ring,
-    /// audited auto-reveal, code modal).
-    ///
-    /// So these are the fallback AND the fast path's second half. They keep
-    /// their 30s cadence for the mail no event ever mentions (a daemon with the
-    /// notify lane off, a frame lost to a dropped connection), and
-    /// `noteSealedEvent` below rings them the moment one does.
-    private var watches: [UUID: BackgroundAuthWatch] = [:]
-
     /// The accounts whose feeds SHOULD be up. It differs from `streams` only
     /// across the keychain read that starting one has to await — and that gap
     /// is exactly why it exists. A `remove` landing inside it takes the id out
     /// of here, so the read resumes, finds itself unwanted, and drops the
     /// stream instead of dialling a daemon this install has just forgotten.
     private var wantedStreams: Set<UUID> = []
-
-    /// The same wanted-set guard for the watchers, protecting the same gap —
-    /// separate because the two lifecycles genuinely differ: a switch leaves
-    /// every stream alone and moves exactly two watches.
-    private var wantedWatches: Set<UUID> = []
 
     /// Whether the background ears should be running AT ALL — raised by the
     /// `.connected` transition and dropped by its opposite. Without it, an
@@ -732,7 +696,7 @@ final class AccountManager {
     private var feedsUp = false
 
     /// Bring up everything that listens on an account's behalf: one event feed
-    /// per account, and one auth watch per account that is not the live one.
+    /// per account.
     /// Called on the `.connected` transition, which is the moment this install
     /// is known to have an identity. Idempotent: an account already listening
     /// keeps what it has rather than being cut and redialled.
@@ -740,24 +704,20 @@ final class AccountManager {
         feedsUp = true
         for account in accounts {
             startStream(account.id)
-            startWatch(account.id)
         }
     }
 
-    /// Drop every feed and every watch. The `.disconnected` transition — an app
+    /// Drop every feed. The `.disconnected` transition — an app
     /// with no identity on screen holds no connections either.
     func stopAllFeeds() {
         feedsUp = false
         wantedStreams.removeAll()
-        wantedWatches.removeAll()
         // Everything is stopped BEFORE its dictionary is emptied: a
         // `ResidentTask` is retained by the runtime while its loop runs, so a
         // stream merely dropped on the floor would keep reconnecting forever
         // with nothing left in the process holding a reference to stop it.
         for stream in streams.values { stream.stop() }
         streams.removeAll()
-        for watch in watches.values { watch.stop() }
-        watches.removeAll()
     }
 
     /// Start ONE account's feed. Asynchronous underneath because the
@@ -787,8 +747,6 @@ final class AccountManager {
             }
             // The FIRST keychain read every account pays at boot, so the index
             // takes its host from here rather than raising a panel of its own.
-            // (An inactive account's auth watch pays a second one; see
-            // `startWatch`.)
             noteDisplayHost(id, serverURL: stored.serverURL)
             let stream = EventStream(accountId: id, settings: stored)
             streams[id] = stream
@@ -807,7 +765,7 @@ final class AccountManager {
     /// a re-validated token, a moved server URL.
     ///
     /// A stream's settings are fixed for its lifetime BY DESIGN (see
-    /// EventStream), and a watch's for the same reason, so new credentials mean
+    /// EventStream), so new credentials mean
     /// a new connection: mutating one in place is how a feed ends up holding
     /// one account's URL with another's token. The settings are handed in
     /// rather than re-read, because the caller has just written them and a
@@ -816,7 +774,6 @@ final class AccountManager {
         // Unconditional, even with the feeds down: whatever is connected right
         // now is presenting credentials that are no longer the truth.
         stopStream(id)
-        stopWatch(id)
         // Before the `feedsUp` bail: a moved daemon has to rename its row in
         // the switcher whether or not the feeds happen to be running.
         noteDisplayHost(id, serverURL: settings.serverURL)
@@ -825,99 +782,13 @@ final class AccountManager {
         let stream = EventStream(accountId: id, settings: settings)
         streams[id] = stream
         stream.start()
-        // Both callers today are the LIVE account re-validating itself, where
-        // this is a no-op — `startWatch` refuses the account on screen. It is
-        // here so that the day something re-validates an inactive account, its
-        // watch comes back too instead of staying silently dead. That path pays
-        // one keychain read for credentials already in hand, which is the
-        // cheaper mistake than the alternative shape: a watch started from
-        // settings handed in by a caller who might not be talking about it.
-        startWatch(id)
+
     }
 
-    // MARK: - the background auth watches
-
-    /// Start ONE account's auth watch. Refuses the LIVE account outright: that
-    /// mailbox's auth mail belongs to `AuthArrival`, and a watcher on top of it
-    /// would be a second writer of one seen-set and a second banner for one
-    /// code. Asynchronous underneath for its own keychain read, and
-    /// fire-and-forget for the same reason `startStream` is.
-    ///
-    /// That read is a SECOND access-panel risk per inactive account, on top of
-    /// the one the feed already pays. The alternative — caching every account's
-    /// credentials in this class so both ears could share one read — puts N
-    /// live API tokens in a long-lived main-actor dictionary to save a prompt,
-    /// which is not a trade worth making.
-    func startWatch(_ id: UUID) {
-        guard feedsUp, id != activeId, accounts.contains(where: { $0.id == id }) else { return }
-        // `insert` reporting no insertion means the id is already wanted —
-        // watching, or mid-keychain-read.
-        guard wantedWatches.insert(id).inserted else { return }
-        Task {
-            let stored = await settings(for: id)
-            // The world can have moved during that read: a stop, a removal, a
-            // whole disconnect — `wantedWatches` answers all three. A watch
-            // already under this id means something overtook us; that one is
-            // the fresher, so leave it alone.
-            guard wantedWatches.contains(id), watches[id] == nil else { return }
-            // Or this account went LIVE while we were reading, and `AuthArrival`
-            // has it now. Unwanted rather than merely abandoned: an id left
-            // wanted with no watch behind it is an id the `insert` guard above
-            // silently refuses forever, and switching away again would then
-            // never start one.
-            guard id != activeId else {
-                wantedWatches.remove(id)
-                return
-            }
-            guard let stored else {
-                // No credentials behind the record: slots gone, or the keychain
-                // refused. A watcher with nothing to dial is a backoff loop
-                // that never ends, so none is started and the id goes back to
-                // unwanted — the next switch (or the next launch) is the retry.
-                wantedWatches.remove(id)
-                return
-            }
-            let watch = BackgroundAuthWatch(accountId: id, settings: stored)
-            watches[id] = watch
-            watch.start()
-        }
-    }
-
-    /// Stop and forget ONE account's auth watch, including a start still
-    /// waiting on the keychain.
-    func stopWatch(_ id: UUID) {
-        wantedWatches.remove(id)
-        watches.removeValue(forKey: id)?.stop()
-    }
-
-    // MARK: - the sealed doorbell
-
-    /// A sealed event just arrived on ONE account's feed: go and ask that
-    /// account's daemon what landed, now, instead of at the next tick.
-    ///
-    /// THE ROUTING LIVES HERE because this is the only object that knows which
-    /// of the two ears is listening to a given mailbox — `EventStream` is
-    /// deliberately ignorant of which account is on screen, and asking it to
-    /// compare would give every stream in the process an opinion about that.
-    /// The two branches are the same complement as `streams` vs `watches`.
-    ///
-    /// FIRE AND FORGET, and idempotent by the layers underneath: the fetch it
-    /// pokes joins one already in flight rather than stacking a second, and
-    /// `AuthSeenSet` decides exactly once whether what comes back is worth a
-    /// noise. So an event that beats the poll, an event that loses to it, and
-    /// an event replayed across a reconnect all cost at most one extra request
-    /// and produce at most one banner.
+    /// Refresh explicit Auth lookup for legacy events. Notification events are
+    /// the only source of banners; metadata polling never rings or opens mail.
     func noteSealedEvent(for id: UUID) {
-        // Not an account this install still has: nothing to ask, nowhere to
-        // ask it. A stream for a removed account is already being torn down.
-        guard accounts.contains(where: { $0.id == id }) else { return }
-        if id == activeId {
-            // The live account's sealed list rides the sitrep read model, which
-            // is what `AuthArrival` watches. Pulling just that one leg is the
-            // whole poll's work minus four requests nothing here is waiting on.
-            Task { await SitrepPoller.shared.refreshSealed() }
-        } else {
-            watches[id]?.pollNow()
-        }
+        guard id == activeId, accounts.contains(where: { $0.id == id }) else { return }
+        Task { await SitrepPoller.shared.refreshSealed() }
     }
 }

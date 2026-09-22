@@ -211,377 +211,51 @@ refuses it before the handler is reached).
   `Message::header_raw` resolves to the LAST occurrence — the forgeable one — and
   `headers_raw()` DROPS non-UTF-8 headers, which would let an attacker hide the
   genuine verdict and promote one they wrote.
-## 4. Sealed mail and the two-door split
+## 4. Human and agent access after the triage rewrite
 
-**Invariant.** Auth mail (OTPs, password resets, magic links, login alerts,
-verification) never reaches an LLM, never crosses the agent door, and is never
-queryable as normal mail — not even for an instant.
+**Invariant.** Humans and internal triage models can read all their mail, including
+pending assessments and actionable authentication. External user agents, including
+the embedded assistant, cannot read actionable authentication secrets or their
+derivatives. Informational login/security alerts are normally allowed.
 
-**Enforcement, in order.**
-- **Detection first.** `squelch-core/src/sync/ingest.rs` calls
-  `triage::seal::detect_sealed` right after parse and returns early — before Stage-1,
-  before shipment/receipt/calendar extraction, before anything else reads the body. It
-  biases to **recall over precision**: a false seal only hides benign mail from the
-  agent, a false negative leaks a code. A concrete reader-addressed code (`otp_code`)
-  seals even past the marketing guard, which exists so auth-vendor newsletters
-  discussing 2FA as a product don't seal.
-- **Atomic ingest.** `squelch-core/src/store/sqlite.rs:ingest_message` writes the
-  message row and the triage row (`sensitivity='sealed'`) in ONE transaction — no
-  window in which a sealed message is queryable as normal mail.
-- **SQL absence.** Every serving and queueing query gates on `sensitivity='normal'`
-  / `!= 'sealed'`. Sealed rows are *absent*, never redacted.
-- **Release-mode guards.** `squelch-core/src/triage/mod.rs:stage1_sealed_guard`,
-  `stage2_sealed_guard`, `stage2_llm_triage` return `Err(CoreError::InvalidInput)` on
-  a sealed row — real runtime checks (they replaced `debug_assert!`, which compiled
-  out in release), redacted to the invariant plus the message id.
-- **Agent door re-check.** `squelch-mcp/src/server.rs:SquelchServer` re-queries the
-  sealed set (`thread_is_sealed`) and drops overlapping results; `get_thread` collapses
-  a sealed thread and a nonexistent one into one `resource_not_found`, so existence
-  cannot be inferred.
-- **Human door only.** `squelch-api` (`/client/*`, bearer auth) carries sealed
-  **metadata** at `/client/sealed` and exactly one body at
-  `/client/sealed/{id}/reveal`, which appends the audit row **before** returning
-  and sets `Cache-Control: no-store`. A **sealed notification** (`events` rows
-  carrying `sealed_kind`, docs/NOTIFY.md §11.6) is the same metadata class and
-  no wider: the sender address, the thread id, and a fixed phrase chosen by the
-  kind. It rides the SSE feed and `get_event`, both behind the same bearer; the
-  agent door has zero references to `events`.
+**Assessment.** The triage model decides whether actual access-granting material
+is present. There is no deterministic sealing detector in ingest. A missing or
+stale assessment denies external access until a current allowed decision exists.
+Model summaries, notification text, reasons, and evidence locations must not quote
+credentials. This is a model-output requirement; it is not a claim that arbitrary
+model output can be proven secret-free by a string filter.
 
-**What the agent door gained with issue #21.** `get_inbox_updates` and
-`get_thread` now carry a matched sender rule's `want_text` beside the mail it
-applies to (`standing_instruction` / `standing_instructions`). Three things keep
-that inside the model above:
+**Enforcement.** `store/sqlite/messages.rs:external_message_allowed_conn` checks the
+current assessment and source provenance under the store lock. External whole-thread
+reads require the thread's sources to be allowed. MCP and dedicated
+`/client/agent/` routes use these checks for messages and derived results. Search
+rehydrates results under the same guard instead of releasing stale cached snippets.
+Account ownership is checked independently of access assessment.
 
-- **It is not email content.** `want_text` is written by the account owner
-  through the client, or by an agent through `set_sender_rule`, whose write is
-  committed in the SAME transaction as its audit row (actor `agent`, action
-  `rule.set`) — fail-closed, so a rule cannot land untraced. Stage-2 has read the
-  same field, in its trusted-context block, since sender rules shipped.
-- **It is not a new read.** `list_sender_rules` already returns every rule,
-  `want_text` included, to any agent holding the door. What #21 adds is
-  *delivery* — the instruction arriving at the moment its sender's mail does,
-  instead of behind a correlation the agent has to think to perform.
-- **The verdict does not travel with it.** `disposition` is left off the wire on
-  purpose. It is a decision the pipeline has already applied, and re-applying it
-  agent-side is wrong in a case that matters: Rung 1 of Stage-1 (bill/payment)
-  runs *before* sender rules, so a past-due notice from a squelched sender is
-  surfaced deliberately, and an agent reading "squelch" off it would bury exactly
-  the mail the ladder raised.
+The human `/client/v2/messages/{id}` endpoint can open the exact message immediately.
+It returns `Cache-Control: no-store`; `cache_allowed` controls client prefetch
+eligibility. Human read, attachment, draft, and reply paths do not treat a legacy
+`sensitivity=sealed` value as a denial. The legacy sealed list/reveal API remains a
+compatibility surface, not the new access authority.
 
-Sealed mail is untouched by all of this: a sealed row never reaches either tool,
-so no instruction is ever attached to one.
+**Do not break.**
 
-**Human-door credentials.** Two kinds, checked in this order by
-`squelch-api/src/auth.rs`:
+- Do not let the embedded assistant call unrestricted human read endpoints.
+- Do not treat a missing assessment as allowed, or trust a client-only filter.
+- Keep source provenance with derived summaries, attention, records, and drafts.
+- Internal evidence readers stay account-scoped and never execute email instructions.
+- Keep user message access independent from the speed or availability of triage.
 
-1. `SQUELCH_API_TOKEN`, the **optional** master token, compared in constant time.
-   Unset or blank is a supported configuration: the door still serves and 401s
-   everything until a device token exists. It is never deprecated, because it is
-   the way back in after revoking the last device.
-2. **Issued per-device tokens** (`sqd_…`, `squelch-core/src/store/sqlite/device_tokens.rs`),
-   minted by `squelchd token issue` or a pairing claim. Stored as a hex SHA-256
-   and verified by hashing what was presented, so the plaintext exists once. Named
-   and individually revocable, effective on the very next request because nothing
-   caches the lookup.
+See [TRIAGE-OPERATIONS.md](TRIAGE-OPERATIONS.md) for the current execution contract.
 
-**Surfaces outside the bearer**, each on its own router merged outside the bearer
-layer so the boundary is visible in `lib.rs`. Two are machine-facing, and the
-rest are the console.
-
-- `GET /t/{token}` — the read-tracking pixel (§3). One response, always.
-- `POST /client/pair` — the pairing claim, which has to be unauthenticated: it is
-  how a device with no credential gets its first one. Every failure (wrong,
-  expired, already claimed, burned, malformed, store error) is one bare 401 with
-  no body. The code is ~40 bits, which is only defensible because it is one-shot,
-  expires in minutes, and **burns after 5 misses** — a miss is charged against the
-  live code, so guessing spends the user's code rather than being free. **No CORS
-  layer** on this router, unlike `/client/*`, so a random web page cannot read the
-  minted token out of a cross-origin response.
-
-Both touch the store mutex the whole daemon shares, so both are bounded
-(`PIXEL_CONCURRENCY` / `PAIR_CONCURRENCY`, 4 each); the device-token branch of the
-bearer check is bounded the same way, since any caller can push a `sqd_`-shaped
-guess into it. The pixel bails out when its slots are full (it can answer without
-the store); the claim **waits**, because an answer that varied with load would be
-a signal the uniform 401 exists to remove.
-
-**The console (`/console`).** Server-rendered HTML for the person who owns this
-daemon (`squelch-api/src/console.rs`), on both tiers. **A console session is a
-device token**: signing in claims a pairing code exactly the way `/client/pair` does, and
-the `sqd_` token that comes back is set as a cookie and verified on every later
-request through the same `verify_device_token`. No session table, no signing key,
-no third credential type — so revocation, the audit trail, the one-shot claim and
-the ten-minute TTL are inherited rather than reinvented, and `squelchd token list`
-shows a browser for what it is.
-
-| Route | What gates it |
-|---|---|
-| `GET /console` | nothing. Renders the home page with a valid session cookie and the login page without one |
-| `POST /console/login-code` | a pasted pairing code — the store's own claim: one-shot, ~40 bits, ten minutes, **burns after 5 misses**, queued on the same `PAIR_CONCURRENCY` slots |
-| `GET /console/callback?code=` | the same claim, on a code the control plane minted. Nothing about the hop is trusted here: a code that was burned, replayed, expired or never minted fails exactly like a typo |
-| `POST /console/pair`, `POST /console/revoke/{id}`, `POST /console/logout` | a verified session cookie, checked ahead of the handler |
-
-**Cookie posture.** `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`, `Secure`
-whenever the origin is https, 30-day `Max-Age`. Deliberately
-**not** `__Host-` prefixed: the prefix requires `Secure`, a plain-http loopback
-run cannot set it, and a cookie name that only works in production is a name
-whose absence nobody notices until production — so the two properties the prefix
-would buy are set explicitly instead. `Lax` and not `Strict`, which was learned
-live: the SSO landing is a navigation chain that started at accounts.google.com,
-Chrome withholds `Strict` cookies from every request in a cross-site-initiated
-chain including the same-site 303 hop back to `/console`, and the first thing a
-freshly signed-in user saw was the login page again. `Lax` still withholds the
-cookie from cross-site POSTs, and the mutating routes are guarded below
-regardless. Sign-out **revokes** the token rather than
-only dropping the cookie, and every refusal of a cookie that would not verify
-clears it on the way out.
-
-**The one escape hatch: `[console] allow_insecure_cookie`.** Off by default and
-meant to stay there. It exists for the self-host serving the console over plain
-http on a LAN, who otherwise has a console that cannot work at all: a browser
-will not store a `Secure` cookie from `http://`. It is read as a statement about
-the whole origin rather than as a cookie flag, so with it on the daemon also
-builds its pairing deep link with `http://`, compares `Origin` against that same
-`http://` origin, and stops offering the SSO link. Those move together
-deliberately: a login page that renders and then refuses the POST from it is not
-a working console. **The cookie is a live device token**, so turning this on puts
-a revocable credential on the wire in the clear for anything on the path to take,
-and it is the reason to prefer TLS or loopback. When it is on, the login page
-carries a banner and the daemon warns at startup.
-
-**CSRF, two independent controls.** `SameSite=Lax`, plus an
-`Origin`/`Sec-Fetch-Site` check in front of every mutating POST — including the
-*unauthenticated* login POST, so a cross-site page cannot sign a browser into an
-account of the attacker's choosing either. `Sec-Fetch-Site` is believed
-absolutely (page script cannot set it); where it is absent `Origin` is compared
-whole, scheme included; where both are absent the answer is no.
-
-**No CORS layer** on this router, for the reason `/client/pair` has none and more
-so: a bearer is carried by a client that has one, a cookie is carried
-automatically by any browser pointed at us.
-
-**No token on any page, and uniform refusals.** A pairing code renders exactly
-once, on the page that mints it, which is that page's entire purpose; a device
-token appears only in a `Set-Cookie`. Wrong, expired, already claimed, burned and
-"the store could not answer" are one login page with one sentence, byte for byte.
-There is no bare 401 anywhere in the tree, because a person is reading it. Pages
-carry `default-src 'none'; style-src 'unsafe-inline'; form-action 'self';
-frame-ancestors 'none'; base-uri 'none'` and fetch no script, font or image.
-
-**The Google hop is the control plane's, and it is hosted-only.** Google forbids
-wildcard redirect URIs, so a per-tenant hostname cannot run OAuth itself. The
-login page links to `GET /console/auth?tenant=<label>` on `squelch-control`,
-which: is rate-limited on **its own** budget, tighter than signup's, shared with
-`/app/auth` below (they are the only two routes that open a server-side session
-with nothing presented at all); sends **every well-formed label** to Google
-without looking it up, because answering a real label differently from an
-unprovisioned one is a directory of which hosted addresses exist; **discovers**
-the mailbox from Google on the way back and compares it constant-time against the
-store's owner for that label, and only then calls the warden — so guessing a real
-label cannot make a pairing code exist, let alone show one; and takes **no**
-`return` or `next` parameter anywhere in the flow, so there is no open redirect:
-the destination is constructed from this deployment's own base domain and the
-validated label. The redirect carrying the live code is `Cache-Control:
-no-store, no-cache` and `Referrer-Policy: no-referrer`. Every identity-shaped
-refusal is one page. The link renders only when `SQUELCH_CONSOLE_SSO_URL` is set
-— hosted tenants get it from the warden (`SQUELCH_WARDEN_CONSOLE_SSO_URL`), a
-self-host never sets it, and without it the console is the pasted-code form
-alone.
-
-**`GET /app/auth` is that hop with its input removed, for the native app.** The
-app has no label to send (its user knows their address, not their tenant record)
-and no console to be returned to, so this route accepts **nothing** — no query
-string at all — and the tenant is found by **reverse lookup** on the address
-Google verified (`active_tenant_for_email`, `status = 'active'` part of the
-question). Same consent (`openid email`, online, no refresh token), same session
-table, same warden-minted **pairing code** as the ticket; what differs is the
-ending, a page carrying a `passband://pair?url=…&code=…` deep link built from
-this deployment's own tenant URL, under the same `no-store` / `no-referrer`
-headers. **Taking no input is what removes the oracle rather than adding one:**
-the lookup key is an address Google vouched for on this request, so the only
-mailbox anybody can ask about is the one they just proved they hold, and there is
-no label space to walk. That is why this route may say plainly that a signed-in
-account has no mailbox here, where `/console/auth` may not. Both logins share one
-rate-limit bucket and one carve-out of the session table
-(`MAX_IDENTITY_SESSIONS`), so alternating them cannot buy a flooder a second
-budget or crowd a paying signup out. It exists so somebody who already has a
-mailbox never touches an invite code: invites provision tenants, and this flow is
-for people whose tenant already runs.
-
-**Local drafts (human-door-only table).** `drafts`
-(`squelch-core/src/store/sqlite/drafts.rs`, served only by `/client/drafts`) holds
-unsent compositions, one per reply target plus one new-message slot. It is **never
-synced to Gmail Drafts** and **never visible on `/mcp`** — an unsent draft is the
-user's own thinking, not mail the agent door was handed. It is also **never
-audited**: the audit log is the ledger of reveals and Gmail writes, and a
-composition that never left the machine is neither, so audit rows would only add a
-record of what the user was drafting. Reads and writes carry `Cache-Control:
-no-store`, like the reveal.
-- `handlers::put_draft` resolves the parent through the same lookup `send` uses, so
-  a draft can never be **saved** against sealed mail (sealed and unknown are one 404).
-- A **post-hoc** seal scrubs it: both seal paths — `feedback.rs:correct_triage`'s
-  seal branch (hand correction) and `messages.rs:ingest_message` (a re-ingest whose
-  triage row lands `sealed`) — `DELETE FROM drafts` for that message id in the same
-  transaction as the seal. `list_drafts` additionally filters a sealed parent
-  (`NOT EXISTS` on `triage`, the same shape as `deadlines`) as a belt.
-
-**The sent listing (human-door-only route).** `GET /client/sent`
-(`store::sent_listing`) is the **only** listing in the codebase that reads
-`is_sent = 1`; every other one on both doors filters it out, and the agent door has
-no sent route at all — what the user writes is not the agent's to page through. It
-serves metadata only (recipients, subject, snippet, sent-at, read-receipt count),
-newest first, behind the same bearer as the rest of `/client/*`.
-
-Because the usual `is_sent = 0` filter is what normally keeps this mail out of
-reach, the sealed guard here **fails closed**: an INNER `JOIN triage` *plus*
-`sensitivity != 'sealed'`, so a sent row whose triage row is missing is excluded
-rather than `COALESCE`d to visible. Sent mail is written with its triage row in the
-same transaction, so a missing one is a broken row, not an untriaged one. On top of
-the per-row guard sits a thread-level belt (`NOT EXISTS` over sealed siblings, the
-same shape as `list_drafts`): seal detection is per-message content, so the user's
-own reply in a thread sealed by a sibling commits as `normal` — yet `thread_view`
-404s that thread, and listing the row would leak `Re: <sealed subject>` behind a
-dead click. The
-`messages.to_addrs` column it reads is parsed at ingest from To/Cc and is NULL on
-received mail; the one-shot backfill that fills it for pre-existing sent mail
-(`SyncEngine::backfill_sent_recipients`) runs on the **read** credential and
-fetches `format=metadata` headers only.
-
-**What enforces the split, and what token scope cannot.** The two-door split is
-enforced by three structural facts, none of which involve OAuth scope: the agent
-door exposes **no write tools at all**, the write credential is loaded **only** by
-human-door action handlers and never by sync or triage, and sealed rows are
-**absent** from every serving query.
-
-Scope is defense in depth on top of that, and it is worth being precise about how
-much it buys. Google unions grants **per Cloud project**: with incremental
-authorization a newly issued access token also covers every scope the user has
-previously granted the project, even when those grants were requested from a
-different client. So once a user has run `squelchd auth --write`, the token behind
-the *read* slot carries `gmail.modify` and `gmail.send` too, however narrow the
-request that minted it was. "The agent door holds a token that physically cannot
-send" is therefore **not a claim we get to make**.
-
-This is also why `judge_transfer_credential` holds an imported credential to a
-scope **floor** (does the grant cover what this slot needs?) rather than an exact
-match. An exact match would refuse the Read entry of every `--export --write`
-blob, because both entries legitimately report the union. Do not "tighten" it.
-
-Real token-level separation would require a **second Google Cloud project**, not
-merely a second OAuth client, since the union is per project. That doubles the
-verification and CASA burden for a property the structural enforcement above
-already provides. We are deliberately not doing it.
-
-**Do not break.** Seal detection stays the first thing that touches a parsed body —
-any pass moved above it is a pass that has read an OTP. Sealed *absence* is the
-agent-door contract: do not add a `sensitivity` field to agent-door types "so callers
-can filter". Keep the guards returning errors, the reveal audited-before-served and
-`no-store`, and writes human-door only. Keep `drafts` off the agent door and out of
-the audit log, and keep both seal paths scrubbing it — a draft outliving its parent's
-seal is a quotation of auth mail the user has already decided is auth.
-
-**Sealed notifications, and the six things that keep them safe.** Sealed mail
-buzzes (docs/NOTIFY.md §6, §11.6). A ping is not a reveal — `PushRequest` is
-`{event_id, collapse_id}` and the relay is blind by construction — but the
-`events` row behind it is served to a client, so it is the surface with rules:
-
-- **A sealed event row carries `sealed_kind`-derived text only.** The `one_line`
-  is one of five constants picked by the kind ("Login code arrived", "Password
-  reset requested"). Never the subject, never a snippet, never the code, never
-  anything derived from any of them. `triage::events::sealed_event` takes no
-  `subject` and no `body` parameter, and none may be added: the signature is the
-  enforcement, and this is exactly the kind of thing a later change "improves"
-  by making the notification more useful.
-- **`events` is not gated on sensitivity, and must not need to be.** The table
-  has no `sensitivity` column and not one query reads one. That is safe only for
-  as long as the bullet above holds, which is why the two are one rule rather
-  than two.
-- **The fast lane runs after seal detection and cannot see a sealed body.**
-  `sync::notify_lane::Candidate::Sealed` has no `subject` and no `body` field,
-  so the sealed path is deterministic, model-free, and type-enforced. No model
-  is ever asked about sealed mail, in either lane.
-- **A seal that lands mid-call still wins, and it is asked TWICE.**
-  `correct_triage`'s redaction can only redact an `events` row that exists when
-  the human hits seal, and a notify model call takes seconds: a user sealing the
-  mail they can already see, while the fast lane is waiting on a verdict about
-  it, would otherwise get a row appended *afterwards* carrying a one_line
-  written from the body they just declared auth — served over SSE to every
-  cursor forever, with nothing left to redact it. So `notify_lane` re-reads the
-  row through `triage_seed_verdict` (which selects `sensitivity = 'normal'`) at
-  two points, because they protect different things across different windows:
-  - **After the semaphore permit, before the request is built**, which protects
-    THE PROMPT. `tokio::time::timeout` wraps the call but never the wait for a
-    permit, so at `fast_concurrency` 4 a burst queues the last task minutes
-    behind the message it is about, all of it after the mail is visible in the
-    client.
-  - **Immediately before the event is appended**, which protects the `events`
-    row against a seal that landed while the request was actually out.
-
-  Sealed or gone records a `suppressed` ledger row and emits nothing; a store
-  error emits nothing and records nothing (an error is a fact about the
-  database, not about the message). RECORDING IS PART OF THE GUARD, not
-  bookkeeping: with no row, the lane's re-entry probe stays false, and the next
-  re-ingest inside `notify.freshness_window_secs` re-runs the whole lane over
-  the sealed body. Which is also why `ingest_message`'s triage upsert preserves
-  a human-decided `sensitivity` instead of overwriting it with the heuristic
-  seed a re-walk carries: a re-ingest that reverts a person's seal is the same
-  leak from the other end. The deliberate lane has the same guard in
-  `stage1_apply`/`stage2_apply` returning `Ok(false)`.
-
-  **"Human-decided" is asked of the AXIS, not of the row.** The predicate is a
-  `triage_feedback` row with `dimension = 'sensitivity'`, written by
-  `correct_triage` in the same transaction as the correction. It is not
-  `triage.model_used = 'human'`, which that function stamps for a *tier* or a
-  *category* correction too: keyed on the column, a freeze would pin the
-  sensitivity of every human-corrected row forever, so an improved
-  `detect_sealed` could never newly seal a message whose tier somebody once
-  fixed — and detection biasing to recall is worth nothing if it cannot be
-  improved. Keyed on the axis it holds in BOTH directions, which is the second
-  half: `detect_sealed` over-seals by design, `correct_triage` is how that is
-  undone, and a re-walk that quietly re-sealed the row would be a correction
-  the user has to make again every poll.
-
-- **The sealed path re-reads too, in the opposite direction.**
-  `notify_lane::candidate` is pure and reads the FRESH heuristic triage, so a
-  message a person un-sealed is a `Candidate::Sealed` again on the next
-  re-walk: the seed detector has not changed its mind and nothing in the gate
-  can know better. `run`'s sealed arm therefore asks the store whether the row
-  is still sealed before it appends, and records `suppressed` when it is not.
-  Otherwise "this is not a login code" costs the user an Urgent,
-  importance-90 ping on a lock screen, routed to the Auth list where the
-  message is not, once per re-walk.
-- **The decline ledger carries no email-derived text.** `notify_decisions` holds
-  ids, a lane, a decision word, a score, a model id and a latency. Not the
-  `one_line`, not the subject, nothing. It cannot leak by construction, which is
-  why it needs no sensitivity gate either — and adding a text column would give
-  it one to need.
-
-**The recipient headers a send states.** `to`, `cc` and `bcc` come from the caller
-and go into the outgoing message's headers, so `gmail_write::build_reply_rfc822` and
-`build_forward_rfc822` reject any of them carrying CR or LF **before** composing: a
-smuggled newline is how a recipient gets appended that the sender never approved,
-and in a `Bcc` that addition is invisible to everyone downstream by construction.
-
-The two copy lists reach that check by different routes, and the difference is worth
-stating because it decides which guard is load-bearing:
-
-- `bcc` is filtered through `addrs_excluding` first, which parses to bare addresses
-  and **cuts the value at an embedded header token** (`parse_addr_list`), so a
-  smuggled line is dropped and the honest prefix survives. Fewer recipients, never
-  a forged one.
-- A stated `cc` is written **verbatim** — running it through `cc_excluding` would
-  delete the display names the sender typed — so on that path the builder's CR/LF
-  refusal is the whole of the sanitization, and it refuses rather than repairs.
-
-**A Bcc is recorded in exactly one place: the audit ledger.** Every other recipient
-is legible in the delivered mail; a blind copy is stripped by Gmail from the copies
-the visible recipients receive, so nothing outside this machine records that it
-happened. `handlers::action_send` therefore writes `ok:bcc:<n>` as the send's audit
-detail. **Counts, never addresses** — the ledger's job is that a send of this shape
-happened, not who it named, and the same rule that keeps matched secret text out of
-an audit row keeps recipients out of one. A stated `cc` gets no line of its own,
-deliberately: it is legible in the delivered mail, which is the test for whether the
-ledger has to carry it.
+**Staged outbound attachments.** `outbound_attachments` holds composer files until
+a send consumes them or their owning draft is deleted. Unclaimed uploads are
+swept after a day by the next upload. These human-only routes never expose bytes
+on MCP, never audit file contents, and use `no-store`. Byte responses use the same
+content-type whitelist, `nosniff`, and attachment disposition as inbound files.
+The outbound guard scans text and message parts at send time; binary files are
+not scanned. Restricting external-agent access does not delete human drafts or
+their attachments.
 
 ## 4b. Provider spam
 
@@ -713,9 +387,14 @@ raw fetch found the write credential dead — a 403 telling the user to re-run
 `squelchd auth --write`, never the 502 that would blame Gmail), `failed:target`,
 `rejected:no_recipient`, `rejected:too_large` (the original exceeds
 `MAX_FORWARD_RAW_BYTES` = 20 MiB decoded, refused with a 413 before the four-to-five-x
-re-encode allocates), `failed:fetch_original` (the forwarded original could not be
-read back, so nothing was sent), `rejected:compose`, `failed:gmail`, `ok`,
-`ok:forward`):
+re-encode allocates — or the send's own staged attachments total more than 25 MB),
+`rejected:attachment_missing` (an `attachment_ids` entry names no staged file — swept,
+deleted, or another account's — so the whole send is refused rather than going out
+with fewer files than the tray showed), `rejected:attachment_cid_clash` (two staged
+files carry one `content_id`, so the body's reference would resolve to a coin flip),
+`failed:fetch_original` (the forwarded
+original could not be read back, so nothing was sent), `rejected:compose`,
+`failed:gmail`, `ok`, `ok:forward`):
 
 | `send.echo` detail | meaning |
 | --- | --- |
@@ -739,6 +418,9 @@ budget. Keep the echo's failures audited and swallowed; keep it out of core's wr
 surface (the fetch lives in `squelch-api/src/gmail_write.rs`, core takes bytes).
 
 ## 6. The embedded assistant
+
+> The dedicated `/client/agent/` read routes and source checks in §4 supersede
+> references below to using ordinary human endpoints or legacy sealing.
 
 **Invariant.** The agent inside Passband reads only what the human door serves, so
 sealed mail is absent from it for the same reason it is absent from the door; and it

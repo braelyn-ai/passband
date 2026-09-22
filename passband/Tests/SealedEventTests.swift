@@ -29,6 +29,12 @@ struct SealedEventTests {
     static var checks = 0
 
     static func main() {
+        expect(EventBanner.shouldPresentForeground(appActive: true, windowVisible: true, isTest: false, isAuth: true), "Authentication pushes interrupt a foreground Mac")
+        expect(!EventBanner.shouldPresentForeground(appActive: true, windowVisible: true, isTest: false, isAuth: false), "Ordinary mail keeps foreground policy")
+        let auth = try! JSONDecoder().decode(Event.self, from: Data("""
+        {"id":99,"message_id":42,"thread_id":"auth","kind":"surfaced","tier":"signal","importance":0,"sender":"Security","one_line":"Login alert","created_at":"2026-09-17T12:00:00Z","is_auth":true}
+        """.utf8))
+        expect(auth.isAuth && EventBanner.copy(for: auth).sound, "Login alerts carry explicit auth and sound even at low importance")
         anOrdinaryEventDecodesWithNoSealedKey()
         aSealedEventCarriesItsKind()
         anUnheardOfKindKeepsItsRawString()
@@ -39,6 +45,32 @@ struct SealedEventTests {
         theAuthBannerStandsAloneWithNoAccountName()
         anUnnamedSenderStillSaysSomething()
         authBannersOfOneMailboxShareAGroup()
+        genericPushStillIdentifiesItsAccountAndEvent()
+        var taps = NotificationTapQueue<Int>()
+        let account = UUID()
+        taps.enqueue(91, accountId: account)
+        expect(taps.take(connected: false) == nil, "Cold-start tap waits for configured connection")
+        expect(taps.pending?.target == 91, "Connection failure does not lose the tap")
+        taps.enqueue(92, accountId: account)
+        let delivered = taps.take(connected: true)
+        expect(delivered?.target == 92 && delivered?.accountId == account, "Newest tap keeps its account through bootstrap")
+        expect(taps.take(connected: true) == nil, "Ready transition drains each tap once")
+        taps.enqueue(93, accountId: account)
+        let failed = taps.take(connected: true)!
+        taps.park(failed)
+        for _ in 0..<3 {
+            expect(taps.take(connected: true) == nil, "Failed switch is not retried by recursive completion drains")
+        }
+        taps.connectionBecameReady()
+        expect(taps.take(connected: true)?.target == 93, "Successful connection enables one new attempt")
+        taps.park(failed)
+        taps.enqueue(94, accountId: account)
+        expect(taps.take(connected: true)?.target == 94, "A newer explicit tap supersedes a parked failure")
+        taps.enqueue(95, accountId: account)
+        taps.park(failed)
+        expect(taps.take(connected: true)?.target == 95, "A tap arriving during the failed switch is not overwritten or blocked")
+        theThreadBannerNeverTitlesAnAddress()
+        theThreadBannerNeverCarriesADate()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -55,11 +87,13 @@ struct SealedEventTests {
     static func frame(
         sealedKind: String? = nil,
         sender: String = "Acme Security <no-reply@acme.com>",
-        oneLine: String = "Login code arrived"
+        oneLine: String = "Login code arrived",
+        kind: String = "urgent",
+        deadline: String? = nil
     ) -> Data {
         var fields = [
             "\"id\": 41",
-            "\"kind\": \"urgent\"",
+            "\"kind\": \(quoted(kind))",
             "\"message_id\": 907",
             "\"thread_id\": \"t-abc\"",
             "\"tier\": \"signal\"",
@@ -69,6 +103,7 @@ struct SealedEventTests {
             "\"created_at\": \"2026-09-01T10:00:00Z\"",
         ]
         if let sealedKind { fields.append("\"sealed_kind\": \(quoted(sealedKind))") }
+        if let deadline { fields.append("\"deadline\": \(quoted(deadline))") }
         return Data("{\(fields.joined(separator: ","))}".utf8)
     }
 
@@ -225,6 +260,64 @@ struct SealedEventTests {
             "and the group is the shared constant, not a per-event string")
     }
 
+    // MARK: - what the thread banner says
+
+    /// The title is a few bold words on a lock screen, and an address there is
+    /// noise in front of the summary. Every shape that has actually landed in
+    /// a title is a name or a brand here, and the auth banner's "from" line
+    /// follows the same rule.
+    static func theThreadBannerNeverTitlesAnAddress() {
+        let senders = [
+            "Sarah Chen <sarah@acme.com>": "Sarah Chen",
+            "bounce-1234-5678@em.brand.com": "Brand",
+            "sarah.chen@acme.com": "Sarah Chen",
+            "No Reply <no-reply@accounts.google.com>": "Google",
+            "notifications@github.com <noreply@github.com>": "Github",
+        ]
+        for (sender, title) in senders {
+            guard let e = decode(frame(sender: sender, oneLine: "Invoice 4471 is overdue")) else {
+                return expect(false, "decodes")
+            }
+            let copy = EventBanner.copy(for: e)
+            expect(copy.title == title, "\(sender) is titled \(title), got \(copy.title)")
+            expect(!copy.title.contains("@"), "no title carries an address")
+            expect(copy.body == "Invoice 4471 is overdue", "and the summary is the body")
+        }
+        guard let auth = decode(frame(sealedKind: "otp", sender: "no-reply@accounts.google.com"))
+        else { return expect(false, "decodes") }
+        expect(
+            authCopy(auth).body == "from Google", "the auth banner's from-line follows the same rule")
+    }
+
+    /// The event's deadline is a snapshot taken at triage, and a banner sits
+    /// on a lock screen for hours. The second line says there IS one and
+    /// nothing about when.
+    static func theThreadBannerNeverCarriesADate() {
+        let past = "2026-08-30T09:00:00Z"
+        guard let urgent = decode(frame(kind: "urgent", deadline: past)),
+            let dated = decode(frame(kind: "deadline", deadline: past)),
+            let plain = decode(frame(kind: "surfaced", deadline: past))
+        else { return expect(false, "decodes") }
+        expect(
+            EventBanner.copy(for: urgent).subtitle == "needs attention",
+            "urgent says why, not when")
+        expect(
+            EventBanner.copy(for: dated).subtitle == "has a deadline",
+            "a deadline event says there is one, not when it is")
+        expect(EventBanner.copy(for: plain).subtitle == "", "surfaced mail has no second line")
+        // The chip the rows draw for this date, asserted absent BY ITS OWN
+        // TEXT rather than by a guess at its spelling.
+        guard let chip = Fmt.deadlineChip(past)?.text, !chip.isEmpty else {
+            return expect(false, "the fixture's date yields a chip the rows would draw")
+        }
+        for e in [urgent, dated, plain] {
+            let copy = EventBanner.copy(for: e)
+            let everything = [copy.title, copy.subtitle, copy.body].joined(separator: " ")
+            expect(!everything.contains(chip), "the chip \(chip) reaches no field of the banner")
+            expect(!everything.contains("2026"), "nor the date it was made from")
+        }
+    }
+
     static func expect(_ cond: Bool, _ what: String) {
         checks += 1
         if !cond {
@@ -232,4 +325,14 @@ struct SealedEventTests {
             print("  FAIL: \(what)")
         }
     }
+    static func genericPushStillIdentifiesItsAccountAndEvent() {
+        let account = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
+        let route = EventBanner.unresolvedPush("\(account.uuidString):42")
+        expect(route?.accountId == account, "generic push keeps its account")
+        expect(route?.eventId == 42, "generic push can resolve its exact event")
+        expect(EventBanner.unresolvedPush("42") == nil, "untagged event cannot guess an account")
+        expect(EventBanner.unresolvedPush("\(account.uuidString):-1") == nil, "invalid event is rejected")
+        expect(EventBanner.unresolvedPush("not-an-account:42") == nil, "invalid account is rejected")
+    }
+
 }

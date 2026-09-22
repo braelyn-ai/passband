@@ -1892,6 +1892,7 @@ fn build_serve_router(
         store,
         account_email,
         api_state.shipment_policy(),
+        api_state.triage_ranking(),
         mcp_cancel,
     )?;
     // The latency histogram wraps BOTH doors, outermost, so the number it

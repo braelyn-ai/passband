@@ -1,5 +1,6 @@
 //! Keyword, semantic (vec0 KNN) and hybrid recall, plus the message-vector
-//! writes that feed them.
+//! writes that feed them. These are human/internal reads. External callers must
+//! rehydrate results through `external_search_hits` before exposing any fields.
 
 use super::*;
 use crate::store::recency;
@@ -12,29 +13,11 @@ use zerocopy::AsBytes;
 /// around the matched terms, `…` where the window jumps a gap. Internal markers
 /// become plain text plus matched surface forms before leaving the store.
 ///
-/// Used where the query has ALREADY established that the body matched, which
-/// on this leg means a body-scoped MATCH (`body : (...)`). Then a returned row
-/// is the proof and the window needs no probe.
+/// A column without matches yields its head. Keyword mapping uses the markers
+/// to keep the stored snippet in that case; a sender-supplied control character
+/// can fool this cosmetic check. Recall snippets establish body membership in
+/// SQL before replacing the stored snippet.
 const BODY_WINDOW: &str = "snippet(messages_fts, 1, char(1), char(2), '…', 24)";
-
-/// [`BODY_WINDOW`] with a did-the-body-match PROBE in the open marker slot.
-///
-/// `snippet()` on a column the terms did not hit returns that column's head,
-/// which is indistinguishable from a real window by content alone, so a
-/// subject-only hit would silently swap the curated stored snippet for the raw
-/// head of the body. The marker says which happened, and is stripped before
-/// anything leaves the store.
-///
-/// IT IS A HEURISTIC, NOT A GUARANTEE. `messages.body` is flattened
-/// sender-controlled text and nothing strips C0 controls at ingest, so a sender
-/// who plants U+0001 in their own body makes a subject-only hit on their own
-/// mail report a window. The consequence is that the reader sees the head of
-/// that sender's body instead of the head of that sender's stored snippet, on
-/// their own authed door: cosmetic, and self-inflicted by the one party it
-/// affects. The path that could not tolerate even that ([`SqliteStore::fts_snippet`],
-/// which runs for hits the keyword leg never produced) asks the question in SQL
-/// instead; this one cannot, because its MATCH has to span subject OR body.
-const BODY_WINDOW_PROBED: &str = BODY_WINDOW;
 
 /// THE RELEVANCE SCORE for every keyword-leg query: bm25 with the SUBJECT
 /// weighted four times the body.
@@ -51,7 +34,7 @@ const BODY_WINDOW_PROBED: &str = BODY_WINDOW;
 /// is the relevance and every ORDER BY here reads biggest-first.
 const BM25: &str = "bm25(messages_fts, 4.0, 1.0)";
 
-/// The marker `BODY_WINDOW_PROBED` plants on each matched term.
+/// The marker `BODY_WINDOW` plants on each matched term.
 const SNIPPET_MARK: char = '\u{1}';
 
 /// HOW FAR A DIAGNOSTIC COUNT COUNTS before it answers "that many, at least".
@@ -95,7 +78,6 @@ pub(super) fn fts_count_sql(include_sent: bool) -> String {
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?1
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0{sent}
                AND messages_fts MATCH ?2
              LIMIT ?3
@@ -103,9 +85,7 @@ pub(super) fn fts_count_sql(include_sent: bool) -> String {
     )
 }
 
-/// A `BODY_WINDOW_PROBED` value is a real match window only if the marker is
-/// present — otherwise the terms hit the subject (or nothing) and the caller
-/// should keep the stored snippet.
+/// Extract matched surface forms from the internal FTS highlight markers.
 fn matched_words(raw: &str) -> Vec<String> {
     raw.split(SNIPPET_MARK)
         .skip(1)
@@ -158,7 +138,7 @@ fn map_search_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
 }
 
 /// Envelope, status, subject highlights, then the body match window.
-/// Replace the stored snippet only when the body really matched.
+/// Keep the stored snippet unless the returned body window carries a marker.
 fn map_search_hit_with_window(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
     let mut hit = map_search_hit(r)?;
     hit.subject_matches = matched_words(&r.get::<_, String>(8)?);
@@ -301,20 +281,89 @@ fn fuse_ranked(lists: &[&[Candidate]], sort: SearchSort, now: DateTime<Utc>) -> 
 }
 
 impl SqliteStore {
+    /// Rehydrate externally returned hits under the same lock as current access
+    /// validation. Search indexes may contain old/restricted content; their
+    /// cached snippets and fields are never themselves permission to disclose it.
+    /// Preserve the retrieval order after removing unavailable candidates.
+    pub fn external_search_hits(
+        &self,
+        account_id: AccountId,
+        hits: &[SearchHit],
+    ) -> Result<Vec<SearchHit>> {
+        let conn = self.lock()?;
+        let mut allowed = Vec::new();
+        for candidate in hits {
+            if !super::messages::external_message_allowed_conn(&conn, account_id, candidate.id)? {
+                continue;
+            }
+            let hit = conn
+                .query_row(
+                    "SELECT m.id,m.thread_id,m.from_addr,m.from_name,m.subject,m.received_at,m.snippet,
+                        (COALESCE(t.status, 'new') = 'done')
+                 FROM messages m LEFT JOIN triage t ON t.message_id=m.id
+                 WHERE m.account_id=?1 AND m.id=?2 AND m.is_spam=0",
+                    params![account_id, candidate.id],
+                    map_search_hit,
+                )
+                .optional()?;
+            let Some(hit) = hit else {
+                continue;
+            };
+            match super::messages::thread_guard_and_subject(&conn, account_id, &hit.thread_id) {
+                Ok(_) => allowed.push(hit),
+                Err(CoreError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(allowed)
+    }
+
+    /// Apply external access before the public result limit. Hidden leading hits
+    /// must not consume an agent's result window. Recall expands until enough
+    /// readable results are found or the underlying search is exhausted.
+    pub fn external_search(
+        &self,
+        account_id: AccountId,
+        query: &str,
+        sort: SearchSort,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut window = limit;
+        loop {
+            let (hits, full) = self.hybrid_search_legs(
+                account_id,
+                query,
+                &SearchFilter::default(),
+                sort,
+                false,
+                false,
+                window,
+            )?;
+            let candidates: Vec<_> = hits.into_iter().map(|hit| hit.hit).collect();
+            let mut allowed = self.external_search_hits(account_id, &candidates)?;
+            if allowed.len() >= limit || !full {
+                allowed.truncate(limit);
+                return Ok(allowed);
+            }
+            window = window.saturating_mul(2);
+        }
+    }
+
     // ON-BOX SEMANTIC RECALL. Inherent methods rather than `Store` ones because
     // they need the attached [`Embedder`] and the sqlite-vec `message_vecs`
     // table, which not every `Store` impl carries.
     //
-    // SECURITY: SEALED MESSAGES ARE NEVER EMBEDDED — the write callers gate on
-    // `sensitivity='normal'`, so sealed text is structurally absent from the
-    // vector space; query-time methods re-exclude sealed rows anyway.
+    // Internal embedding and human recall may process restricted mail. External
+    // results always pass through current source checks in external_search_hits.
 
     /// SEMANTIC RECALL: embed `query_text` and return the `k` nearest messages as
     /// `(message_id, distance)`, smaller = closer, scoped to `account_id`.
     ///
-    /// SECURITY: the KNN hit set is re-joined to `triage` to drop sealed rows
-    /// (they should never be indexed at all). BOTH `is_sent` values are INCLUDED
-    /// — recall wants the user's own sent mail ("did I say I'd send X").
+    /// Internal recall includes restricted mail and the user's own sent mail.
+    /// This primitive does not authorize exposing a result to an external agent.
     ///
     /// RAW KNN: this is nearest-by-meaning and nothing else. Recency belongs to
     /// the SEARCH surfaces built on top of it — see
@@ -352,7 +401,7 @@ impl SqliteStore {
 
     /// Lower-level KNN used by [`semantic_knn`](Self::semantic_knn) (and reused
     /// by [`hybrid_search`]): given an already-computed query vector, return the
-    /// `k` nearest non-sealed messages for the account, each with its distance.
+    /// `k` nearest account-owned messages for the account, each with its distance.
     fn knn_by_vector(
         &self,
         account_id: AccountId,
@@ -377,7 +426,6 @@ impl SqliteStore {
              WHERE v.embedding MATCH ?1
                AND v.account_id = ?2
                AND v.k = ?3
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0
              ORDER BY v.distance",
         )?;
@@ -457,7 +505,7 @@ impl SqliteStore {
         want_windows: bool,
         k: usize,
     ) -> Result<(Vec<LeggedHit>, bool)> {
-        self.hybrid_search_legs_windowed(
+        self.hybrid_search_legs_ordered(
             account_id,
             query_text,
             filter,
@@ -465,34 +513,6 @@ impl SqliteStore {
             partial,
             if want_windows { 0..usize::MAX } else { 0..0 },
             k,
-        )
-    }
-
-    /// Hybrid recall with match snippets only for the specified range of
-    /// filtered results. Ranking, filtering, provenance and window fullness are
-    /// identical to `hybrid_search_legs`; callers still paginate the returned
-    /// hits. Restricting snippet work avoids probing candidates outside the
-    /// page while keeping hydration and snippets under the same store lock.
-    #[allow(clippy::too_many_arguments)]
-    pub fn hybrid_search_legs_windowed(
-        &self,
-        account_id: AccountId,
-        query_text: &str,
-        filter: &SearchFilter,
-        sort: SearchSort,
-        partial: bool,
-        snippet_range: std::ops::Range<usize>,
-        k: usize,
-    ) -> Result<(Vec<LeggedHit>, bool)> {
-        self.hybrid_search_legs_ordered(
-            account_id,
-            query_text,
-            filter,
-            sort,
-            partial,
-            snippet_range,
-            k,
-            false,
         )
     }
 
@@ -506,7 +526,6 @@ impl SqliteStore {
         partial: bool,
         snippet_range: std::ops::Range<usize>,
         k: usize,
-        unfinished_first: bool,
     ) -> Result<(Vec<LeggedHit>, bool)> {
         // ONE clock for both legs of one search.
         let now = Utc::now();
@@ -517,7 +536,9 @@ impl SqliteStore {
                 // The instruction is the QUERY side of BGE's asymmetry; the
                 // corpus vectors were embedded without it, on purpose.
                 let qvec = embedder.embed(&crate::embed::query_embed_text(query_text))?;
-                self.knn_by_vector(account_id, &qvec, k)?
+                // sqlite-vec caps one nearest-neighbor query at 4096.
+                // Keyword recall can keep expanding beyond the semantic window.
+                self.knn_by_vector(account_id, &qvec, k.min(4096))?
                     .into_iter()
                     .map(|(c, _dist)| c)
                     .collect()
@@ -557,9 +578,7 @@ impl SqliteStore {
                 });
             }
         }
-        if unfinished_first {
-            out.sort_by_key(|item| item.hit.is_done);
-        }
+        filter.order_hits(&mut out, |item| item.hit.is_done);
         for (index, item) in out.iter_mut().enumerate() {
             if snippet_range.contains(&index)
                 && let Some(window) = self.fts_snippet(&conn, account_id, item.hit.id, &fts.any)?
@@ -585,11 +604,8 @@ impl SqliteStore {
     /// `prepare_cached`, and the connection comes from the caller: this runs
     /// once per hydrated hit, up to `recall_k` (600) of them for a deep page.
     ///
-    /// SECURITY: `messages_fts` indexes bodies at INGEST, before triage seals
-    /// anything, so the index does contain sealed text. The account and sealed
-    /// guards are IN THIS QUERY, not delegated to the caller's hydration order
-    /// — a future second caller must not be one refactor away from windowing a
-    /// sealed body.
+    /// Account-scoped human snippet extraction. External results are rehydrated
+    /// through external_search_hits and never reuse these cached match windows.
     fn fts_snippet(
         &self,
         conn: &Connection,
@@ -610,7 +626,6 @@ impl SqliteStore {
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE f.rowid = ?1
                AND m.account_id = ?2
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0
                AND messages_fts MATCH ?3"
         );
@@ -686,6 +701,7 @@ impl SqliteStore {
                 out.push(hit);
             }
         }
+        filter.order_hits(&mut out, |hit| hit.is_done);
         Ok((out, window_full))
     }
 
@@ -744,7 +760,6 @@ impl SqliteStore {
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0
                AND messages_fts MATCH ?",
         );
@@ -789,8 +804,7 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// Hydrate a single non-sealed message id into a [`SearchHit`] (sealed rows
-    /// return `None`, keeping them absent from hybrid results).
+    /// Hydrate one account-owned message for human/internal recall.
     ///
     /// The connection comes from the caller and the statement is cached: this
     /// runs once per candidate in a hydration loop, so a lock per call and a
@@ -808,8 +822,7 @@ impl SqliteStore {
                  FROM messages m
                  LEFT JOIN triage t ON t.message_id = m.id
                  WHERE m.account_id = ?1 AND m.id = ?2
-                   AND COALESCE(t.sensitivity, 'normal') != 'sealed'
-                   AND m.is_spam = 0",
+                       AND m.is_spam = 0",
             )?
             .query_row(params![account_id, id], map_search_hit)
             .optional()?;
@@ -846,8 +859,8 @@ impl SqliteStore {
     /// in Rust, so LIMIT/OFFSET keep cutting an exact page out of a real
     /// ordering instead of out of a fetched window.
     ///
-    /// SECURITY: the sealed, spam and sent predicates live in this one place, so
-    /// both passes carry them by construction.
+    /// Both passes share account, spam, and sent-mail filters. External access
+    /// is checked separately when an external consumer requests these results.
     #[allow(clippy::too_many_arguments)] // one keyword query, one argument per part
     fn keyword_page(
         &self,
@@ -860,10 +873,6 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        // SECURITY: sealed rows excluded in SQL. An untriaged message COALESCEs
-        // to non-sealed so freshly-ingested mail is still findable, but a sealed
-        // classification always hides the row.
-        //
         // The trailing column is the FTS match window; the mapper swaps it in
         // over the stored head-of-message snippet only when the body really
         // matched (see `body_window`) — a subject-only hit keeps the curated
@@ -871,12 +880,11 @@ impl SqliteStore {
         let mut sql = format!(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
                     m.received_at, m.snippet, (COALESCE(t.status, 'new') = 'done'),
-                    highlight(messages_fts, 0, char(1), char(2)), {BODY_WINDOW_PROBED}
+                    highlight(messages_fts, 0, char(1), char(2)), {BODY_WINDOW}
              FROM messages_fts f
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0
                AND messages_fts MATCH ?"
         );
@@ -964,7 +972,6 @@ impl SqliteStore {
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0
                AND messages_fts MATCH ?",
         );
@@ -1025,8 +1032,7 @@ impl SqliteStore {
     }
 
     /// Desktop search: status groups precede the strict/partial seam and
-    /// LIMIT/OFFSET. Include sent mail to match the desktop's hybrid scope.
-    /// Other callers retain their existing ranking and inbound-only scope.
+    /// LIMIT/OFFSET. Corpus scope comes from the same filter as diagnostics.
     #[allow(clippy::too_many_arguments)]
     pub fn search_unfinished_first(
         &self,
@@ -1038,43 +1044,54 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
+        let conn = self.lock()?;
         let fts = FtsQuery::build(text, partial);
+        // Validate the caller's filter before adding our internal status predicate.
+        if fts.is_empty() && filter.is_empty() {
+            return self
+                .search_filtered_locked(
+                    &conn, account_id, text, filter, sort, partial, limit, offset,
+                )
+                .map(|(hits, _)| hits);
+        }
         let mut group = filter.clone();
         group.done = Some(false);
-        group.include_sent = true;
-        let unfinished = {
-            let conn = self.lock()?;
-            if fts.is_empty() {
-                let mut sql = String::from(
-                    "SELECT COUNT(*) FROM messages m
-                    LEFT JOIN triage t ON t.message_id = m.id
-                    WHERE m.account_id = ? AND m.is_spam = 0
-                    AND COALESCE(t.sensitivity, 'normal') != 'sealed'",
-                );
-                let mut args = vec![Value::Integer(account_id)];
-                push_filter_clauses(&mut sql, &mut args, &group);
-                conn.query_row(&sql, params_from_iter(args), |r| r.get::<_, u32>(0))?
-            } else {
-                self.keyword_total(&conn, account_id, &fts.any, &group)?
+        let unfinished = if offset == 0 {
+            0 // No seam count is needed to fill the first page.
+        } else if fts.is_empty() {
+            let mut sql = String::from(
+                "SELECT COUNT(*) FROM messages m LEFT JOIN triage t ON t.message_id = m.id WHERE m.account_id = ? AND m.is_spam = 0",
+            );
+            let mut args = vec![Value::Integer(account_id)];
+            if !group.include_sent {
+                sql.push_str(" AND m.is_sent = 0");
             }
-        };
-        let mut out = if offset < unfinished {
-            self.search_filtered(account_id, text, &group, sort, partial, limit, offset)?
+            push_filter_clauses(&mut sql, &mut args, &group);
+            conn.query_row(&sql, params_from_iter(args), |r| r.get::<_, u32>(0))?
         } else {
-            Vec::new()
+            self.keyword_total(&conn, account_id, &fts.any, &group)?
         };
+        let mut out = self
+            .search_filtered_locked(
+                &conn, account_id, text, &group, sort, partial, limit, offset,
+            )?
+            .0;
         let owed = limit.saturating_sub(out.len() as u32);
         if owed > 0 {
             group.done = Some(true);
-            out.extend(self.search_filtered(
-                account_id,
-                text,
-                &group,
-                sort,
-                partial,
-                owed,
-                offset.saturating_sub(unfinished),
-            )?);
+            out.extend(
+                self.search_filtered_locked(
+                    &conn,
+                    account_id,
+                    text,
+                    &group,
+                    sort,
+                    partial,
+                    owed,
+                    offset.saturating_sub(unfinished),
+                )?
+                .0,
+            );
         }
         Ok(out)
     }
@@ -1082,7 +1099,7 @@ impl SqliteStore {
     /// [`search_filtered`](Self::search_filtered) plus THE STRICT COUNT IT
     /// ALREADY TOOK, for a caller that would otherwise take it again.
     ///
-    /// The seam between the strict page and the any-only one is a `COUNT(*)`
+    /// Beyond page zero, the seam between strict and any-only is a `COUNT(*)`
     /// over the strict expression (see [`keyword_total`](Self::keyword_total)),
     /// and the diagnostics beside the page report that same number as
     /// `strict_hits`. Counting it twice per request is one full doclist walk
@@ -1111,6 +1128,24 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SearchHit>, Option<u32>)> {
+        let conn = self.lock()?;
+        self.search_filtered_locked(
+            &conn, account_id, text, filter, sort, partial, limit, offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_filtered_locked(
+        &self,
+        conn: &Connection,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SearchHit>, Option<u32>)> {
         let fts = FtsQuery::build(text, partial);
         if fts.is_empty() {
             // No text AND no filter is not a search — it is "page me the whole
@@ -1128,10 +1163,9 @@ impl SqliteStore {
             }
             // No MATCH ran, so there is no strict set and nothing to report a
             // count of.
-            let hits = self.filter_only_listing(account_id, filter, limit, offset)?;
+            let hits = self.filter_only_listing(conn, account_id, filter, limit, offset)?;
             return Ok((hits, None));
         }
-        let conn = self.lock()?;
         // ONE TERM means strict and any are the same expression, so there is no
         // any-only pass to run and no count to take: the strict page IS the
         // page. Skipping both is not just an optimisation — a `NOT IN` against
@@ -1139,7 +1173,7 @@ impl SqliteStore {
         // more FTS scans to learn that is silly.
         if fts.terms.len() == 1 {
             let hits = self.keyword_page(
-                &conn,
+                conn,
                 account_id,
                 &fts.strict,
                 None,
@@ -1150,11 +1184,30 @@ impl SqliteStore {
             )?;
             return Ok((hits, None));
         }
-        let strict_total = self.keyword_total(&conn, account_id, &fts.strict, filter)?;
+        if offset == 0 {
+            let mut hits =
+                self.keyword_page(conn, account_id, &fts.strict, None, filter, sort, limit, 0)?;
+            if hits.len() == limit as usize {
+                return Ok((hits, None));
+            }
+            let strict_total = hits.len() as u32;
+            hits.extend(self.keyword_page(
+                conn,
+                account_id,
+                &fts.any,
+                Some(&fts.strict),
+                filter,
+                sort,
+                limit - strict_total,
+                0,
+            )?);
+            return Ok((hits, Some(strict_total)));
+        }
+        let strict_total = self.keyword_total(conn, account_id, &fts.strict, filter)?;
         let mut out = Vec::new();
         if offset < strict_total {
             out = self.keyword_page(
-                &conn,
+                conn,
                 account_id,
                 &fts.strict,
                 None,
@@ -1172,7 +1225,7 @@ impl SqliteStore {
         if owed > 0 {
             let any_offset = offset.saturating_sub(strict_total);
             let rest = self.keyword_page(
-                &conn,
+                conn,
                 account_id,
                 &fts.any,
                 Some(&fts.strict),
@@ -1202,11 +1255,8 @@ impl SqliteStore {
     /// not worth a full doclist walk under the store mutex; nothing that reads
     /// these needs one.
     ///
-    /// SECURITY: account-scoped, sealed rows excluded, spam rows excluded —
-    /// exactly the predicates the hit queries carry, and for a sharper reason
-    /// here. A document frequency is a yes/no oracle over message text, so a
-    /// count that could see sealed mail would answer questions about sealed
-    /// mail one word at a time, without ever returning a row.
+    /// Human-only diagnostics include restricted mail and exclude spam, exactly
+    /// like the search results. These counts must never be exposed to agents.
     pub fn search_diagnostics(
         &self,
         account_id: AccountId,
@@ -1227,7 +1277,7 @@ impl SqliteStore {
     ///
     /// WHAT THE CALLER IS PROMISING, because nothing here can check it: that
     /// the number came from the SAME question these counts ask — this account,
-    /// no operator predicates, sealed and spam excluded, and sent mail excluded
+    /// no operator predicates, provider spam excluded, and sent mail excluded
     /// exactly as `include_sent = false` would. A count taken under a `from:`
     /// belongs to a different set and must not be passed; the two predicates
     /// differ and two counts are then the honest answer.
@@ -1287,7 +1337,7 @@ impl SqliteStore {
         })
     }
 
-    /// How many non-sealed, non-spam messages of this account match `expr`,
+    /// How many non-spam messages of this account match `expr`,
     /// COUNTED NO FURTHER THAN [`DIAGNOSTIC_COUNT_CAP`]. The counting half of
     /// [`search_diagnostics`](Self::search_diagnostics); no operators, because
     /// a count of "what the index holds" is not a count of one filtered page.
@@ -1322,25 +1372,22 @@ impl SqliteStore {
     /// (`from:jane after:2026-01-01`), so there is no text to rank on and no
     /// MATCH to run — this is a plain newest-first page over `messages`.
     ///
-    /// SECURITY: identical guarantees to [`search`](Self::search) — sealed rows
-    /// excluded via the triage LEFT JOIN, sent mail excluded (`is_sent = 0`), so
-    /// dropping the FTS join cannot widen what the door can see. With no filter
-    /// at all it is simply the newest non-sealed inbound mail.
+    /// Account-scoped human listing. Sent mail and provider spam are excluded;
+    /// pending and restricted inbound messages remain readable.
     fn filter_only_listing(
         &self,
+        conn: &Connection,
         account_id: AccountId,
         filter: &SearchFilter,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        let conn = self.lock()?;
         let mut sql = String::from(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
                     m.received_at, m.snippet, (COALESCE(t.status, 'new') = 'done')
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND COALESCE(t.sensitivity, 'normal') != 'sealed'
                AND m.is_spam = 0",
         );
         let mut args = vec![Value::Integer(account_id)];
@@ -1400,7 +1447,6 @@ impl SqliteStore {
              FROM messages m
              JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?1
-               AND t.sensitivity = 'normal'
                AND m.is_spam = 0
                AND NOT EXISTS (
                    SELECT 1 FROM message_vecs v WHERE v.message_id = m.id

@@ -18,12 +18,13 @@ By default, typing requests keyword retrieval with unfinished-first ordering,
 including sent mail to preserve the old hybrid search's mailbox scope.
 `Include related` enables hybrid retrieval and remembers the choice across
 searches and app launches. Existing results remain on screen while a new request
-runs. Returning
-from the reader refreshes status and preserves the selected message when it is
-still on the first page. Keyword ordering is exact across status and
-strict/partial boundaries. Related retrieval uses a fixed, bounded 600-candidate
-window so the grouping does not change merely because another page was fetched;
-it is still approximate recall and does not enumerate all mailbox matches.
+runs. Returning from the reader preserves every loaded page, its cursor and selection. Keyword
+ordering is exact across status and strict/partial boundaries, with one store
+lock per page and no first-page seam count. Related retrieval starts with a
+page-sized recall window and expands as needed (capped at 600). Its cursor
+remembers delivered IDs so expanding the ranking does not repeat rows, and it
+exhausts the bounded window before entering the done group.
+It is still approximate recall and does not enumerate all mailbox matches.
 
 The API logs queue, retrieval, diagnostics and total time for searches taking
 at least 250 ms, without queries or mail content. The original 30-second delay
@@ -125,7 +126,7 @@ Confirmed from code:
 1. The panel waits 220 ms after a keystroke, then requests 50 results with
    `partial=1` and no explicit retrieval mode.
 2. With an attached embedder, the API defaults to hybrid.
-3. `hybrid_search_legs_windowed` embeds the query, runs vector retrieval, then
+3. `hybrid_search_legs_ordered` embeds the query, runs vector retrieval, then
    keyword retrieval, fusion, hydration and snippets. Diagnostics also finish
    before the response. No keyword result can reach the UI early.
 4. The embedding session is protected by a mutex. Lazy loading and concurrent

@@ -99,7 +99,7 @@ enum SettingsCard: String, CaseIterable, Sendable {
         case .signature: "Signature"
         case .readTracking: "Read tracking"
         case .triagePipeline: "How triage works"
-        case .triageBudget: "Triage budget"
+        case .triageBudget: "While triage is working"
         case .ranking: "For your eyes"
         case .assistant: "Assistant"
         case .privacy: "Developer Telemetry"
@@ -186,7 +186,7 @@ enum SettingsSearch {
         SettingsEntry(
             card: .tour,
             title: "Replay the tour",
-            blurb: "Runs the seven step first run walkthrough over your own board again.",
+            blurb: "Opens the guided practice inbox, then returns to your live inbox.",
             keywords: [
                 "tour", "walkthrough", "onboarding", "tutorial", "guide", "intro",
                 "introduction", "first run", "getting started", "replay", "help", "again",
@@ -268,7 +268,7 @@ enum SettingsSearch {
         SettingsEntry(
             card: .triagePipeline,
             title: "How triage works",
-            blurb: "The path a new email takes: sealing, your rules, then the two model stages.",
+            blurb: "Fast notifications and agent decisions for For your eyes, Reading, and Records.",
             keywords: [
                 "triage", "how triage works", "pipeline", "stages", "stage 1", "stage 2",
                 "escalation", "escalate", "seal", "sealed", "sender rules", "rules",
@@ -277,16 +277,16 @@ enum SettingsSearch {
             ]),
         SettingsEntry(
             card: .triageBudget,
-            title: "Stage 1 daily cap",
-            blurb: "How many emails a day the first model may look at before triage falls back.",
+            title: "Pending triage",
+            blurb: "Mail stays readable while triage works within its processing budget.",
             keywords: [
                 "stage 1", "stage one", "daily cap", "cap", "caps", "limit", "limits",
                 "budget", "quota", "throttle", "per day", "global cap", "calls",
             ]),
         SettingsEntry(
             card: .triageBudget,
-            title: "Stage 2 daily caps",
-            blurb: "How many escalations a day are allowed per thread, per sender, and overall.",
+            title: "Triage investigation",
+            blurb: "The agent can read more context before deciding where mail belongs.",
             keywords: [
                 "stage 2", "stage two", "escalation cap", "per thread", "per sender",
                 "thread cap", "sender cap", "global cap", "daily cap", "caps", "limit",
@@ -294,8 +294,8 @@ enum SettingsSearch {
             ]),
         SettingsEntry(
             card: .triageBudget,
-            title: "Spend estimate",
-            blurb: "What triage costs you a day at your current caps and usage.",
+            title: "Processing budget",
+            blurb: "Processing budgets are managed with your account; mail remains readable while waiting.",
             keywords: [
                 "cost", "costs", "spend", "spending", "price", "pricing", "estimate",
                 "money", "dollars", "bill", "billing", "budget", "expensive", "monthly",
@@ -304,7 +304,7 @@ enum SettingsSearch {
         SettingsEntry(
             card: .ranking,
             title: "For your eyes ranking",
-            blurb: "Whether the top zone leans on how soon something is due or how bad it is.",
+            blurb: "Urgency, action needed, personal relevance, and recency determine a shared order.",
             keywords: [
                 "ranking", "rank", "order", "ordering", "sort", "sorting", "for your eyes",
                 "sitrep", "urgency", "severity", "importance", "priority", "deadline",

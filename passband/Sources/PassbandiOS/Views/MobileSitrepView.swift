@@ -1,6 +1,6 @@
 // THE PHONE'S DASHBOARD — the ACTION half of the Mac's SitrepView, folded to one
 // column: the hero states what needs you today, For-your-eyes ranks the standing
-// band, and the newsletters zone offers the rule-onboarding it always has.
+// band, and the reading zone offers the rule-onboarding it always has.
 //
 // The Mac's other half, the pinned records rail, is a TAB here instead
 // (MobileRecordsView). That split is the phone's own: a Mac shows work surface
@@ -49,7 +49,7 @@ struct MobileSitrepView: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
 
-    /// NewslettersZone takes a cursor because the Mac drives it with the
+    /// ReadingZone takes a cursor because the Mac drives it with the
     /// keyboard. Nothing writes to this one — it is the shared component's
     /// price of admission, and holding it here keeps that zone byte-identical
     /// across the two shells rather than forking it for the phone.
@@ -61,41 +61,23 @@ struct MobileSitrepView: View {
     private static let eyesVisible = 4
     @State private var expanded = false
 
-    /// The codes young enough to still be worth racing to. The window, the
-    /// code-kind test and the sort all belong to MobileAuthView, which is the
-    /// surface that has to keep its word about them — this is only the card
-    /// asking.
-    private var freshCodes: [SealedMeta] {
-        MobileAuthView.freshCodes(store.sitrep.sealed)
-    }
-
     var body: some View {
-        // ONE rank per render, exactly as the Mac does it: this sorts the whole
-        // standing band, and a computed property read three times would sort it
-        // three times on every scroll frame.
-        let ranked = Ranking.rank(store.sitrep.standing, weight: prefs.rankWeight)
+        // Preserve the server order on every device.
+        let ranked = store.sitrep.standing
         let visible = expanded ? ranked : Array(ranked.prefix(Self.eyesVisible))
         let overflow = ranked.count - Self.eyesVisible
 
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                // ABOVE THE HERO, and only ever for the minutes it is true.
-                // Everything else in this column is work that will still be
-                // there tomorrow; a login code is the one thing on the screen
-                // with a clock running on it, and a card under the greeting is
-                // a card you scroll to.
-                let fresh = freshCodes
-                if !fresh.isEmpty {
-                    FreshCodeCard(codes: fresh)
-                }
                 hero
                 if !ranked.isEmpty {
                     forYourEyes(visible: visible, overflow: overflow, queue: ranked)
                 }
-                NewslettersZone(
-                    newsletters: Newsletters.prune(
-                        store.zones.newsletters, resolved: store.resolvedIds),
+                ReadingZone(
+                    senders: Reading.prune(
+                        store.zones.reading, resolved: store.resolvedIds),
                     cursor: cursor)
+                AgentRecordsZone()
                 footnote
             }
             .padding(.horizontal, 16)
@@ -201,7 +183,7 @@ struct MobileSitrepView: View {
         let total = store.sitrep.standing.count
         if today > 0 {
             return "\(Self.spell(today)) item\(today == 1 ? "" : "s") "
-                + "need\(today == 1 ? "s" : "") you today."
+                + "for your eyes."
         }
         if total > 0 {
             return "\(Self.spell(total)) item\(total == 1 ? "" : "s") on your plate."
@@ -295,85 +277,5 @@ struct MobileSitrepView: View {
         guard let last = store.lastRefresh else { return "waiting for the first sync…" }
         let age = Fmt.relAge(last)
         return (age.isEmpty || age == "now") ? "synced just now" : "synced \(age) ago"
-    }
-}
-
-// MARK: - the code that just landed
-
-/// THE ONE CARD ON THIS SCREEN WITH A CLOCK ON IT. Everything else in the sitrep
-/// is work that will still be there tomorrow; this is a login code that arrived
-/// in the last hour, drawn only while that is true and gone on its own after.
-///
-/// IT REVEALS FROM HERE. The point of raising it above the hero is to make the
-/// distance from "the app is open" to "the digits are on screen" one tap, so
-/// sending the user to the codes page first would have given the card its
-/// urgency and then charged for it anyway. The tap runs
-/// `MobileAuthView.revealCode` — the same audited call the page's own rows run —
-/// and the digits land in `store.authQueue`, which the shell already watches:
-/// AuthCodeModal comes up with its 30s self-destruct and its copy button, and
-/// nothing here ever holds a code.
-///
-/// AND IT DRAWS `AuthRow`, the page's row, not a lookalike. A card that rendered
-/// the same sealed message a little differently from the page behind it would be
-/// two answers to "what just arrived".
-///
-/// TWO ROWS, THEN IT DEFERS. Codes arrive one at a time in practice; two is the
-/// generous case (a retry, or two services at once) and anything past it is a
-/// list, which is what the page is for. A card that could grow without bound is
-/// a card that can push the whole dashboard off the screen.
-private struct FreshCodeCard: View {
-    @Environment(AppStore.self) private var store
-    /// Newest first, already filtered to live code kinds by
-    /// `MobileAuthView.freshCodes` — this view does not decide what is fresh.
-    let codes: [SealedMeta]
-
-    private static let visible = 2
-
-    /// Which row is mid-reveal. Local, like the page's: a reveal in flight is
-    /// this card's business and outlives nothing.
-    @State private var busy: Int?
-
-    var body: some View {
-        ZoneCard(
-            symbol: "key.fill",
-            title: "Just arrived",
-            count: codes.count > 1 ? codes.count : nil,
-            subtitle: "sealed until you tap",
-            tint: Palette.lock
-        ) {
-            VStack(spacing: 2) {
-                ForEach(codes.prefix(Self.visible)) { meta in
-                    AuthRow(
-                        meta: meta,
-                        live: true,
-                        busy: busy == meta.id,
-                        onReveal: { Task { await reveal(meta) } })
-                }
-                if codes.count > Self.visible {
-                    NavigationLink {
-                        MobileAuthView()
-                    } label: {
-                        Text("\(codes.count - Self.visible) more")
-                            .font(Typo.micro)
-                            .foregroundStyle(Palette.inkFaint)
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 5)
-                    }
-                    .buttonStyle(.glass)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 6)
-                }
-            }
-        }
-    }
-
-    /// No kind branch, unlike the page's: `freshCodes` already promised every
-    /// row here has digits to present, so there is no RevealPanel case to host
-    /// and this card never has to become a second reading surface.
-    private func reveal(_ meta: SealedMeta) async {
-        guard busy == nil else { return }
-        busy = meta.id
-        defer { busy = nil }
-        await MobileAuthView.revealCode(meta, into: store)
     }
 }

@@ -73,6 +73,10 @@ impl SearchSort {
 /// exactly the first of January.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilter {
+    /// Presentation policy, not a user query constraint.
+    pub unfinished_first: bool,
+    /// Already delivered recall hits, excluded before snippet generation.
+    pub exclude_ids: Vec<i64>,
     /// The desktop fast path searches the same sent/inbound corpus as hybrid.
     pub include_sent: bool,
     /// Internal status constraint for exact unfinished-first pagination.
@@ -93,6 +97,12 @@ impl SearchFilter {
         self.done.is_none() && self.from.is_none() && self.after.is_none() && self.before.is_none()
     }
 
+    pub fn order_hits<T>(&self, hits: &mut [T], done: impl Fn(&T) -> bool) {
+        if self.unfinished_first {
+            hits.sort_by_key(done);
+        }
+    }
+
     /// Does this hit satisfy every constraint? The post-hoc twin of the SQL
     /// predicates, for the recall legs (semantic/hybrid), which rank first and
     /// filter after.
@@ -101,6 +111,9 @@ impl SearchFilter {
     /// `LIKE`, which is itself ASCII-only, or the same query would mean two
     /// different things depending on the mode.
     pub fn matches(&self, hit: &SearchHit) -> bool {
+        if self.exclude_ids.contains(&hit.id) {
+            return false;
+        }
         if self.done.is_some_and(|done| done != hit.is_done) {
             return false;
         }

@@ -81,9 +81,8 @@ actor APIClient {
         config = nil
     }
 
-    var isConfigured: Bool { config != nil }
-
     private func requireConfig() throws -> Config {
+        if RehearsalMode.isEnabled { return Config(baseURL: "https://rehearsal.invalid", token: "practice") }
         guard let config else { throw APIError(.network, 0, "client not configured") }
         return config
     }
@@ -97,7 +96,10 @@ actor APIClient {
         method: Method,
         query: [String: String?],
         body: Data?,
-        timeout: TimeInterval
+        timeout: TimeInterval,
+        // JSON for every route but one: the attachment upload's body IS the
+        // file, and its type is the file's.
+        contentType: String = "application/json"
     ) throws -> URLRequest {
         let cfg = try requireConfig()
         guard var comps = URLComponents(string: cfg.baseURL + path) else {
@@ -107,7 +109,15 @@ actor APIClient {
             guard let value, !value.isEmpty else { return nil }
             return URLQueryItem(name: key, value: value)
         }
-        if !pairs.isEmpty { comps.queryItems = pairs.sorted { $0.name < $1.name } }
+        if !pairs.isEmpty {
+            comps.queryItems = pairs.sorted { $0.name < $1.name }
+            // `URLComponents` leaves a literal `+` in a query value, and the
+            // daemon's form decoder reads a literal `+` as a SPACE — so a
+            // file called `C++ notes.pdf` would be staged as `C   notes.pdf`.
+            // Encode it, so what is sent is what was named.
+            comps.percentEncodedQuery = comps.percentEncodedQuery?
+                .replacingOccurrences(of: "+", with: "%2B")
+        }
         guard let url = comps.url else { throw APIError(.network, 0, "bad server url") }
 
         var req = URLRequest(url: url, timeoutInterval: timeout)
@@ -116,14 +126,20 @@ actor APIClient {
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         if let body {
             req.httpBody = body
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(contentType, forHTTPHeaderField: "Content-Type")
         }
         return req
     }
 
     /// Perform a request and return the raw body. Non-2xx throws an APIError
     /// whose message comes from the server's `{"error": …}` body when present.
-    private func perform(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    private func perform(_ req: URLRequest, allowPractice: Bool = true) async throws -> (Data, HTTPURLResponse) {
+        if RehearsalMode.isEnabled {
+            guard allowPractice else {
+                throw APIError(.badRequest, 400, "Finish the practice inbox before changing accounts.")
+            }
+            return try await RehearsalAPI.shared.response(for: req)
+        }
         let data: Data
         let response: URLResponse
         do {
@@ -218,6 +234,28 @@ actor APIClient {
 
     // MARK: - reads
 
+    func getFeed(destination: String, limit: Int = 200) async throws -> AgentFeed {
+        let feed: AgentFeed = try await get("/client/v2/feed", query: [
+            "destination": destination, "limit": String(limit),
+        ])
+        guard feed.version == 2 else {
+            throw APIError(.unknown, 0, "Please update Passband to read this server's feeds.")
+        }
+        return feed
+    }
+
+    func getEvent(_ eventId: Int) async throws -> Event {
+        try await get("/client/events/\(eventId)")
+    }
+
+    func getMessage(_ messageId: Int) async throws -> HumanMessageEnvelope {
+        try await get("/client/v2/messages/\(messageId)")
+    }
+
+    func markMessageOpened(_ messageId: Int) async throws {
+        try await postNoContent("/client/v2/messages/\(messageId)/opened")
+    }
+
     /// `peek: true` reads the same rows WITHOUT stamping the seen-ledger — for a
     /// reader acting on the user's behalf (the embedded agent) that will surface
     /// only some of what it fetched. Every UI fetch leaves it false, because the
@@ -241,10 +279,10 @@ actor APIClient {
             ])
     }
 
-    func getThread(_ threadId: String) async throws -> ClientThreadView {
+    func getThread(_ threadId: String, forAgent: Bool = false) async throws -> ClientThreadView {
         let escaped =
             threadId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadId
-        return try await get("/client/thread/\(escaped)")
+        return try await get(forAgent ? "/client/agent/thread/\(escaped)" : "/client/thread/\(escaped)")
     }
 
     /// `sort` is the reader's standing preference (`Prefs.searchSort`), passed
@@ -266,10 +304,11 @@ actor APIClient {
         mode: SearchMode? = nil,
         sort: SearchSortChoice? = nil,
         partial: Bool = false,
-        unfinishedFirst: Bool = false
+        unfinishedFirst: Bool = false,
+        forAgent: Bool = false
     ) async throws -> SearchPage {
         try await get(
-            "/client/search",
+            forAgent ? "/client/agent/search" : "/client/search",
             query: [
                 "q": q, "limit": limit.map(String.init), "cursor": cursor, "mode": mode?.rawValue,
                 "sort": sort?.rawValue, "partial": partial ? "1" : nil,
@@ -354,17 +393,51 @@ actor APIClient {
     /// host that answers but is not a daemon must fail the same way it fails at
     /// the Connect gate.
     func probe(baseURL: String, token: String) async throws {
+        guard !RehearsalMode.isEnabled else {
+            throw APIError(.badRequest, 400, "Finish the practice inbox before changing accounts.")
+        }
+        var retry = CapabilityProbeRetry()
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await probeOnce(baseURL: baseURL, token: token)
+                return
+            } catch {
+                guard let delay = retry.delay(after: error) else { throw error }
+                try await Task.sleep(for: .seconds(delay))
+            }
+        }
+    }
+
+    private func probeOnce(baseURL: String, token: String) async throws {
         var base = baseURL
         while base.hasSuffix("/") { base.removeLast() }
-        guard let url = URL(string: base + "/client/stats") else {
+        guard let url = URL(string: base + "/client/v2/capabilities") else {
             throw APIError(.network, 0, "bad server url")
         }
         var req = URLRequest(url: url, timeoutInterval: Self.requestTimeout)
         req.httpMethod = Method.GET.rawValue
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, _) = try await perform(req)
-        _ = try decode(StoreStats.self, from: data)
+        do {
+            let (data, _) = try await perform(req, allowPractice: false)
+            guard !RehearsalMode.isEnabled else {
+                throw APIError(.badRequest, 400, "The mailbox changed during the credential check. Try again.")
+            }
+            guard let capabilities = try? decode(TriageCapabilities.self, from: data),
+                capabilities.isSupported else { throw Self.triageUpgradeRequired }
+        } catch let error as APIError where error.status == 404 || error.status == 410 {
+            throw Self.triageUpgradeRequired
+        }
+    }
+
+    private static var triageUpgradeRequired: APIError {
+        APIError(.unknown, 0, "Update squelchd to the agent-triage release before connecting this Passband version.")
+    }
+
+    func requireAgentTriage() async throws {
+        let current = try requireConfig()
+        try await probe(baseURL: current.baseURL, token: current.token)
     }
 
     func getUsage(days: Int? = nil) async throws -> UsageResponse {
@@ -391,21 +464,26 @@ actor APIClient {
     }
 
     func getReceipts(days: Int? = nil) async throws -> [Receipt] {
-        try await get("/client/receipts", query: ["days": days.map(String.init)])
+        if RehearsalMode.isEnabled { return try await get("/client/receipts") }
+        return try await getFeed(destination: "records", limit: 1000).receipts
     }
 
     func getCalendar(hours: Int? = nil) async throws -> [CalendarUpdate] {
-        try await get("/client/calendar", query: ["hours": hours.map(String.init)])
+        if RehearsalMode.isEnabled { return try await get("/client/calendar") }
+        return try await getFeed(destination: "records", limit: 1000).calendar
     }
 
-    func getBanking() async throws -> [BankingRecord] { try await get("/client/banking") }
+    func getBanking() async throws -> [BankingRecord] {
+        if RehearsalMode.isEnabled { return try await get("/client/banking") }
+        return try await getFeed(destination: "records", limit: 1000).banking
+    }
 
     func getMarketing(days: Int? = nil) async throws -> [MarketingOffer] {
-        try await get("/client/marketing", query: ["days": days.map(String.init)])
+        try await getFeed(destination: "reading", limit: 1000).marketing
     }
 
-    func getTriageDebug(_ messageId: Int) async throws -> TriageDebug {
-        try await get("/client/triage-debug/\(messageId)")
+    func getTriageDebug(_ messageId: Int, forAgent: Bool = false) async throws -> JSONValue {
+        try await get(forAgent ? "/client/agent/triage/\(messageId)" : "/client/v2/triage/\(messageId)")
     }
 
     // MARK: - attachments
@@ -648,7 +726,8 @@ actor APIClient {
         body: String, replyToMessageId: Int? = nil, to: String? = nil, cc: String? = nil,
         bcc: String? = nil, groupId: Int? = nil, subject: String? = nil,
         overrideGuard: Bool = false, draftId: Int? = nil, includeTracker: Bool = false,
-        replyAll: Bool = false, forwardOfMessageId: Int? = nil
+        replyAll: Bool = false, forwardOfMessageId: Int? = nil, attachmentIds: [Int] = [],
+        attachmentBytes: Int = 0
     ) async throws -> SendResult {
         try await post(
             "/client/actions/send",
@@ -680,8 +759,54 @@ actor APIClient {
                 include_tracker: includeTracker ? true : nil,
                 // Same omission rule, and the daemon expands the set itself —
                 // this is a flag, never a recipient list.
-                reply_all: replyAll ? true : nil),
-            timeout: forwardOfMessageId == nil ? Self.requestTimeout : Self.forwardTimeout)
+                reply_all: replyAll ? true : nil,
+                // Omitted when empty, like everything else here.
+                attachment_ids: attachmentIds.isEmpty ? nil : attachmentIds),
+            // A send that re-reads and base64s megabytes of files, then
+            // hands them to Gmail, gets a budget sized to what it carries —
+            // the forward's floor plus a second per 50 KB. A 20 MB send on
+            // a slow uplink that timed out CLIENT-side while the daemon
+            // finished would be retried, and the recipient would get it
+            // twice.
+            timeout: forwardOfMessageId == nil && attachmentIds.isEmpty
+                ? Self.requestTimeout
+                : Self.forwardTimeout + TimeInterval(attachmentBytes / 50_000))
+    }
+
+    // MARK: - compose attachments
+
+    /// How long an upload may take. A 25 MB file over a hosted tenant's link
+    /// is minutes, not the 15 s a JSON round-trip gets.
+    static let uploadTimeout: TimeInterval = 300
+
+    /// Stage one file for a send: the bytes go up as the body, the name and
+    /// the client-minted `cid:` token in the query. What comes back is the
+    /// daemon's id for the file, which is what the draft and the send name.
+    func stageAttachment(filename: String, mime: String, contentId: String, data: Data)
+        async throws -> OutboundAttachment
+    {
+        let req = try buildRequest(
+            path: "/client/compose/attachments", method: .POST,
+            query: ["filename": filename, "content_id": contentId],
+            body: data, timeout: Self.uploadTimeout, contentType: mime)
+        let (bytes, _) = try await perform(req)
+        return try decode(OutboundAttachment.self, from: bytes)
+    }
+
+    /// A file taken out of the tray. Unknown and another account's are one 404,
+    /// and the caller ignores both: the row is gone either way.
+    func deleteComposeAttachment(_ id: Int) async throws {
+        try await deleteNoContent("/client/compose/attachments/\(id)")
+    }
+
+    /// A staged file's bytes, for the thumbnail of a file this session did not
+    /// upload (a restored draft). Authenticated like every other read.
+    func composeAttachmentBytes(_ id: Int) async throws -> Data {
+        let req = try buildRequest(
+            path: "/client/compose/attachments/\(id)", method: .GET, query: [:], body: nil,
+            timeout: Self.attachmentTimeout)
+        let (bytes, _) = try await perform(req)
+        return bytes
     }
 
     /// The recipients a reply to `messageId` would carry, derived server-side.
@@ -759,13 +884,13 @@ actor APIClient {
     @discardableResult
     func putDraft(
         replyToMessageId: Int?, to: String, cc: String = "", bcc: String = "", subject: String,
-        body: String
+        body: String, attachmentIds: [Int] = []
     ) async throws -> DraftView {
         try await put(
             "/client/drafts",
             body: DraftBody(
                 reply_to_message_id: replyToMessageId, to: to, cc: cc, bcc: bcc, subject: subject,
-                body: body))
+                body: body, attachment_ids: attachmentIds))
     }
 
     /// Discard one draft. Another account's id and an unknown id are the same 404.
@@ -811,25 +936,24 @@ actor APIClient {
 
     // MARK: - triage feedback
 
-    struct CorrectTriageBody: Codable, Sendable {
-        var message_id: Int
-        var dimension: String
-        var to_value: String
-        var note: String?
+    func getAgentFeed(destination: String = "fye", limit: Int = 50) async throws -> AgentFeed {
+        try await get("/client/agent/feed", query: ["destination": destination, "limit": String(limit)])
     }
 
-    /// Record that triage got one wrong and apply the fix (one server-side
-    /// transaction: the triage row moves AND a training row is stored). The
-    /// response is deliberately NOT decoded — a decode failure would toast an
-    /// error for a write that succeeded.
-    func correctTriage(messageId: Int, dimension: TriageAxis, toValue: String, note: String? = nil)
-        async throws
-    {
-        try await postNoContent(
-            "/client/triage-feedback",
-            body: CorrectTriageBody(
-                message_id: messageId, dimension: dimension.rawValue, to_value: toValue, note: note)
-        )
+    func getAgentRecords(kind: String, days: Int? = nil, hours: Int? = nil,
+        includeDelivered: Bool = false) async throws -> JSONValue {
+        try await get("/client/agent/records", query: ["kind": kind,
+            "days": days.map(String.init), "hours": hours.map(String.init),
+            "include_delivered": includeDelivered ? "true" : "false"])
+    }
+
+    func getAgentTriage(_ messageId: Int) async throws -> AgentTriageInspection {
+        try await get("/client/v2/triage/\(messageId)")
+    }
+
+    func correctTriage(messageId: Int, target: TriageTarget) async throws {
+        try await postNoContent("/client/v2/messages/\(messageId)/corrections",
+            body: TriageCorrectionRequest(target))
     }
 
     func getTriageFeedback(limit: Int? = nil) async throws -> [TriageFeedback] {

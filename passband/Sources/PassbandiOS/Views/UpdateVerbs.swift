@@ -66,8 +66,7 @@ struct UpdateVerbs {
     func fixTriage() {
         store.openTriageFix(
             TriageFixTarget(
-                messageId: update.id, sender: update.sender, subject: update.one_line,
-                tier: .some(update.tier.rawValue)))
+                messageId: update.id, sender: update.sender, subject: update.one_line))
     }
 
     /// `f`. `sender` IS the address on this wire type — see the note on the

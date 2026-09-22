@@ -1,285 +1,108 @@
-//! The notification-emission decision: is THIS triage verdict worth waking the
-//! user for, and what does the durable `events` row look like?
-//!
-//! Pure and store-free — the sync engine owns the call sites, the store owns the
-//! append — so the whole policy is unit-testable without a database. Kind
-//! precedence is `urgent` > `deadline` > `surfaced`.
-//!
-//! SEALED MAIL, AND WHAT THE SEAL ACTUALLY FORBIDS. This module used to say a
-//! sealed message is never notified at all. That was one reading of the seal
-//! invariant and it turned out to be the wrong one: it made the single most
-//! time-critical class of mail in the inbox — the login code that expires in
-//! sixty seconds — the one class that could not ring (docs/NOTIFY.md §2c). The
-//! invariant is narrower and sharper than "stay quiet". A sealed BODY must never
-//! reach a model and must never reach an `events` row (docs/SECURITY.md §4), so
-//! no subject, no snippet, no extracted code, and nothing derived from any of
-//! them. A ping derived from the KIND alone carries none of that: see
-//! [`sealed_event`], whose entire input is a `SealedKind`, a thread id and a
-//! sender address, and which shares no code with the verdict path below
-//! precisely so it cannot read an email's words even by accident. `worthy_kind`
-//! still refuses every sealed row, and that stays true: the ordinary path is
-//! the one that reads a one_line.
-//!
-//! ELIGIBILITY IS NOT DECIDED HERE. Whether a message may EVER notify is
-//! answered once, at ingest, by the one caller that knows which sync path it is
-//! on, and stamped on the row as `triage.notify_eligible_at`; this module reads
-//! that stamp and asks only the two questions left: is the verdict worth a buzz,
-//! and did we get to it in time (docs/NOTIFY.md §11.3).
+//! Shared arrival-notification qualification. Model-assessed auth always qualifies;
+//! other mail uses the configured notification importance threshold. Transport
+//! freshness, origin eligibility, and delivery dedup remain lifecycle concerns.
+//! Legacy context fields stay temporarily for retiring call sites, without policy effect.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
 use crate::config::NotifyConfig;
 use crate::store::{NewEvent, TriagedMessage};
 use crate::triage::DeadlineHit;
-use crate::types::{AccountId, Disposition, EventKind, SealedKind, SenderRule, Sensitivity, Tier};
+use crate::types::{AccountId, Disposition, EventKind, SenderRule, Sensitivity, Tier};
 
-/// Every fact the emission decision needs about one triaged message, gathered at
-/// whichever verdict site produced it (ingest heuristic, Stage-1 apply, Stage-2
-/// apply). Borrowed, so no site pays for a clone to ask the question.
 #[derive(Debug, Clone, Copy)]
 pub struct EventContext<'a> {
     pub account_id: AccountId,
     pub message_id: i64,
     pub thread_id: &'a str,
-    /// `from_addr`, as the client lists render it (matches
-    /// [`crate::types::Update::sender`]).
     pub sender: &'a str,
     pub one_line: &'a str,
-    /// `triage.notify_eligible_at`: WHEN WE FIRST SAW this message, stamped once
-    /// at ingest, or `None` for a message that may never notify (backfill, a
-    /// sent copy, or mail already stale the first time we laid eyes on it).
-    ///
-    /// Deliberately NOT `received_at`, which this replaced. That one is the
-    /// sender's `Date:` header, so it answered "how old does the sender claim
-    /// this is" at a site that meant to ask "how long have we been sitting on
-    /// it" — and the two diverge exactly when a verdict is late, which is the
-    /// case the notification mattered in. See [`NotifyConfig::rescue_window_secs`].
     pub notify_eligible_at: Option<DateTime<Utc>>,
     pub sensitivity: Sensitivity,
-    /// `true` for the user's own outbox.
     pub is_sent: bool,
-    /// `true` when the provider filed this under its spam label.
     pub is_spam: bool,
-    /// The disposition of the sender rule that decided this row, when one fired.
     pub rule: Option<Disposition>,
     pub tier: Tier,
     pub importance: u8,
     pub deadline: Option<&'a DeadlineHit>,
 }
 
-/// How far AHEAD of our clock a message may be dated and still count as fresh:
-/// tolerance for a wrong sender clock only, never a licence to notify.
 const MAX_FUTURE_SKEW_SECS: i64 = 3600;
 
-/// Why an emission was refused, when it was. THREE refusals, kept apart because
-/// they mean different things to whoever asked, and the ledger spends a
-/// different word on each (docs/NOTIFY.md §11.4): `NotWorthy` is the system
-/// working (this mail does not deserve a buzz), `Suppressed` is a standing
-/// instruction from the user rather than a judgement about the mail, and
-/// `Expired` is a notification the user WOULD have wanted and did not get
-/// because we were too slow — the drop that ran at 24.7% with no counter and no
-/// log line to say so (docs/NOTIFY.md §2a). Only the caller can record any of
-/// them, so only the caller may be told, and it must not have to re-derive the
-/// window or re-read the rule list to work out which it got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Never a candidate (sealed, sent, spam, never eligible) or simply below
-    /// the line. Silent, and correctly so.
     NotWorthy,
-    /// A standing Squelch/Filtered rule silenced it. SPLIT OUT FROM
-    /// `NotWorthy` because §11.4's vocabulary insists on the distinction and
-    /// hangs a decision on it: `suppressed` is NOT rescuable and
-    /// `declined_by_model` is, so folding the two would let a rescue path fire
-    /// on the one row class the user explicitly asked never to hear from. It
-    /// would also read as a catastrophic model false-negative rate on the
-    /// §11.11 rollout query, which is the number that decides whether the
-    /// threshold moves.
     Suppressed,
-    /// Eligible AND worthy, but past [`NotifyConfig::rescue_window_secs`] by the
-    /// time this site reached it. Counted, never silent.
     Expired,
 }
 
-/// Whether `received_at` is inside the configured freshness window — THE
-/// FIRST-SIGHT TEST (see [`NotifyConfig::freshness_window_secs`]). Bounded on
-/// BOTH sides because `received_at` is SENDER-CONTROLLED (ingest prefers the
-/// RFC822 `Date:` header): with no ceiling, future-dated mail stays "fresh"
-/// forever and the backlog grind — which walks the queues `received_at DESC` —
-/// storms.
-///
-/// ASKED ONCE, AT INGEST, by [`crate::sync::SyncEngine`], whose answer becomes
-/// `triage.notify_eligible_at`. It is deliberately no longer asked at the
-/// emission sites: there it was measuring the wrong clock (see
-/// [`EventContext::notify_eligible_at`]).
 pub fn is_fresh(received_at: DateTime<Utc>, cfg: &NotifyConfig, now: DateTime<Utc>) -> bool {
     let floor = now - ChronoDuration::seconds(cfg.freshness_window_secs as i64);
     let ceiling = now + ChronoDuration::seconds(MAX_FUTURE_SKEW_SECS);
     received_at >= floor && received_at <= ceiling
 }
 
-/// THE decision. `Ok(kind)` when this verdict earns a notification, otherwise
-/// the [`Refusal`] saying which kind of no it is. Pure — no store, no clock
-/// beyond the injected `now`.
-///
-/// THE WORTHINESS QUESTION IS ANSWERED BEFORE THE WINDOW ONE, and the order is
-/// load-bearing: `Expired` is reserved for mail that would have buzzed, so that
-/// the counter hanging off it measures missed notifications rather than
-/// every below-the-line row that happened to age out of a queue.
 pub fn worthy_kind(
     ctx: &EventContext<'_>,
     cfg: &NotifyConfig,
     now: DateTime<Utc>,
-) -> std::result::Result<EventKind, Refusal> {
-    // SEAL INVARIANT, defense in depth: sealed rows never get here anyway.
-    if ctx.sensitivity != Sensitivity::Normal {
-        return Err(Refusal::NotWorthy);
-    }
-    // The user's own outbox never notifies the user.
-    if ctx.is_sent {
-        return Err(Refusal::NotWorthy);
-    }
-    // Neither does mail the provider already sorted into spam. Waking someone up
-    // for something Gmail filed in the spam folder inverts the entire point of
-    // the folder, and the tier/importance tests below cannot catch it: a spam row
-    // is never triaged, so it carries the neutral seed and would fall through to
-    // `None` today by accident rather than by decision. This makes it a decision.
-    if ctx.is_spam {
-        return Err(Refusal::NotWorthy);
-    }
-    // A squelch/filtered rule is a standing "not from this sender". Its own
-    // refusal, because it is the user's instruction rather than our judgement:
-    // see [`Refusal::Suppressed`].
-    if matches!(
-        ctx.rule,
-        Some(Disposition::Squelch) | Some(Disposition::Filtered)
-    ) {
-        return Err(Refusal::Suppressed);
-    }
-    // NEVER ELIGIBLE: no stamp means backfill, a sent copy, or mail that was
-    // already stale the first time we saw it. Structural, and unrescuable.
-    let Some(eligible_at) = ctx.notify_eligible_at else {
-        return Err(Refusal::NotWorthy);
-    };
+) -> Result<EventKind, Refusal> {
+    notification_kind(ctx, false, cfg, now)
+}
 
-    // Precedence: urgent > deadline > surfaced.
-    let kind = if matches!(ctx.tier, Tier::PastDue | Tier::Deadline) {
-        EventKind::Urgent
-    } else if ctx.deadline.is_some() {
-        EventKind::Deadline
-    } else if ctx.importance >= cfg.min_importance {
-        EventKind::Surfaced
-    } else {
+fn notification_kind(
+    ctx: &EventContext<'_>,
+    is_auth: bool,
+    cfg: &NotifyConfig,
+    now: DateTime<Utc>,
+) -> Result<EventKind, Refusal> {
+    if ctx.is_sent || ctx.is_spam {
         return Err(Refusal::NotWorthy);
-    };
-
-    // THE RESCUE CEILING, measured from the moment WE saw the message. A verdict
-    // that took a slow model call or waited behind a backlog still lands; one
-    // that took hours does not, because past that horizon a buzz is news about
-    // mail the user has already read.
+    }
+    let eligible_at = ctx.notify_eligible_at.ok_or(Refusal::NotWorthy)?;
+    if !is_auth && ctx.importance < cfg.min_importance {
+        return Err(Refusal::NotWorthy);
+    }
     if now - eligible_at > ChronoDuration::seconds(cfg.rescue_window_secs as i64) {
         return Err(Refusal::Expired);
     }
-    Ok(kind)
+    Ok(if is_auth {
+        EventKind::Urgent
+    } else {
+        EventKind::Surfaced
+    })
 }
 
-/// [`worthy_kind`] plus the denormalized snapshot the `events` row stores — what
-/// the sync engine hands to [`crate::store::Store::append_event`]. The
-/// [`Refusal`] is passed straight through, so the emission site can count an
-/// expiry without asking the question twice.
 pub fn event_for(
     ctx: &EventContext<'_>,
     cfg: &NotifyConfig,
     now: DateTime<Utc>,
-) -> std::result::Result<NewEvent, Refusal> {
-    let kind = worthy_kind(ctx, cfg, now)?;
+) -> Result<NewEvent, Refusal> {
+    notification_event(ctx, false, cfg, now)
+}
+
+pub fn notification_event(
+    ctx: &EventContext<'_>,
+    is_auth: bool,
+    cfg: &NotifyConfig,
+    now: DateTime<Utc>,
+) -> Result<NewEvent, Refusal> {
+    let kind = notification_kind(ctx, is_auth, cfg, now)?;
     Ok(NewEvent {
         account_id: ctx.account_id,
         message_id: ctx.message_id,
         thread_id: ctx.thread_id.to_string(),
         kind,
-        tier: ctx.tier,
+        is_auth,
+        tier: Tier::Signal,
         importance: ctx.importance,
         sender: ctx.sender.to_string(),
         one_line: ctx.one_line.to_string(),
-        deadline: ctx.deadline.map(|d| d.due_at.to_rfc3339()),
-        // ALWAYS None here. This is the ordinary path, and it reads the mail's
-        // own one_line and deadline; a sealed message reaches its event through
-        // the kind-derived path (docs/NOTIFY.md §11.6), which shares no code
-        // with this function precisely so it cannot read either.
+        deadline: None,
         sealed_kind: None,
     })
 }
 
-/// THE KIND-DERIVED PING for a sealed message (docs/NOTIFY.md §11.6). A pure
-/// table: `kind` picks the wording and the score, and NOTHING ELSE about the
-/// email is read, because nothing else is passed in.
-///
-/// THE SIGNATURE IS THE ENFORCEMENT. There is no `subject` parameter and no
-/// `body` parameter, so no future edit here can leak one without first changing
-/// a call site that has nothing to give it: the fast lane's sealed candidate
-/// carries no body field at all. `thread_id` and `sender` are metadata of
-/// exactly the class `/client/sealed` already serves to an authenticated
-/// client, and neither is derived from the sealed content.
-///
-/// All five kinds are `urgent`, which is not a shrug at the tiering: all five
-/// want a time-sensitive interruption. The requested ones (a code, a link, a
-/// reset) because the thing expires while the user is looking for it, and
-/// `login_alert` because somebody may be past the password RIGHT NOW. The
-/// "different shape" a sealed notification needs is the wording, not the tier.
-///
-/// The one_line strings are constants and stay constants. A sealed
-/// notification saying "Login code arrived" is useful; one saying "Your code is
-/// 481920" is the seal undone on a lock screen in front of whoever is standing
-/// there.
-pub fn sealed_event(
-    account_id: AccountId,
-    message_id: i64,
-    thread_id: &str,
-    sender: &str,
-    kind: SealedKind,
-) -> NewEvent {
-    let (one_line, importance) = match kind {
-        SealedKind::Otp => ("Login code arrived", 90),
-        SealedKind::MagicLink => ("Sign-in link arrived", 90),
-        SealedKind::Verification => ("Verification email arrived", 80),
-        SealedKind::PasswordReset => ("Password reset requested", 90),
-        SealedKind::LoginAlert => ("New sign-in alert", 85),
-    };
-    NewEvent {
-        account_id,
-        message_id,
-        thread_id: thread_id.to_string(),
-        kind: EventKind::Urgent,
-        tier: Tier::Signal,
-        importance,
-        sender: sender.to_string(),
-        one_line: one_line.to_string(),
-        // A sealed ping is never a dated obligation, and a deadline column is
-        // one more place email-derived text could land.
-        deadline: None,
-        // THE ROUTING HINT, and the reason this column exists: a client reads it
-        // to send the tap to the sealed reveal flow instead of a thread fetch
-        // the seal makes the daemon 404, and to pick an icon. It is NOT a gate
-        // (docs/NOTIFY.md §11.6): no query reads it to decide what to serve.
-        sealed_kind: Some(kind),
-    }
-}
-
-/// Gather the [`EventContext`] for an INGEST-path verdict, resolving
-/// `matched_rule`'s id against `rules` (the batch's rule list).
-///
-/// CALLER OBLIGATION: only a CONFIDENT seed may emit — a guess is not grounds
-/// for waking anyone. Non-confident rows wait for Stage-1/Stage-2 to refine them
-/// and emit from those sites instead, carrying the SAME eligibility stamp — one
-/// answer to "may this message ever notify", written here and read there.
-///
-/// UNCALLED SINCE THE FAST LANE LANDED. The ingest-path emission this gathered a
-/// context for lives in [`crate::sync::notify_lane`] now (docs/NOTIFY.md §11.5),
-/// which builds its own [`EventContext`] because it has to apply a LIVE rule
-/// lookup and a model's score rather than the row's own — see the provisional
-/// note on `notify_eligible_at` below for the trap that move had to carry with
-/// it. Kept because it is the one worked example of assembling this struct from
-/// a `TriagedMessage`; delete it if a second wave goes by without a caller.
 pub fn ingest_context<'a>(
     triaged: &'a TriagedMessage,
     message_id: i64,
@@ -295,24 +118,6 @@ pub fn ingest_context<'a>(
         thread_id: &triaged.message.thread_id,
         sender: &triaged.message.from_addr,
         one_line: &triaged.one_line,
-        // PROVISIONAL. Off the row the engine is about to commit, which is where
-        // the stamp was just computed — the one site that knows which sync path
-        // this is — but the computed value is not always the value the STORE
-        // holds, and the store's is the one that decides.
-        //
-        // They diverge on exactly one real path: `catch_up()` re-ingests a row
-        // that already exists, `ingest_message` writes `notify_eligible_at` on
-        // FIRST INSERT ONLY and preserves the stored one on conflict, so a
-        // backfilled row (stamp NULL, silent forever) whose `Date:` happens to be
-        // inside the freshness window at catch-up time computes a `Some` here
-        // that the database will never accept. Emitting off it would notify for
-        // month-old mail.
-        //
-        // So the engine's ingest emission site OVERWRITES this field with a
-        // `triage_seed_verdict` re-read of the committed row before calling
-        // `emit_event` (see `SyncEngine::ingest_one`, and `emit_seed_event` doing
-        // the same thing for the same reason). A future caller that emits from
-        // this context WITHOUT that re-read reintroduces the bug.
         notify_eligible_at: triaged.notify_eligible_at,
         sensitivity: triaged.sensitivity,
         is_sent: triaged.message.is_sent,
@@ -324,54 +129,15 @@ pub fn ingest_context<'a>(
     }
 }
 
-/// Gather the [`EventContext`] for a Stage-1 row whose model call produced NO
-/// verdict, from the heuristic seed the row still carries. `None` means this row
-/// must not notify from its seed.
-///
-/// THE GATE IS THE SEED'S OWN CONFIDENCE, read back rather than guessed at:
-/// ingest stores `needs_stage2 = !confident`, so a row still bound for Stage-2
-/// has another verdict coming and must wait for it. A CONFIDENT seed on a row
-/// that failed Stage-1 permanently is the final word — nothing else will look at
-/// it, and `UNIQUE(message_id)` means a notification skipped now is skipped
-/// forever — so it notifies, exactly as the seed does on a daemon with no API
-/// key at all. That equivalence is the point: "no model to wait for" covers a
-/// model that refused as surely as a model that was never configured.
 pub fn seed_context<'a>(
-    row: &'a crate::store::Stage1Queued,
-    seed: &'a crate::store::SeedVerdict,
-    deadline: Option<&'a DeadlineHit>,
-    rule: Option<Disposition>,
+    _row: &'a crate::store::Stage1Queued,
+    _seed: &'a crate::store::SeedVerdict,
+    _deadline: Option<&'a DeadlineHit>,
+    _rule: Option<Disposition>,
 ) -> Option<EventContext<'a>> {
-    if seed.needs_stage2 {
-        return None;
-    }
-    Some(EventContext {
-        account_id: row.account_id,
-        message_id: row.message_id,
-        thread_id: &row.thread_id,
-        sender: &row.from_addr,
-        one_line: &seed.one_line,
-        // From the SEED, not from `row`: the seed is read back at emission
-        // time while the queued row was read at the top of the pass, and a
-        // stamp is written once and never rewritten, so the two agree — but
-        // the fresher read is the honest one to quote.
-        notify_eligible_at: seed.notify_eligible_at,
-        sensitivity: row.sensitivity,
-        // The Stage-1 queue selects `m.is_sent = 0` and `m.is_spam = 0`.
-        is_sent: false,
-        is_spam: false,
-        rule,
-        tier: seed.tier,
-        importance: seed.importance,
-        deadline,
-    })
+    None
 }
 
-/// The sender's rule as the list stands NOW, for the REFINE sites (Stage-1 /
-/// Stage-2 apply). They cannot read it off the triage row: a rule the user adds
-/// AFTER ingest — the reactive squelch, the common case — leaves no mark on rows
-/// already queued, so without this lookup a mid-grind pass would keep pushing
-/// that sender's still-fresh mail.
 pub fn current_rule(from_addr: &str, rules: &[SenderRule]) -> Option<Disposition> {
     crate::triage::rules::match_sender_rule(from_addr, rules).map(|r| r.disposition)
 }
@@ -379,28 +145,14 @@ pub fn current_rule(from_addr: &str, rules: &[SenderRule]) -> Option<Disposition
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::triage::deadline::DeadlineHit;
 
-    fn hit(now: DateTime<Utc>) -> DeadlineHit {
-        DeadlineHit {
-            kind: "bill".to_string(),
-            amount: Some(42.0),
-            currency: Some("USD".to_string()),
-            due_at: now + ChronoDuration::days(3),
-            past_due: false,
-            source: "subject".to_string(),
-        }
-    }
-
-    /// A worthy baseline: eligible as of NOW, normal, unruled, signal-tier,
-    /// above threshold.
-    fn ctx<'a>(now: DateTime<Utc>) -> EventContext<'a> {
+    fn context(now: DateTime<Utc>) -> EventContext<'static> {
         EventContext {
             account_id: 1,
             message_id: 7,
             thread_id: "t1",
-            sender: "a@b.com",
-            one_line: "hi",
+            sender: "a@example.com",
+            one_line: "A new message",
             notify_eligible_at: Some(now),
             sensitivity: Sensitivity::Normal,
             is_sent: false,
@@ -412,164 +164,61 @@ mod tests {
         }
     }
 
-    /// The emission table: every axis of the decision, worthy and unworthy, and
-    /// which KIND of unworthy — the two refusals are what the caller counts on.
     #[test]
-    fn worthy_kind_table() {
+    fn auth_bypasses_score_but_not_arrival_eligibility() {
         let now = Utc::now();
         let cfg = NotifyConfig::default();
-        let d = hit(now);
-
-        // ---- worthy ----------------------------------------------------
-        // Score at/above the threshold -> surfaced.
-        assert_eq!(worthy_kind(&ctx(now), &cfg, now), Ok(EventKind::Surfaced));
-        let mut c = ctx(now);
-        c.importance = cfg.min_importance;
+        let mut ctx = context(now);
+        ctx.importance = 0;
+        ctx.rule = Some(Disposition::Squelch);
+        ctx.sensitivity = Sensitivity::Sealed;
+        let event = notification_event(&ctx, true, &cfg, now).unwrap();
+        assert_eq!(event.kind, EventKind::Urgent);
+        assert_eq!(event.message_id, ctx.message_id);
+        assert_eq!(event.sealed_kind, None);
+        ctx.notify_eligible_at = None;
         assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Ok(EventKind::Surfaced),
-            "boundary is inclusive"
+            notification_kind(&ctx, true, &cfg, now),
+            Err(Refusal::NotWorthy)
         );
-
-        // Urgent tiers bypass the threshold entirely.
-        for tier in [Tier::PastDue, Tier::Deadline] {
-            let mut c = ctx(now);
-            c.tier = tier;
-            c.importance = 0;
-            assert_eq!(
-                worthy_kind(&c, &cfg, now),
-                Ok(EventKind::Urgent),
-                "{tier:?}"
-            );
-        }
-
-        // A detected deadline on a non-urgent tier bypasses the threshold too.
-        let mut c = ctx(now);
-        c.tier = Tier::Noise;
-        c.importance = 0;
-        c.deadline = Some(&d);
-        assert_eq!(worthy_kind(&c, &cfg, now), Ok(EventKind::Deadline));
-
-        // PRECEDENCE: urgent beats deadline beats surfaced.
-        let mut c = ctx(now);
-        c.tier = Tier::Deadline;
-        c.deadline = Some(&d);
-        c.importance = 100;
-        assert_eq!(worthy_kind(&c, &cfg, now), Ok(EventKind::Urgent));
-
-        // ---- unworthy --------------------------------------------------
-        // Below the threshold with nothing else going for it.
-        let mut c = ctx(now);
-        c.tier = Tier::Noise;
-        c.importance = cfg.min_importance - 1;
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::NotWorthy));
-
-        // Sent mail.
-        let mut c = ctx(now);
-        c.is_sent = true;
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::NotWorthy));
-
-        // Squelched / filtered senders are silent even when urgent — and they
-        // say WHICH silence it is, because the ledger word for a standing rule
-        // is `suppressed` and it is the one that is never rescued.
-        for disp in [Disposition::Squelch, Disposition::Filtered] {
-            let mut c = ctx(now);
-            c.rule = Some(disp);
-            c.tier = Tier::PastDue;
-            c.deadline = Some(&d);
-            assert_eq!(
-                worthy_kind(&c, &cfg, now),
-                Err(Refusal::Suppressed),
-                "{disp:?}"
-            );
-        }
-        // A SURFACE rule is the opposite instruction and must not block.
-        let mut c = ctx(now);
-        c.rule = Some(Disposition::Surface);
-        assert_eq!(worthy_kind(&c, &cfg, now), Ok(EventKind::Surfaced));
-
-        // NEVER ELIGIBLE: no stamp, with a maximally alarming verdict. Backfill,
-        // a sent copy and mail already stale at first sight all land here, and
-        // none of them is a missed notification — so it is NotWorthy, not
-        // Expired, and nothing counts it.
-        let mut c = ctx(now);
-        c.notify_eligible_at = None;
-        c.tier = Tier::PastDue;
-        c.importance = 100;
-        c.deadline = Some(&d);
+        ctx.notify_eligible_at = Some(now - ChronoDuration::hours(2));
         assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Err(Refusal::NotWorthy),
-            "an unstamped row can never notify"
+            notification_kind(&ctx, true, &cfg, now),
+            Err(Refusal::Expired)
         );
-
-        // THE RESCUE CEILING, both sides of it. Inside the hour a late verdict
-        // still buzzes: this is the 24.7% the old `Date:`-based guard ate.
-        let mut c = ctx(now);
-        c.notify_eligible_at = Some(now - ChronoDuration::seconds(3599));
-        assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Ok(EventKind::Surfaced),
-            "an hour-old rescue still lands"
-        );
-        let mut c = ctx(now);
-        c.notify_eligible_at = Some(now - ChronoDuration::seconds(3601));
-        assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Err(Refusal::Expired),
-            "past the ceiling the drop is COUNTED, not silent"
-        );
-        // Exactly at the ceiling is still inside it.
-        let mut c = ctx(now);
-        c.notify_eligible_at = Some(now - ChronoDuration::seconds(cfg.rescue_window_secs as i64));
-        assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Ok(EventKind::Surfaced),
-            "the edge is inclusive"
-        );
-
-        // AND EXPIRY IS THE LAST QUESTION ASKED. A row that was never going to
-        // buzz is NotWorthy however long it sat, or the counter hanging off
-        // `Expired` would measure queue depth instead of missed notifications.
-        let mut c = ctx(now);
-        c.notify_eligible_at = Some(now - ChronoDuration::hours(9));
-        c.tier = Tier::Noise;
-        c.importance = cfg.min_importance - 1;
-        assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Err(Refusal::NotWorthy),
-            "below the line is not a missed notification"
-        );
-        // Same for a structural gate: a squelched sender's aged-out row is not
-        // a rescue anybody wanted, and it stays `Suppressed` rather than
-        // decaying into `Expired` just because it sat in a queue.
-        let mut c = ctx(now);
-        c.notify_eligible_at = Some(now - ChronoDuration::hours(9));
-        c.rule = Some(Disposition::Squelch);
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::Suppressed));
     }
 
-    /// THE FIRST-SIGHT TEST, now asked exactly once (at ingest) rather than at
-    /// every emission site. Both bounds are load-bearing and neither is
-    /// reachable through `worthy_kind` any more, so they are asserted here:
-    /// `received_at` is the SENDER'S `Date:` header, so an old one must not
-    /// stamp and a future-dated one must not buy permanent freshness.
     #[test]
-    fn is_fresh_bounds_a_sender_controlled_date_on_both_sides() {
+    fn nonauth_uses_only_notification_score() {
         let now = Utc::now();
         let cfg = NotifyConfig::default();
-        let win = cfg.freshness_window_secs as i64;
+        let mut ctx = context(now);
+        ctx.importance = cfg.min_importance - 1;
+        ctx.tier = Tier::PastDue;
+        assert_eq!(worthy_kind(&ctx, &cfg, now), Err(Refusal::NotWorthy));
+        ctx.importance = cfg.min_importance;
+        ctx.tier = Tier::Noise;
+        ctx.rule = Some(Disposition::Filtered);
+        ctx.sensitivity = Sensitivity::Sealed;
+        assert_eq!(worthy_kind(&ctx, &cfg, now), Ok(EventKind::Surfaced));
+        ctx.is_spam = true;
+        assert_eq!(worthy_kind(&ctx, &cfg, now), Err(Refusal::NotWorthy));
+        ctx.is_spam = false;
+        ctx.is_sent = true;
+        assert_eq!(worthy_kind(&ctx, &cfg, now), Err(Refusal::NotWorthy));
+    }
 
-        assert!(is_fresh(now, &cfg, now));
-        assert!(
-            is_fresh(now - ChronoDuration::seconds(win), &cfg, now),
-            "the floor is inclusive"
-        );
-        assert!(!is_fresh(now - ChronoDuration::seconds(win + 1), &cfg, now));
-
-        // A modestly wrong sender clock is tolerated; a lying one is not.
+    #[test]
+    fn eligibility_uses_original_arrival_and_has_inclusive_boundaries() {
+        let now = Utc::now();
+        let cfg = NotifyConfig::default();
         assert!(is_fresh(
-            now + ChronoDuration::seconds(MAX_FUTURE_SKEW_SECS),
+            now - ChronoDuration::seconds(cfg.freshness_window_secs as i64),
+            &cfg,
+            now
+        ));
+        assert!(!is_fresh(
+            now - ChronoDuration::seconds(cfg.freshness_window_secs as i64 + 1),
             &cfg,
             now
         ));
@@ -578,305 +227,12 @@ mod tests {
             &cfg,
             now
         ));
-        assert!(
-            !is_fresh(now + ChronoDuration::days(365 * 4), &cfg, now),
-            "mail dated 2030 is not fresh, it is forged"
-        );
-    }
-
-    /// The Stage-1 fallback notifies from the seed, but only when the seed is
-    /// the LAST word. Ingest stopped emitting on the promise that a model verdict
-    /// was coming; a refusal or a permanent failure is that promise breaking, and
-    /// one event per message ever means a notification skipped here is skipped
-    /// for good.
-    #[test]
-    fn a_confident_seed_notifies_when_the_model_never_answered() {
-        let now = Utc::now();
-        let cfg = NotifyConfig::default();
-        let row = crate::store::Stage1Queued {
-            message_id: 7,
-            account_id: 1,
-            thread_id: "t1".into(),
-            from_addr: "alerts@monitoring.example".into(),
-            subject: "checkout api is down".into(),
-            body: String::new(),
-            received_at: now,
-            is_known_contact: false,
-            sender_corrected: false,
-            sensitivity: Sensitivity::Normal,
-            retriage_at: None,
-            notify_eligible_at: Some(now),
-        };
-        let confident = crate::store::SeedVerdict {
-            tier: Tier::Signal,
-            importance: 75,
-            one_line: "incident opened".into(),
-            needs_stage2: false,
-            deadline: None,
-            notify_eligible_at: Some(now),
-        };
-
-        let ctx = seed_context(&row, &confident, None, None).expect("a confident seed is final");
-        assert_eq!(ctx.one_line, "incident opened", "the seed's own words");
+        let mut ctx = context(now);
+        ctx.notify_eligible_at = Some(now - ChronoDuration::seconds(cfg.rescue_window_secs as i64));
+        assert!(event_for(&ctx, &cfg, now).is_ok());
         assert_eq!(
-            worthy_kind(&ctx, &cfg, now),
-            Ok(EventKind::Surfaced),
-            "and it notifies"
+            worthy_kind(&ctx, &cfg, now + ChronoDuration::seconds(1)),
+            Err(Refusal::Expired)
         );
-
-        // A row still bound for Stage-2 has another verdict coming: that pass
-        // owns the notification, and emitting twice is emitting the weaker one
-        // first.
-        let unsure = crate::store::SeedVerdict {
-            needs_stage2: true,
-            ..confident.clone()
-        };
-        assert!(
-            seed_context(&row, &unsure, None, None).is_none(),
-            "a seed with an escalation still pending must stay quiet"
-        );
-
-        // A rule the owner added since is still honored here.
-        let ctx = seed_context(&row, &confident, None, Some(Disposition::Squelch)).unwrap();
-        assert_eq!(
-            worthy_kind(&ctx, &cfg, now),
-            Err(Refusal::Suppressed),
-            "squelched, so silent"
-        );
-
-        // AND THE STAMP COMES OFF THE SEED, so a row the Stage-1 pass reached
-        // hours late is refused as `Expired` from this site too — the fallback
-        // path is exactly where a slow model call lands.
-        let stale = crate::store::SeedVerdict {
-            notify_eligible_at: Some(now - ChronoDuration::hours(2)),
-            ..confident.clone()
-        };
-        let ctx = seed_context(&row, &stale, None, None).unwrap();
-        assert_eq!(worthy_kind(&ctx, &cfg, now), Err(Refusal::Expired));
-    }
-
-    /// The refine sites read the rule list LIVE, so a rule added after a message
-    /// was queued still silences it.
-    #[test]
-    fn current_rule_matches_the_live_list_by_glob() {
-        let rules = vec![
-            SenderRule {
-                id: 1,
-                account_id: 1,
-                match_pattern: "*@monitoring.example".to_string(),
-                want_text: "not urgent".to_string(),
-                disposition: Disposition::Squelch,
-                updated_at: Utc::now(),
-            },
-            SenderRule {
-                id: 2,
-                account_id: 1,
-                match_pattern: "boss@corp.example".to_string(),
-                want_text: "always".to_string(),
-                disposition: Disposition::Surface,
-                updated_at: Utc::now(),
-            },
-        ];
-        assert_eq!(
-            current_rule("alerts@monitoring.example", &rules),
-            Some(Disposition::Squelch)
-        );
-        assert_eq!(
-            current_rule("boss@corp.example", &rules),
-            Some(Disposition::Surface)
-        );
-        assert_eq!(current_rule("stranger@nowhere.example", &rules), None);
-        // And the squelch it returns is what silences the verdict.
-        let now = Utc::now();
-        let cfg = NotifyConfig::default();
-        let mut c = ctx(now);
-        c.rule = current_rule("alerts@monitoring.example", &rules);
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::Suppressed));
-    }
-
-    /// A FILTERED rule suppresses on its DISPOSITION alone, never on
-    /// `want_text` — which the store maps to `None` when empty, so an emit site
-    /// inferring the rule from `rule_want_text` presence would let a row with an
-    /// empty want_text push.
-    #[test]
-    fn filtered_rule_with_empty_want_text_still_silences() {
-        let rules = vec![SenderRule {
-            id: 1,
-            account_id: 1,
-            match_pattern: "*@vendor.example".to_string(),
-            want_text: "   ".to_string(),
-            disposition: Disposition::Filtered,
-            updated_at: Utc::now(),
-        }];
-        assert_eq!(
-            current_rule("billing@vendor.example", &rules),
-            Some(Disposition::Filtered),
-            "the match is by pattern + disposition, never by want_text"
-        );
-        let now = Utc::now();
-        let cfg = NotifyConfig::default();
-        let mut c = ctx(now);
-        c.rule = current_rule("billing@vendor.example", &rules);
-        c.tier = Tier::PastDue;
-        c.importance = 100;
-        assert_eq!(
-            worthy_kind(&c, &cfg, now),
-            Err(Refusal::Suppressed),
-            "filtered stays silent, want_text or not"
-        );
-    }
-
-    /// SEAL INVARIANT, the half this decision owns: a sealed message can never
-    /// come out of THE ORDINARY PATH, whatever its tier, deadline, or score. No
-    /// path constructs those values for sealed mail; this proves the decision
-    /// would refuse them even if one did.
-    ///
-    /// A sealed message CAN reach an `events` row, through [`sealed_event`] and
-    /// only through it (docs/NOTIFY.md §11.6). The two are unrelated code, which
-    /// is the point: this one reads a one_line off the verdict, and that is
-    /// exactly what a sealed row must not have.
-    #[test]
-    fn sealed_can_never_produce_an_event() {
-        let now = Utc::now();
-        let cfg = NotifyConfig::default();
-        let d = hit(now);
-        for (tier, importance, deadline) in [
-            (Tier::Noise, 0u8, None),
-            (Tier::PastDue, 100, Some(&d)),
-            (Tier::Deadline, 100, Some(&d)),
-            (Tier::Signal, 100, None),
-        ] {
-            let mut c = ctx(now);
-            c.sensitivity = Sensitivity::Sealed;
-            c.tier = tier;
-            c.importance = importance;
-            c.deadline = deadline;
-            assert_eq!(
-                worthy_kind(&c, &cfg, now),
-                Err(Refusal::NotWorthy),
-                "sealed {tier:?}/{importance}"
-            );
-            assert!(event_for(&c, &cfg, now).is_err());
-        }
-    }
-
-    /// The snapshot really is denormalized: the row carries everything a client
-    /// needs to render without touching the message.
-    #[test]
-    fn event_for_snapshots_the_verdict() {
-        let now = Utc::now();
-        let cfg = NotifyConfig::default();
-        let d = hit(now);
-        let mut c = ctx(now);
-        c.tier = Tier::Deadline;
-        c.deadline = Some(&d);
-        let ev = event_for(&c, &cfg, now).expect("worthy");
-        assert_eq!(ev.account_id, 1);
-        assert_eq!(ev.message_id, 7);
-        assert_eq!(ev.thread_id, "t1");
-        assert_eq!(ev.kind, EventKind::Urgent);
-        assert_eq!(ev.tier, Tier::Deadline);
-        assert_eq!(ev.importance, 70);
-        assert_eq!(ev.sender, "a@b.com");
-        assert_eq!(ev.one_line, "hi");
-        assert_eq!(ev.deadline.as_deref(), Some(d.due_at.to_rfc3339().as_str()));
-    }
-
-    /// AND THE DOC HEADER SAYS SO. This module's header used to state, as an
-    /// invariant, that a sealed message is never notified — which is now false,
-    /// and a false invariant in a header is worse than none: the next person to
-    /// touch [`sealed_event`] would read it as a rule they were breaking.
-    ///
-    /// Asserting on the source text is unusual and deliberate. The seal is the
-    /// one place in this codebase where the prose IS the specification, and a
-    /// header can go stale for years with every test still green. The needle is
-    /// assembled at runtime so this test does not match itself.
-    #[test]
-    fn the_module_header_no_longer_claims_sealed_mail_stays_silent() {
-        let src = include_str!("events.rs");
-        let lines: Vec<&str> = src.lines().take_while(|l| l.starts_with("//!")).collect();
-        assert!(lines.len() > 5, "the header should still be there");
-        // Unwrapped into one line: the sentences below are wrapped in the
-        // source, and a needle that straddles a line break would never match.
-        let header: String = lines
-            .iter()
-            .flat_map(|l| l.trim_start_matches("//!").split_whitespace())
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let stale = ["sealed mail is never", " notified"].concat();
-        assert!(
-            !header.contains(&stale),
-            "the header still states the old, now-false invariant"
-        );
-        // And it states the real one, in both halves.
-        assert!(header.contains("A sealed BODY must never reach a model"));
-        assert!(header.contains("docs/SECURITY.md §4"));
-        assert!(header.contains("sealed_event"));
-    }
-
-    /// THE SEALED PING CARRIES NOTHING OF THE EMAIL. Every kind's `one_line` is
-    /// the fixed phrase, contains no digit, and contains none of the input — and
-    /// the inputs here are deliberately shaped like the thing that must never
-    /// leak, a six-digit code, so a `format!` that spliced one in would fail
-    /// this rather than merely look wrong in review.
-    #[test]
-    fn a_sealed_event_says_only_what_kind_of_auth_mail_arrived() {
-        // Shaped like leakage: an id and an address that read as a code.
-        let thread_id = "481920";
-        let sender = "code-481920@auth.example";
-
-        for (kind, phrase, importance) in [
-            (SealedKind::Otp, "Login code arrived", 90u8),
-            (SealedKind::MagicLink, "Sign-in link arrived", 90),
-            (SealedKind::Verification, "Verification email arrived", 80),
-            (SealedKind::PasswordReset, "Password reset requested", 90),
-            (SealedKind::LoginAlert, "New sign-in alert", 85),
-        ] {
-            let ev = sealed_event(1, 7, thread_id, sender, kind);
-            assert_eq!(ev.one_line, phrase, "{kind:?}");
-            assert_eq!(ev.importance, importance, "{kind:?}");
-            // All five interrupt: a code expires, and a login alert may be
-            // somebody in the account right now.
-            assert_eq!(ev.kind, EventKind::Urgent, "{kind:?}");
-            assert_eq!(ev.tier, Tier::Signal, "{kind:?}");
-            assert_eq!(ev.deadline, None, "{kind:?}");
-            // The routing hint the client reads to send the tap at the auth
-            // flow instead of a thread fetch the seal 404s.
-            assert_eq!(ev.sealed_kind, Some(kind));
-
-            // NOTHING FROM THE MESSAGE. No digit at all, and not a byte of
-            // either input, however code-shaped they were.
-            assert!(
-                !ev.one_line.chars().any(|c| c.is_ascii_digit()),
-                "a digit in a sealed one_line is a code on a lock screen: {}",
-                ev.one_line
-            );
-            assert!(!ev.one_line.contains("481920"), "{kind:?}");
-            assert!(!ev.one_line.contains("auth.example"), "{kind:?}");
-
-            // The two metadata fields pass through verbatim, and they are the
-            // only two: `/client/sealed` already serves this class to an
-            // authenticated client.
-            assert_eq!(ev.thread_id, thread_id);
-            assert_eq!(ev.sender, sender);
-            assert_eq!(ev.account_id, 1);
-            assert_eq!(ev.message_id, 7);
-        }
-    }
-
-    /// A raised `min_importance` moves the line; env/config drives it.
-    #[test]
-    fn min_importance_is_config_driven() {
-        let now = Utc::now();
-        let cfg = NotifyConfig {
-            min_importance: 90,
-            ..NotifyConfig::default()
-        };
-        let c = ctx(now); // importance 70
-        assert_eq!(worthy_kind(&c, &cfg, now), Err(Refusal::NotWorthy));
-        let mut c = ctx(now);
-        c.importance = 90;
-        assert_eq!(worthy_kind(&c, &cfg, now), Ok(EventKind::Surfaced));
     }
 }
