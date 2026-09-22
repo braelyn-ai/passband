@@ -679,7 +679,8 @@ final class AppStore {
     var threadQueue: [AttentionUpdate] = []
     var readingMail = false
     var readingStack: Bool {
-        readingMail && Set(threadQueue.map(\.thread_id)).count > 1
+        guard readingMail, let first = threadQueue.first else { return false }
+        return threadQueue.dropFirst().contains { $0.thread_id != first.thread_id }
     }
 
     /// Shared by the preview and advance action so resolved siblings never peek.

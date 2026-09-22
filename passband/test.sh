@@ -23,6 +23,12 @@ run_suite() {
   "$BUILD/$name"
 }
 
+# The hero, peek and fire-and-forget preload must share one request.
+run_suite thread-prefetch \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Model/ThreadPrefetch.swift \
+  Tests/ThreadPrefetchTests.swift
+
 # The real poller against a cancellation-oblivious transport: mailbox switches
 # must detach old requests before the next mailbox starts warming.
 run_suite sitrep-poller \
