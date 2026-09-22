@@ -287,6 +287,14 @@ struct ThreadViewer: View {
             guard styles.style(threadId) == nil else { return }
             style = resolvedStyle(messages)
         }
+        // READING MAIL IS ALWAYS FULL WIDTH, and the zone that says a thread is
+        // Reading can arrive AFTER the thread did: a newsletter opened from
+        // search or a notification before the sitrep has loaded resolves its
+        // style with no zone to consult, and `adopt` never asks twice. This is
+        // the second ask.
+        .onChange(of: isReadingMail) { _, reading in
+            if reading { style = .classic }
+        }
         // NEW MAIL IN THIS VERY THREAD, from the poll that heard about it.
         // `onChange` rather than `.task(id:)`: a task keyed on the token would
         // also fire on mount, refetching the thread `load()` is already
@@ -334,12 +342,7 @@ struct ThreadViewer: View {
         #if os(macOS)
             VStack(spacing: 0) {
                 header
-                if store.readingStack {
-                    readingDeck
-                } else {
-                    content
-                    composer
-                }
+                deck
             }
         #else
             VStack(spacing: 0) {
@@ -352,9 +355,20 @@ struct ThreadViewer: View {
 
     #if os(macOS)
         /// The header belongs to the window; only the mail participates in the deck.
-        private var readingDeck: some View {
+        ///
+        /// ONE TREE WHETHER OR NOT THERE IS A STACK BEHIND IT. `readingStack`
+        /// can flip while the same thread stays open — a reopen from a push or
+        /// a FYE row hands the reader a one-row queue — and an `if` here would
+        /// give the two shapes separate identities, so the flip would tear down
+        /// every web frame's state and the scroll position under the reader's
+        /// eyes. The stack is expressed in VALUES (a narrower card, the flight
+        /// on the card instead of the window, a peek or none) on a tree whose
+        /// stateful children never move.
+        private var deck: some View {
             GeometryReader { reader in
-                let cardWidth = max(0, reader.size.width - 56)
+                let stacked = store.readingStack
+                let flight: AppStore.ThreadFlight = stacked ? store.threadFlight : .settled
+                let cardWidth = stacked ? max(0, reader.size.width - Self.stackPeekWidth) : reader.size.width
                 // Constrain the scroll viewport to the window. The full-height
                 // preview is decoration and must never size the scroll container.
                 VStack(spacing: 0) {
@@ -362,19 +376,24 @@ struct ThreadViewer: View {
                     composer
                 }
                 .frame(width: cardWidth, height: reader.size.height)
-                .background { ReaderBackdrop() }
+                // The card's own opaque floor, so it covers the peek as it
+                // slides over it. Only the stack needs one: the reader already
+                // has a backdrop under everything.
+                .background { if stacked { ReaderBackdrop() } }
                 .clipped()
-                .offset(store.threadFlight.offset(in: CGSize(
-                    width: cardWidth + 12, height: reader.size.height)))
-                .scaleEffect(store.threadFlight.scale)
-                .opacity(store.threadFlight.opacity)
+                // With a stack the card flies and the window stays; without one
+                // RootView flies the whole reader, and this must not fly it twice.
+                .offset(flight.offset(in: CGSize(
+                    width: cardWidth + Self.stackGap, height: reader.size.height)))
+                .scaleEffect(flight.scale)
+                .opacity(flight.opacity)
                 .background(alignment: .topLeading) {
-                    if let next = store.nextQueuedThread {
+                    if stacked, let next = store.nextQueuedThread {
                         ReadingStackPeek(row: next)
                             .id(next.thread_id)
                             .frame(width: cardWidth, height: reader.size.height, alignment: .topLeading)
                             .clipped()
-                            .offset(x: cardWidth + 12)
+                            .offset(x: cardWidth + Self.stackGap)
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
                     }
@@ -383,6 +402,11 @@ struct ThreadViewer: View {
                 .clipped()
             }
         }
+
+        /// How much of the next card shows past the current one's trailing edge,
+        /// and the air between the two.
+        private static let stackPeekWidth: CGFloat = 56
+        private static let stackGap: CGFloat = 12
     #endif
 
     /// MOUNTED UNCONDITIONALLY, and gated on `store.inlineReply` INSIDE. Reading
@@ -688,10 +712,7 @@ struct ThreadViewer: View {
                             // and then thrown away by the pass that named it.
                             FrameHeights.shared.using(width: width)
                         }
-                        .padding(.horizontal, Self.columnPadding)
-                        .padding(.vertical, 4)
-                        .frame(maxWidth: Self.columnWidth)
-                        .frame(maxWidth: .infinity)
+                        .readerColumn()
                         // INSIDE the scroll content deliberately: an overlay on the
                         // ScrollView itself would sit above it and eat the wheel
                         // wherever it covers, and the pointer parks in the gutter.
@@ -1095,9 +1116,9 @@ struct ThreadViewer: View {
     /// The mail's own inset. A phone is narrower than the column will ever be,
     /// so the padding IS the measure there and it matches the header above it.
     #if os(macOS)
-        private static let columnPadding: CGFloat = 22
+        fileprivate static let columnPadding: CGFloat = 22
     #else
-        private static let columnPadding: CGFloat = 18
+        fileprivate static let columnPadding: CGFloat = 18
     #endif
 
     /// CLICK BESIDE THE MAIL TO LEAVE IT — the same exit as Esc.
@@ -1218,7 +1239,7 @@ struct ThreadViewer: View {
     // MARK: - keymap
 
     private var bindings: [KeyBinding] {
-        [
+        var bindings: [KeyBinding] = [
             // allowInInput matters: a search input underneath may still hold
             // focus (if our focus-steal loses the race).
             // With a side panel open beside the reader, Esc sheds the PANEL and
@@ -1330,10 +1351,6 @@ struct ThreadViewer: View {
                 openReplyAll()
                 return true
             },
-            // `b` = the shape of the thread, cards or bubbles. Per-thread, and
-            // the last word: whatever Settings or the guess said, this is what
-            // this thread is from now on.
-            KeyBinding("b", "chat / email style") { toggleStyle() },
             // `t` = tune sender rule, same as on a list row: one verb, one key
             // everywhere. The target differs (the thread's sender rather than the
             // selected row's) but that is the only sender in view here. This
@@ -1345,6 +1362,14 @@ struct ThreadViewer: View {
             // input-suppressed and types a letter instead.
             KeyBinding("c", "new message") { store.openComposeNew() },
         ]
+        // `b` = the shape of the thread, cards or bubbles. Per-thread, and
+        // the last word: whatever Settings or the guess said, this is what
+        // this thread is from now on. Reading mail has one shape, so `b` is
+        // not on offer there rather than listed in the help and ignored.
+        if !isReadingMail {
+            bindings.append(KeyBinding("b", "chat / email style") { toggleStyle() })
+        }
+        return bindings
     }
 
     /// Move the selection by one message, clamped at both ends. The scroll
@@ -1999,35 +2024,79 @@ struct ReaderBackdrop: View {
     }
 }
 
-/// Passive mail preview: no reader shortcuts, read acknowledgement, or selection.
-struct ReadingStackPeek: View {
-    let row: AttentionUpdate
-    @State private var preview: ClientThreadView?
+/// THE COLUMN THE MAIL IS LAID OUT IN, defined once. The reader's column and
+/// the Reading peek's have to agree to the point: a peek's web frame files its
+/// height under the SAME key the reader draws the message from (see
+/// FrameHeights and WebFramePool), which is the whole reason it renders live,
+/// and a height taken at any other width is a card that arrives and then
+/// snaps to its real size — the flicker the height memory exists to prevent.
+private struct ReaderColumn: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, ThreadViewer.columnPadding)
+            .padding(.vertical, 4)
+            .frame(maxWidth: ThreadViewer.columnWidth)
+            .frame(maxWidth: .infinity)
+    }
+}
+
+extension View {
+    fileprivate func readerColumn() -> some View { modifier(ReaderColumn()) }
+}
+
+#if os(macOS)
+    /// Passive mail preview: no reader shortcuts, read acknowledgement, or
+    /// selection. It renders the real card, live, so the frame is parsed, laid
+    /// out and measured before `e` asks for it — nobody waits on a newsletter.
+    ///
+    /// LAID OUT EXACTLY AS THE READER WILL LAY IT OUT: the rail's footprint on
+    /// the leading side, then the column. The peek and the reader are the same
+    /// width (the deck sizes both cards alike), so matching the inner geometry
+    /// is what makes the measured height the right answer.
+    struct ReadingStackPeek: View {
+        let row: AttentionUpdate
+        @State private var preview: ClientThreadView?
+
+        var body: some View {
+            HStack(spacing: 0) {
+                // Reserved, not drawn: the reader keeps this strip for the
+                // minimap whether or not there is a map to draw.
+                Color.clear.frame(width: ThreadMinimap.width)
+                VStack(alignment: .leading, spacing: 0) {
+                    if let message = preview?.messages.last {
+                        MessageCard(
+                            message: message, style: .classic, position: 0,
+                            selected: false, ruled: false, opens: [], onSelect: {})
+                    } else {
+                        MessageSenderHeading(sender: row.senderString)
+                            .padding(.leading, MessageCard.bodyInset)
+                            .padding(.vertical, 16)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .readerColumn()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .clipped()
+            .task(id: row.thread_id) {
+                let loaded = try? await ThreadPrefetch.shared.fetch(row.thread_id)
+                guard !Task.isCancelled else { return }
+                preview = loaded
+            }
+        }
+    }
+#endif
+
+/// The sender identity shared by the loaded card and its peek placeholder.
+private struct MessageSenderHeading: View {
+    let sender: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let message = preview?.messages.last {
-                MessageCard(message: message, style: .classic, position: 0,
-                            selected: false, ruled: false, opens: [], onSelect: {})
-            } else {
-                HStack(spacing: 9) {
-                    Avatar(sender: row.senderString, size: 24)
-                    Text(SenderCache.resolved(row.senderString).displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Palette.ink)
-                }
-                .padding(.leading, MessageCard.bodyInset)
-                .padding(.vertical, 16)
-            }
-            Spacer(minLength: 0)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(.top, 4)
-        .clipped()
-        .task(id: row.thread_id) {
-            let loaded = try? await ThreadPrefetch.shared.fetch(row.thread_id)
-            guard !Task.isCancelled else { return }
-            preview = loaded
+        HStack(spacing: 9) {
+            Avatar(sender: sender, size: 24)
+            Text(SenderCache.resolved(sender).displayName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.ink)
         }
     }
 }
@@ -2183,10 +2252,7 @@ private struct MessageCard: View, Equatable {
 
     private var cardHeader: some View {
         HStack(spacing: 9) {
-            Avatar(sender: message.senderString, size: 24)
-            Text(SenderCache.resolved(message.senderString).displayName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Palette.ink)
+            MessageSenderHeading(sender: message.senderString)
             Spacer(minLength: 8)
             spamChip
             attentionChip
