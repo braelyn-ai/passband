@@ -313,6 +313,7 @@ pub struct SyncMetrics {
     /// by the next token that works.
     gmail_auth_failed_since: AtomicI64,
     gmail_quota: AtomicU64,
+    gmail_quota_retries: AtomicU64,
     gmail_http: AtomicU64,
     gmail_network: AtomicU64,
 
@@ -438,6 +439,10 @@ impl SyncMetrics {
     pub fn stamp_sync_success(&self) {
         self.sync_last_success_unix
             .store(Utc::now().timestamp(), Ordering::Relaxed);
+    }
+
+    pub fn record_gmail_quota_retry(&self) {
+        self.gmail_quota_retries.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_gmail_error(&self, kind: GmailErrorKind) {
@@ -1251,6 +1256,13 @@ pub fn render(metrics: &SyncMetrics, db: Option<&StoreSnapshot>) -> String {
         MetricKind::Gauge,
         "Messages listed for the current catch-up; grows when SENT is listed, 0 when idle.",
         total as f64,
+    );
+
+    e.scalar(
+        "squelchd_gmail_quota_retries_total",
+        MetricKind::Counter,
+        "Gmail quota retries scheduled within catch-up calls; recovered retries are not API failures.",
+        metrics.get(&metrics.gmail_quota_retries),
     );
 
     e.family(

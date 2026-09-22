@@ -20,7 +20,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use crate::config::{Config, ResolvedLlm, Stage2Provider};
+use crate::config::{Config, GmailQuotaProfile, ResolvedLlm, Stage2Provider};
 use crate::credentials::CredentialStore;
 use crate::error::{CoreError, Result};
 use crate::metrics::{GmailErrorKind, SyncMetrics};
@@ -583,7 +583,7 @@ pub struct SyncEngine<S: Store, C: CredentialStore + ?Sized> {
     config: Config,
     http: reqwest::Client,
     gmail_next_request: tokio::sync::Mutex<tokio::time::Instant>,
-    gmail_request_spacing: Duration,
+    gmail_unit_spacing: Duration,
     gmail_quota_backoff: Duration,
     /// LLM key + provider + endpoint URL, resolved once at startup. `None`
     /// disables LLM triage gracefully: rows stay queued, one stderr notice,
@@ -733,6 +733,11 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                  sync continues)"
             );
         }
+        // Leave 20% headroom; charge each method by its own cost, not as a raw fetch.
+        let gmail_unit_spacing = match config.sync.gmail_quota_profile {
+            GmailQuotaProfile::Standard => Duration::from_micros(12_500),
+            GmailQuotaProfile::Legacy => Duration::from_millis(5),
+        };
         Self {
             store,
             creds,
@@ -741,10 +746,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             config,
             http,
             gmail_next_request: tokio::sync::Mutex::new(tokio::time::Instant::now()),
-            // At most ~3,429 units/minute for 20-unit messages.get requests,
-            // leaving headroom below Gmail's 6,000-unit per-user limit.
-            gmail_request_spacing: Duration::from_millis(350),
-            gmail_quota_backoff: Duration::from_secs(60),
+            gmail_unit_spacing,
+            gmail_quota_backoff: Duration::from_secs(1),
             stage2_llm,
             embedder: None,
             embedder_gate: None,
@@ -903,8 +906,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// [`CoreError::NotFound`] so callers can branch on it (the
     /// expired-historyId fallback). Header and body are NEVER logged.
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &str) -> Result<T> {
+        self.get_json_with_retry(url, GmailRetry::None).await
+    }
+
+    async fn get_json_with_retry<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: &str,
+        retry: GmailRetry,
+    ) -> Result<T> {
         let mut backoff = self.gmail_quota_backoff;
-        for attempt in 0..=8 {
+        for attempt in 0..=GMAIL_QUOTA_RETRIES {
             let resp = self.send_get(url).await?;
             let status = resp.status();
             if status.is_success() {
@@ -923,18 +934,23 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 .and_then(gmail_retry_after);
             let body = resp.text().await.unwrap_or_default();
             let kind = classify_gmail_status(status.as_u16(), &body);
-            self.metrics.record_gmail_error(kind);
-            if matches!(kind, GmailErrorKind::Quota) && attempt < 8 {
-                let delay = backoff.max(retry_after.unwrap_or_default());
+            let delay = gmail_quota_delay(backoff, retry_after);
+            if matches!(kind, GmailErrorKind::Quota)
+                && retry == GmailRetry::CatchUp
+                && attempt < GMAIL_QUOTA_RETRIES
+                && let Some(delay) = delay
+            {
+                self.metrics.record_gmail_quota_retry();
                 eprintln!(
                     "squelch: Gmail quota limit ({}); pausing {}s, then retrying the same request (catch-up position retained)",
                     gmail_error_reason(&body),
                     delay.as_secs()
                 );
                 tokio::time::sleep(delay).await;
-                backoff = (backoff * 2).min(BACKOFF_CAP);
+                backoff = (backoff * 2).min(GMAIL_QUOTA_RETRY_CAP);
                 continue;
             }
+            self.metrics.record_gmail_error(kind);
             return Err(CoreError::Other(anyhow::anyhow!(
                 "gmail api status {} (reason: {})",
                 status.as_u16(),
@@ -984,7 +1000,15 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         {
             let mut next = self.gmail_next_request.lock().await;
             tokio::time::sleep_until(*next).await;
-            *next = tokio::time::Instant::now() + self.gmail_request_spacing;
+            let path = url
+                .strip_prefix(&self.api_base)
+                .unwrap_or(url)
+                .split('?')
+                .next()
+                .unwrap_or_default();
+            *next = tokio::time::Instant::now()
+                + self.gmail_unit_spacing
+                    * gmail_method_cost(self.config.sync.gmail_quota_profile, path);
         }
         self.http
             .get(url)
@@ -1052,10 +1076,17 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         // INBOX bodies.
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
-        let inbox_ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
+        let inbox_ids = self
+            .list_message_ids_capped(LABEL_INBOX, Some(&q), None, GmailRetry::CatchUp)
+            .await?;
         // Backfill NEVER notifies (see `IngestOrigin`).
         let n = self
-            .fetch_raw_and_ingest(&inbox_ids, Mailbox::Inbox, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(
+                &inbox_ids,
+                Mailbox::Inbox,
+                IngestOrigin::Backfill,
+                GmailRetry::CatchUp,
+            )
             .await?;
         eprintln!("squelch: backfilled {n} INBOX messages");
 
@@ -1063,9 +1094,16 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // WROTE. Contacts still come from To/Cc; the row is stored neutral
         // (tier=noise, importance=0) and the is_sent exclusions keep it out of
         // triage/updates/search.
-        let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
+        let sent_ids = self
+            .list_message_ids_capped(LABEL_SENT, Some(&q), None, GmailRetry::CatchUp)
+            .await?;
         let seeded = self
-            .fetch_raw_and_ingest(&sent_ids, Mailbox::Sent, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(
+                &sent_ids,
+                Mailbox::Sent,
+                IngestOrigin::Backfill,
+                GmailRetry::CatchUp,
+            )
             .await?;
         eprintln!("squelch: backfilled {seeded} SENT messages (bodies for recall + contacts)");
 
@@ -1285,14 +1323,19 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
         let cap = self.config.sync.spam_max as usize;
         let ids = self
-            .list_message_ids_capped(LABEL_SPAM, Some(&q), Some(cap))
+            .list_message_ids_capped(LABEL_SPAM, Some(&q), Some(cap), GmailRetry::None)
             .await?;
         eprintln!("squelch: spam sync — {} message(s) to fetch", ids.len());
         // `Backfill`, not `Incremental`: this is a bulk read of old mail the
         // user asked to look at. `worthy_kind` already refuses a spam row, so
         // the origin is belt to that brace rather than the guarantee.
         let n = self
-            .fetch_raw_and_ingest(&ids, Mailbox::Spam, IngestOrigin::Backfill)
+            .fetch_raw_and_ingest(
+                &ids,
+                Mailbox::Spam,
+                IngestOrigin::Backfill,
+                GmailRetry::None,
+            )
             .await?;
         self.store.set_app_setting(
             self.account_id,
@@ -1349,7 +1392,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             .await?;
         if !inbox_ids.is_empty() {
             let n = self
-                .fetch_raw_and_ingest(&inbox_ids, Mailbox::Inbox, IngestOrigin::Incremental)
+                .fetch_raw_and_ingest(
+                    &inbox_ids,
+                    Mailbox::Inbox,
+                    IngestOrigin::Incremental,
+                    GmailRetry::None,
+                )
                 .await?;
             eprintln!("squelch: ingested {n} new INBOX messages");
         }
@@ -1390,7 +1438,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             // `Err(Refusal::NotWorthy)` as defense in depth; and the 'n/a' stage
             // markers ingest stamps, which keep it out of both LLM queues.
             match self
-                .fetch_raw_and_ingest(&sent_only, Mailbox::Sent, IngestOrigin::Incremental)
+                .fetch_raw_and_ingest(
+                    &sent_only,
+                    Mailbox::Sent,
+                    IngestOrigin::Incremental,
+                    GmailRetry::None,
+                )
                 .await
             {
                 Ok(n) => eprintln!("squelch: ingested {n} new SENT messages"),
@@ -1498,7 +1551,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// guard and run the trim across every exit path, `?` included.
     async fn catch_up_inner(&self) -> Result<()> {
         let q = format!("newer_than:{}d", self.config.sync.backfill_days);
-        let ids = self.list_message_ids(LABEL_INBOX, Some(&q)).await?;
+        let ids = self
+            .list_message_ids_capped(LABEL_INBOX, Some(&q), None, GmailRetry::CatchUp)
+            .await?;
         // BEFORE the first fetch, so the size of the job is known while it is
         // still a job rather than after it is a result. This is the line that
         // turns "silent for 30 minutes" into "re-fetching 4,500 messages".
@@ -1536,7 +1591,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // against the wall clock, so a row that waited behind a queue of model
         // calls aged out and went silent.
         let n = self
-            .fetch_raw_and_ingest(&ids, Mailbox::Inbox, IngestOrigin::Incremental)
+            .fetch_raw_and_ingest(
+                &ids,
+                Mailbox::Inbox,
+                IngestOrigin::Incremental,
+                GmailRetry::CatchUp,
+            )
             .await?;
         if n > 0 {
             eprintln!("squelch: catch-up ingested {n} INBOX messages");
@@ -1545,7 +1605,9 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         // INBOX first, and its ids subtracted, for the same reason the history
         // walk orders itself that way: a self-addressed message is in both
         // listings and its visible copy must win the unique-key race.
-        let sent_ids = self.list_message_ids(LABEL_SENT, Some(&q)).await?;
+        let sent_ids = self
+            .list_message_ids_capped(LABEL_SENT, Some(&q), None, GmailRetry::CatchUp)
+            .await?;
         let sent_only = subtract_ids(sent_ids, &ids);
         // EXTENDS the same run rather than starting a second one: from outside
         // this is one wait, and a progress bar that reached the end and then
@@ -1557,7 +1619,12 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             sent_only.len()
         );
         let sent_n = self
-            .fetch_raw_and_ingest(&sent_only, Mailbox::Sent, IngestOrigin::Incremental)
+            .fetch_raw_and_ingest(
+                &sent_only,
+                Mailbox::Sent,
+                IngestOrigin::Incremental,
+                GmailRetry::CatchUp,
+            )
             .await?;
         if sent_n > 0 {
             eprintln!("squelch: catch-up ingested {sent_n} SENT messages");
@@ -1785,7 +1852,8 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// List all message ids under `label`, optionally narrowed by a Gmail search
     /// `q`. Paginates fully.
     async fn list_message_ids(&self, label: &str, q: Option<&str>) -> Result<Vec<String>> {
-        self.list_message_ids_capped(label, q, None).await
+        self.list_message_ids_capped(label, q, None, GmailRetry::None)
+            .await
     }
 
     /// [`list_message_ids`](Self::list_message_ids) with an optional ceiling on
@@ -1802,6 +1870,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         label: &str,
         q: Option<&str>,
         cap: Option<usize>,
+        retry: GmailRetry,
     ) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut page_token: Option<String> = None;
@@ -1813,7 +1882,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
             if let Some(tok) = &page_token {
                 url.push_str(&format!("&pageToken={tok}"));
             }
-            let page: ListMessagesResp = self.get_json(&url).await?;
+            let page: ListMessagesResp = self.get_json_with_retry(&url, retry).await?;
             ids.extend(page.messages.into_iter().map(|m| m.id));
             if let Some(cap) = cap
                 && ids.len() >= cap
@@ -1837,6 +1906,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
         ids: &[String],
         mailbox: Mailbox,
         origin: IngestOrigin,
+        retry: GmailRetry,
     ) -> Result<usize> {
         if ids.is_empty() {
             return Ok(0);
@@ -1846,7 +1916,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
 
         for id in ids {
             let url = format!("{}/messages/{id}?format=raw", self.api_base);
-            let msg: GmailMessage = self.get_json(&url).await?;
+            let msg: GmailMessage = self.get_json_with_retry(&url, retry).await?;
             // Only a catch-up has a denominator, so this is a no-op on the
             // ordinary incremental path — `catchup_step` moves a gauge that is
             // zero unless `catch_up` set one up. A line every 50 messages
@@ -2197,7 +2267,7 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
     /// `users.getProfile` -> the account's current historyId.
     async fn fetch_profile_history_id(&self) -> Result<u64> {
         let url = format!("{}/profile", self.api_base);
-        let profile: ProfileResp = self.get_json(&url).await?;
+        let profile: ProfileResp = self.get_json_with_retry(&url, GmailRetry::CatchUp).await?;
         Ok(parse_history_id(&profile.history_id))
     }
 
@@ -2278,6 +2348,43 @@ impl<S: Store + 'static, C: CredentialStore + 'static + ?Sized> SyncEngine<S, C>
                 }
             }
         }
+    }
+}
+
+/// Only backfills/catch-up retain a request across quota pauses. Poll helpers,
+/// spam browsing and metadata sweeps leave retry scheduling to their caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GmailRetry {
+    None,
+    CatchUp,
+}
+
+const GMAIL_QUOTA_RETRIES: usize = 2;
+const GMAIL_QUOTA_RETRY_CAP: Duration = Duration::from_secs(30);
+
+fn gmail_quota_delay(backoff: Duration, retry_after: Option<Duration>) -> Option<Duration> {
+    // A longer server instruction ends this call. Do not sleep unboundedly or
+    // truncate the instruction and retry earlier than Gmail allows.
+    if retry_after.is_some_and(|delay| delay > GMAIL_QUOTA_RETRY_CAP) {
+        return None;
+    }
+    Some(
+        backoff
+            .min(GMAIL_QUOTA_RETRY_CAP)
+            .max(retry_after.unwrap_or_default()),
+    )
+}
+
+fn gmail_method_cost(profile: GmailQuotaProfile, path: &str) -> u32 {
+    match path {
+        "/profile" => 1,
+        "/history" => 2,
+        "/messages" => 5,
+        p if p.starts_with("/labels/") => 1,
+        _ => match profile {
+            GmailQuotaProfile::Standard => 20,
+            GmailQuotaProfile::Legacy => 5,
+        },
     }
 }
 
@@ -3141,6 +3248,7 @@ mod tests {
         /// gmail message id -> RFC822 source.
         bodies: HashMap<String, String>,
         errors: HashMap<String, std::collections::VecDeque<(u16, String)>>,
+        retry_after: Option<String>,
         /// labelId -> the verbatim 200 body `labels.get` answers with. Absent
         /// (or `None`) means 500: an unscripted label must not read as a real
         /// zero. Whole bodies rather than a counter pair because the shapes
@@ -3284,13 +3392,17 @@ mod tests {
         st.seen.push(format!("get:{id}"));
         if let Some((status, reason)) = st.errors.get_mut(&id).and_then(|errors| errors.pop_front())
         {
-            return (
+            let mut response = (
                 StatusCode::from_u16(status).unwrap(),
-                Json(json!({
-                    "error": {"details": [{"reason": reason}]}
-                })),
+                Json(json!({"error": {"details": [{"reason": reason}]}})),
             )
                 .into_response();
+            if let Some(value) = &st.retry_after {
+                response
+                    .headers_mut()
+                    .insert("retry-after", value.parse().unwrap());
+            }
+            return response;
         }
         match st.bodies.get(&id) {
             // Both shapes at once: `raw` for the ingest fetches, and the
@@ -3324,6 +3436,18 @@ mod tests {
     async fn mock_label(State(g): State<MockGmail>, AxumPath(id): AxumPath<String>) -> Response {
         let mut st = g.0.lock().unwrap();
         st.seen.push(format!("label:{id}"));
+        if let Some((status, reason)) = st
+            .errors
+            .get_mut(&format!("label:{id}"))
+            .and_then(|errors| errors.pop_front())
+        {
+            return (
+                StatusCode::from_u16(status).unwrap(),
+                Json(json!({"error": {"details": [{"reason": reason}]}})),
+            )
+                .into_response();
+        }
+
         match st.labels.get(&id).cloned().flatten() {
             Some(body) => Json(body).into_response(),
             None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -3388,7 +3512,7 @@ mod tests {
             config,
         )
         .with_api_base(base.to_string());
-        engine.gmail_request_spacing = Duration::ZERO;
+        engine.gmail_unit_spacing = Duration::ZERO;
         engine
     }
 
@@ -3477,6 +3601,121 @@ mod tests {
             assert_eq!(g.calls("list:INBOX"), 1);
             assert_eq!(g.calls("get:a"), 1);
             assert_eq!(g.calls("get:b"), 2);
+            let metrics = crate::metrics::render(&e.metrics, None);
+            assert!(metrics.contains("squelchd_gmail_quota_retries_total 1\n"));
+            assert!(metrics.contains("squelchd_gmail_api_errors_total{kind=\"quota\"} 0\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn gmail_cosmetic_quota_error_does_not_delay_the_poll() {
+        let g = MockGmail::default();
+        g.0.lock().unwrap().errors.insert(
+            "label:INBOX".into(),
+            [(403, "RATE_LIMIT_EXCEEDED".into())].into(),
+        );
+        let base = serve_mock(g.clone()).await;
+        let (store, acct) = store_at_cursor(Some(1));
+        let mut e = engine(store, acct, &base);
+        e.gmail_quota_backoff = Duration::from_secs(30);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            e.refresh_inbox_unread().await;
+            e.poll_once().await.unwrap();
+        })
+        .await
+        .expect("unread quota response parked the poll lane");
+        assert_eq!(g.calls("label:INBOX"), 1);
+        assert_eq!(g.calls("history:INBOX"), 1);
+        let metrics = crate::metrics::render(&e.metrics, None);
+        assert!(metrics.contains("squelchd_gmail_quota_retries_total 0\n"));
+        assert!(metrics.contains("squelchd_gmail_api_errors_total{kind=\"quota\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn gmail_quota_retry_exhaustion_counts_one_failed_call() {
+        let g = MockGmail::default();
+        g.0.lock().unwrap().errors.insert(
+            "a".into(),
+            (0..9)
+                .map(|_| (429, "RATE_LIMIT_EXCEEDED".into()))
+                .collect(),
+        );
+        let base = serve_mock(g.clone()).await;
+        let (store, acct) = store_at_cursor(Some(1));
+        let mut e = engine(store, acct, &base);
+        e.gmail_quota_backoff = Duration::ZERO;
+        assert!(
+            e.get_json_with_retry::<Value>(&format!("{base}/messages/a"), GmailRetry::CatchUp)
+                .await
+                .is_err()
+        );
+        assert_eq!(g.calls("get:a"), 3);
+        let metrics = crate::metrics::render(&e.metrics, None);
+        assert!(metrics.contains("squelchd_gmail_quota_retries_total 2\n"));
+        assert!(metrics.contains("squelchd_gmail_api_errors_total{kind=\"quota\"} 1\n"));
+    }
+
+    #[tokio::test]
+    async fn gmail_long_retry_after_returns_without_sleeping_or_retrying_early() {
+        let g = MockGmail::default();
+        {
+            let mut state = g.0.lock().unwrap();
+            state
+                .errors
+                .insert("a".into(), [(429, "RATE_LIMIT_EXCEEDED".into())].into());
+            state.retry_after = Some("86400".into());
+        }
+        let base = serve_mock(g.clone()).await;
+        let (store, acct) = store_at_cursor(Some(1));
+        let e = engine(store, acct, &base);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            e.get_json_with_retry::<Value>(&format!("{base}/messages/a"), GmailRetry::CatchUp),
+        )
+        .await
+        .expect("Retry-After held this call open");
+        assert!(result.is_err());
+        assert_eq!(g.calls("get:a"), 1);
+    }
+
+    #[test]
+    fn gmail_quota_sleep_budget_is_bounded() {
+        assert_eq!(
+            gmail_quota_delay(Duration::from_secs(1), Some(Duration::from_secs(20))),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            gmail_quota_delay(Duration::from_secs(500), None),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            gmail_quota_delay(Duration::from_secs(1), Some(Duration::from_secs(31))),
+            None
+        );
+        assert!(GMAIL_QUOTA_RETRY_CAP * GMAIL_QUOTA_RETRIES as u32 <= Duration::from_secs(60));
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc2822();
+        assert_eq!(
+            gmail_quota_delay(Duration::from_secs(1), gmail_retry_after(&future)),
+            None
+        );
+    }
+
+    #[test]
+    fn gmail_pacing_uses_method_cost_and_project_profile() {
+        for (profile, unit, raw_cost) in [
+            (
+                GmailQuotaProfile::Standard,
+                Duration::from_micros(12_500),
+                20,
+            ),
+            (GmailQuotaProfile::Legacy, Duration::from_millis(5), 5),
+        ] {
+            assert_eq!(gmail_method_cost(profile, "/messages/a"), raw_cost);
+            assert_eq!(gmail_method_cost(profile, "/messages"), 5);
+            assert_eq!(gmail_method_cost(profile, "/history"), 2);
+            assert_eq!(gmail_method_cost(profile, "/labels/INBOX"), 1);
+            assert_eq!(gmail_method_cost(profile, "/profile"), 1);
+            assert!(unit * gmail_method_cost(profile, "/labels/INBOX") < Duration::from_millis(20));
         }
     }
 
@@ -3504,13 +3743,13 @@ mod tests {
         let base = serve_mock(g.clone()).await;
         let (store, acct) = store_at_cursor(Some(1));
         let mut e = engine(store, acct, &base);
-        e.gmail_request_spacing = Duration::from_millis(350);
+        e.gmail_unit_spacing = Duration::from_millis(10);
         let started = tokio::time::Instant::now();
         let url = format!("{base}/profile");
         let (a, b) = tokio::join!(e.get_json::<Value>(&url), e.get_json::<Value>(&url));
         a.unwrap();
         b.unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(350));
+        assert!(started.elapsed() >= Duration::from_millis(10));
     }
 
     #[tokio::test]
@@ -4689,6 +4928,7 @@ mod tests {
                 &["g-old".to_string()],
                 Mailbox::Inbox,
                 IngestOrigin::Backfill,
+                GmailRetry::None,
             )
             .await
             .unwrap();

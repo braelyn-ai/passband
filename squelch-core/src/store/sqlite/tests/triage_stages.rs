@@ -2166,3 +2166,32 @@ fn a_run_of_config_failures_leaves_the_cap_intact() {
         "the fleet can still triage once the config is fixed"
     );
 }
+
+#[test]
+fn retriage_progress_uses_covering_range_and_trigger_lookups() {
+    let (store, account) = store();
+    let conn = store.lock().unwrap();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::super::triage_stages::RETRIAGE_PROGRESS_SQL
+    );
+    let plan: Vec<String> = conn
+        .prepare(&sql)
+        .unwrap()
+        .query_map(params![account, Utc::now().to_rfc3339()], |row| row.get(3))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    let plan = plan.join("\n");
+    assert!(
+        plan.contains("SEARCH t USING COVERING INDEX idx_triage_retriage_window"),
+        "{plan}"
+    );
+    assert!(plan.contains("retriage_at>?"), "{plan}");
+    assert!(
+        plan.contains("SEARCH j USING COVERING INDEX idx_agent_jobs_manual_progress"),
+        "{plan}"
+    );
+    assert!(plan.contains("trigger=?"), "{plan}");
+    assert!(!plan.contains("SCAN"), "{plan}");
+}

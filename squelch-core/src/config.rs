@@ -188,10 +188,34 @@ impl Stage2Provider {
     }
 }
 
+/// Gmail changed quotas for new projects in May 2026. Older projects may retain
+/// their previous quota; select legacy only after checking the Cloud console.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GmailQuotaProfile {
+    #[default]
+    Standard,
+    Legacy,
+}
+
+impl std::str::FromStr for GmailQuotaProfile {
+    type Err = &'static str;
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "legacy" => Ok(Self::Legacy),
+            _ => Err("expected standard or legacy"),
+        }
+    }
+}
+
 /// Sync tunables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
+    /// Env: SQUELCH_GMAIL_QUOTA_PROFILE. Standard: 6,000 units/minute,
+    /// messages.get 20 units. Legacy: 15,000/minute, messages.get 5 units.
+    pub gmail_quota_profile: GmailQuotaProfile,
     /// How many days of history to backfill on the initial sync.
     pub backfill_days: u32,
     /// How often (seconds) the incremental poll loop calls `history.list`; one
@@ -215,6 +239,7 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
+            gmail_quota_profile: GmailQuotaProfile::Standard,
             backfill_days: 30,
             poll_secs: 5,
             spam_max: 200,
@@ -1749,6 +1774,10 @@ impl Config {
         }
         env_override("SQUELCH_BACKFILL_DAYS", &mut self.sync.backfill_days);
         env_override("SQUELCH_POLL_SECS", &mut self.sync.poll_secs);
+        env_override(
+            "SQUELCH_GMAIL_QUOTA_PROFILE",
+            &mut self.sync.gmail_quota_profile,
+        );
         // A per-pod memory knob, so it has to be reachable without editing a
         // config file inside a container image. 0 pins the session in memory.
         env_override(
@@ -2241,6 +2270,25 @@ mod tests {
 
     /// Tests that touch process-wide env must not run concurrently.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn gmail_quota_profile_defaults_standard_and_accepts_legacy() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(matches!(
+            config.sync.gmail_quota_profile,
+            GmailQuotaProfile::Standard
+        ));
+        let config: Config = toml::from_str("[sync]\ngmail_quota_profile = \"legacy\"\n").unwrap();
+        assert!(matches!(
+            config.sync.gmail_quota_profile,
+            GmailQuotaProfile::Legacy
+        ));
+        assert!("bogus".parse::<GmailQuotaProfile>().is_err());
+        assert!(matches!(
+            "legacy".parse::<GmailQuotaProfile>().unwrap(),
+            GmailQuotaProfile::Legacy
+        ));
+    }
 
     #[test]
     fn agent_budget_environment_overrides_are_active() {

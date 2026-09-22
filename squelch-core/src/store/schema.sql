@@ -1356,6 +1356,11 @@ CREATE TABLE IF NOT EXISTS agent_triage_jobs (
     UNIQUE(account_id, message_id, kind, input_revision, trigger)
 );
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_claim ON agent_triage_jobs(kind,state,available_at);
+-- Probe one manual request by equality, including its computed trigger. The
+-- trigger expression is on the outer row, so this covering index can serve it.
+CREATE INDEX IF NOT EXISTS idx_agent_jobs_manual_progress
+    ON agent_triage_jobs(account_id,message_id,trigger,kind,state);
+
 -- Tenant queue scans and active per-thread lease exclusion must not inspect all
 -- completed historical jobs on each idle worker poll.
 CREATE INDEX IF NOT EXISTS idx_agent_jobs_account_ready ON agent_triage_jobs(account_id,state,kind,available_at);
