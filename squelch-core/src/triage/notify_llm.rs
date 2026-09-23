@@ -7,7 +7,7 @@ use crate::triage::llm::{self, ClassifyError, LlmOutcome, LlmRequest};
 use crate::triage::text::{Untrusted, neutralize, truncate_flagged};
 use serde::{Deserialize, Serialize};
 
-pub const PROMPT_VERSION: &str = "notification-v2";
+pub const PROMPT_VERSION: &str = "notification-v3";
 
 const ONE_LINE_RULES: &str =
     "ONE_LINE: one clear sentence, at most 120 characters. No leading label, em dash, or en dash.";
@@ -47,9 +47,10 @@ pub fn build_system_prompt() -> &'static str {
     static COMPOSED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     COMPOSED.get_or_init(|| {
         format!(
-            "{PROMPT_HEAD}\n{IMPORTANCE_ANCHORS}\n\n{PROMPT_TAIL}\n\n{ONE_LINE_RULES}\n\n\
+            "{PROMPT_HEAD}\n{IMPORTANCE_ANCHORS}\n\n{PROMPT_TAIL}\n\n{ONE_LINE_RULES}\n\n{login_code_rules}\n\n\
              Only one_line is shown to the user on this path, so the dash rule above \
-             governs it whatever other fields that paragraph names.\n\n{TRUST_RULE}"
+             governs it whatever other fields that paragraph names.\n\n{TRUST_RULE}",
+            login_code_rules = super::login_code::PROMPT
         )
     })
 }
@@ -58,18 +59,21 @@ pub fn output_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["notify_importance", "one_line", "is_auth", "reason"],
+        "required": ["notify_importance", "one_line", "is_auth", "reason", "login_code"],
         "properties": {
             "notify_importance": { "type": "integer" },
             "one_line": { "type": "string" },
             "is_auth": { "type": "boolean" },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "login_code": super::login_code::schema()
         }
     })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NotifyOutput {
+    #[serde(default)]
+    pub login_code: Option<super::login_code::LoginCode>,
     pub is_auth: bool,
     pub reason: String,
     pub notify_importance: i64,
@@ -405,11 +409,11 @@ mod tests {
         let s = output_schema();
         assert_eq!(s["additionalProperties"], serde_json::json!(false));
         let req = s["required"].as_array().unwrap();
-        assert_eq!(req.len(), 4);
+        assert_eq!(req.len(), 5);
         assert!(req.iter().any(|v| v == "notify_importance"));
         assert!(req.iter().any(|v| v == "one_line"));
         let props = s["properties"].as_object().unwrap();
-        assert_eq!(props.len(), 4);
+        assert_eq!(props.len(), 5);
         assert_eq!(props["is_auth"]["type"], "boolean");
         assert!(!props.contains_key("tier"));
         assert_eq!(props["notify_importance"]["type"], "integer");

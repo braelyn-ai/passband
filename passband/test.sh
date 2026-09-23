@@ -29,6 +29,10 @@ run_suite thread-prefetch \
   Sources/Passband/Model/ThreadPrefetch.swift \
   Tests/ThreadPrefetchTests.swift
 
+run_suite calendar-visibility \
+  Sources/Passband/Lib/CalendarVisibility.swift \
+  Tests/CalendarVisibilityTests.swift
+
 # The real poller against a cancellation-oblivious transport: mailbox switches
 # must detach old requests before the next mailbox starts warming.
 run_suite sitrep-poller \

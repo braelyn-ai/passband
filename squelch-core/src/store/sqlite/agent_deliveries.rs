@@ -3,6 +3,7 @@
 //! Canonical decisions own these rows. Retraction rebuilds from remaining
 //! proposals and removes an agent-created row when its last proposal disappears.
 use super::*;
+use crate::triage::ShipmentStatus;
 use crate::triage::decision::{MessageDecision, RecordProposal};
 use crate::triage::extract::shipments::sanitize_tracking_number;
 use std::collections::BTreeSet;
@@ -15,6 +16,63 @@ fn tracking_numbers(decision: &MessageDecision) -> impl Iterator<Item = String> 
         } => sanitize_tracking_number(Some(number), None),
         _ => None,
     })
+}
+
+/// Write what the newest retained mail about a package says onto its row. ONE
+/// place, for owned and legacy rows alike, so there is one answer to "what does
+/// newer mail do to a shipment":
+///
+/// * it becomes the row's click target and its carrier (the mail is the newer
+///   witness; if it names FedEx for a number USPS rejected five times, the
+///   un-retired poll must go to FedEx, not back to USPS);
+/// * it moves `last_update` forward, which is what returns a row the listing
+///   hid as silent; a re-decided OLD mail moves nothing;
+/// * mail NEWER THAN THE ROW un-retires it. A carrier that said "never heard
+///   of it" five times was answering about a label the shipper had not handed
+///   over, and fresh mail is the evidence the number is real now. Nothing else
+///   can reset the counter, because a retired row is not polled.
+///
+/// `status` is decided by the caller (see `reconcile`). `created_by_message_id`
+/// moves only on an owned row: it is the projection's own provenance, and a
+/// legacy row keeps the mail that minted it.
+#[allow(clippy::too_many_arguments)]
+fn record_newer_mail(
+    conn: &Connection,
+    account: AccountId,
+    id: i64,
+    managed: bool,
+    message: i64,
+    info: &crate::triage::ShipmentInfo,
+    status: &str,
+    received: DateTime<Utc>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE shipments SET
+             carrier=?3,
+             tracking_url=?4,
+             created_by_message_id=CASE WHEN ?9 THEN ?5 ELSE created_by_message_id END,
+             last_message_id=?5,
+             poll_failures=CASE WHEN last_update<?7 THEN 0 ELSE poll_failures END,
+             last_update=MAX(last_update,?7),
+             status=?6,
+             delivered_at=CASE
+                 WHEN ?6='delivered' THEN COALESCE(delivered_at,?7)
+                 WHEN carrier_status_raw IS NULL AND ?9 THEN NULL
+                 ELSE delivered_at END
+         WHERE account_id=?1 AND id=?2 AND (?8 OR last_update<?7)",
+        params![
+            account,
+            id,
+            info.carrier,
+            info.tracking_url,
+            message,
+            status,
+            received.to_rfc3339(),
+            managed,
+            managed,
+        ],
+    )?;
+    Ok(())
 }
 
 pub(super) fn reconcile(
@@ -116,15 +174,32 @@ pub(super) fn reconcile(
             id
         };
         let managed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_delivery_projections WHERE account_id=?1 AND shipment_id=?2)",params![account,id],|r|r.get(0))?;
-        if managed {
-            // The newest retained explicit proposal is authoritative for email
-            // fields. Carrier observations remain authoritative once polled.
-            conn.execute("UPDATE shipments SET carrier=?3,created_by_message_id=?4,last_message_id=?4,
-                 tracking_url=?7,last_update=MAX(last_update,?8),
-                 status=COALESCE(?6,?5),
-                 delivered_at=CASE WHEN carrier_status_raw IS NULL AND ?5!='delivered' THEN NULL ELSE delivered_at END
-                 WHERE account_id=?1 AND id=?2",params![account,id,info.carrier,message,info.status.as_str(),carrier_status,info.tracking_url,received.to_rfc3339()])?;
-        }
+        // WHAT THE MAIL SAYS THE STATUS IS differs by ownership, and it is the
+        // only thing that does. An OWNED row is a projection of the retained
+        // proposals, so the newest one is authoritative and a retraction can
+        // walk it back. A LEGACY row is a fact this projection does not own and
+        // cannot rebuild, so it takes the no-regress merge, and a delivered
+        // package is never walked back by a mail the model misread as "shipped"
+        // (a re-ship notice, a survey). Either way the carrier's own word, once
+        // it has one, outranks the mail.
+        let status = if managed {
+            carrier_status.unwrap_or_else(|| info.status.as_str().to_string())
+        } else {
+            let current: String = conn.query_row(
+                "SELECT status FROM shipments WHERE account_id=?1 AND id=?2",
+                params![account, id],
+                |r| r.get(0),
+            )?;
+            let current = ShipmentStatus::parse(&current).unwrap_or(ShipmentStatus::Shipped);
+            carrier_status.unwrap_or_else(|| {
+                ShipmentStatus::merge(current, info.status)
+                    .as_str()
+                    .to_string()
+            })
+        };
+        record_newer_mail(
+            conn, account, id, managed, *message, info, &status, *received,
+        )?;
     }
     Ok(())
 }
@@ -238,6 +313,269 @@ mod tests {
             marker_count, 0,
             "normalized final retraction removes ownership marker"
         );
+    }
+
+    /// A row written before the agent owned deliveries, `age_days` silent.
+    fn legacy_row(store: &SqliteStore, number: &str, age_days: i64) -> i64 {
+        let at = (Utc::now() - chrono::Duration::days(age_days)).to_rfc3339();
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "INSERT INTO shipments(account_id,tracking_number,carrier,item_name,status,first_seen,last_update)
+             VALUES(1,?1,'ups','Lamp','shipped',?2,?2)",
+            params![number, at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn listed(store: &SqliteStore) -> Vec<crate::types::Shipment> {
+        let policy = crate::config::ShipmentListPolicy::default();
+        assert!(
+            policy.stale_after_days > 0,
+            "the default policy goes silent"
+        );
+        store.list_shipments(1, false, policy).unwrap()
+    }
+
+    /// THE PRODUCTION REVIVAL PATH. `reconcile` is the only mail-driven writer
+    /// left, so a row the listing hid as silent comes back through here or not
+    /// at all, and a legacy row is in no projection to be updated through.
+    #[test]
+    fn newer_mail_returns_a_silent_legacy_row_without_adopting_it() {
+        let store = fixture();
+        let id = legacy_row(&store, "1Z999AA10123456784", 30);
+        assert!(listed(&store).is_empty(), "silent for 30 days: hidden");
+
+        let update = delivery("1Z999AA10123456784", "out_for_delivery");
+        write(&store, 2, None, &update);
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1, "the update email brought it back");
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].status, "out_for_delivery");
+        assert_eq!(rows[0].item_name, "Lamp", "the legacy name is untouched");
+
+        // Retracting that mail must not delete a row this projection never owned.
+        write(&store, 2, Some(&update), &MessageDecision::default());
+        let kept: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM shipments WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1, "legacy rows are never retired from here");
+    }
+
+    /// Re-triaging OLD mail is not news: it must not resurrect the row, or a
+    /// re-triage pass would refill the list with every dead package at once.
+    #[test]
+    fn re_deciding_old_mail_does_not_return_a_silent_legacy_row() {
+        let store = fixture();
+        legacy_row(&store, "1Z999AA10123456784", 30);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(40)).to_rfc3339()],
+            )
+            .unwrap();
+        write(
+            &store,
+            1,
+            None,
+            &delivery("1Z999AA10123456784", "delivered"),
+        );
+        assert!(listed(&store).is_empty());
+        let status: String = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT status FROM shipments", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status, "shipped",
+            "mail older than the row rewrites nothing"
+        );
+    }
+
+    fn poll_failures(store: &SqliteStore, id: i64) -> u32 {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT poll_failures FROM shipments WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn retire(store: &SqliteStore, id: i64) {
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE shipments SET poll_failures=5 WHERE id=?1", [id])
+            .unwrap();
+    }
+
+    fn pollable(store: &SqliteStore, id: i64) -> bool {
+        store
+            .list_pollable_shipments(1, Utc::now() - chrono::Duration::days(45), 5)
+            .unwrap()
+            .iter()
+            .any(|s| s.id == id)
+    }
+
+    /// A retired number is polled again once newer mail says it is real. Only a
+    /// successful poll used to reset the counter, and a retired row never gets
+    /// one, so retirement had quietly become permanent.
+    #[test]
+    fn newer_mail_un_retires_a_row_and_older_mail_does_not() {
+        let store = fixture();
+        // Owned row, minted from 30-day-old mail, then retired.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
+            )
+            .unwrap();
+        write(&store, 1, None, &delivery("1Z999AA10123456784", "shipped"));
+        let owned: i64 = store
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM shipments", [], |r| r.get(0))
+            .unwrap();
+        retire(&store, owned);
+        assert!(!pollable(&store, owned), "retired: out of the poll queue");
+
+        // Re-deciding the SAME mail is not news: still retired.
+        write(&store, 1, None, &delivery("1Z999AA10123456784", "shipped"));
+        assert_eq!(poll_failures(&store, owned), 5);
+
+        // Newer mail is.
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456784", "out_for_delivery"),
+        );
+        assert_eq!(poll_failures(&store, owned), 0);
+        assert!(pollable(&store, owned), "back in the poll queue");
+
+        // The same for a legacy row.
+        let legacy = legacy_row(&store, "1Z999AA10123456785", 20);
+        retire(&store, legacy);
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456785", "out_for_delivery"),
+        );
+        assert_eq!(poll_failures(&store, legacy), 0);
+        assert!(pollable(&store, legacy));
+    }
+
+    fn row_facts(store: &SqliteStore, id: i64) -> (String, String, Option<String>, Option<String>) {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT status,carrier,delivered_at,tracking_url FROM shipments WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// A DELIVERED LEGACY ROW IS NEVER WALKED BACK. The model misreads a re-ship
+    /// notice or a survey as "shipped": the row keeps its terminal status and
+    /// its delivery time, and does not re-enter the poll queue. It is still
+    /// news, so it still returns to the list and still un-retires.
+    #[test]
+    fn newer_mail_cannot_walk_a_delivered_legacy_row_back() {
+        let store = fixture();
+        let id = legacy_row(&store, "1Z999AA10123456784", 30);
+        let landed = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE shipments SET status='delivered',delivered_at=?1 WHERE id=?2",
+                params![landed, id],
+            )
+            .unwrap();
+        write(&store, 2, None, &delivery("1Z999AA10123456784", "shipped"));
+        let (status, _, delivered_at, _) = row_facts(&store, id);
+        assert_eq!(
+            status, "delivered",
+            "terminal status survives a misread mail"
+        );
+        assert_eq!(delivered_at.as_deref(), Some(landed.as_str()));
+        assert!(!pollable(&store, id), "a delivered package is not polled");
+        assert_eq!(
+            listed(&store).len(),
+            0,
+            "and en-route listings still exclude it"
+        );
+    }
+
+    /// Newer mail that names a different carrier for the number re-routes the
+    /// un-retired poll: five USPS rejections were USPS being asked about a
+    /// FedEx label, and asking USPS five more times helps nobody.
+    #[test]
+    fn newer_mail_re_routes_a_legacy_row_to_the_carrier_it_names() {
+        let store = fixture();
+        let id = legacy_row(&store, "123456789012", 20);
+        store
+            .lock()
+            .unwrap()
+            .execute("UPDATE shipments SET carrier='usps' WHERE id=?1", [id])
+            .unwrap();
+        retire(&store, id);
+        let mut mail = delivery("123456789012", "out_for_delivery");
+        if let RecordProposal::Delivery { carrier, .. } = &mut mail.records[0] {
+            *carrier = Some("fedex".into());
+        }
+        write(&store, 2, None, &mail);
+        let (status, carrier, _, url) = row_facts(&store, id);
+        assert_eq!(
+            (status.as_str(), carrier.as_str()),
+            ("out_for_delivery", "fedex")
+        );
+        assert!(
+            url.unwrap().contains("fedex"),
+            "the tracking link follows the carrier"
+        );
+        assert_eq!(poll_failures(&store, id), 0);
+        assert!(pollable(&store, id));
+    }
+
+    /// The same revival for a row this projection DOES own.
+    #[test]
+    fn newer_mail_returns_a_silent_managed_row() {
+        let store = fixture();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
+            )
+            .unwrap();
+        write(&store, 1, None, &delivery("1Z999AA10123456784", "shipped"));
+        assert!(
+            listed(&store).is_empty(),
+            "minted from 30-day-old mail: hidden"
+        );
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456784", "out_for_delivery"),
+        );
+        assert_eq!(listed(&store).len(), 1);
     }
 
     #[test]

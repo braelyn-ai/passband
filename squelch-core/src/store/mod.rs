@@ -1165,20 +1165,16 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// `include_delivered=false` restricts to en-route (status != 'delivered').
     /// Sealed rows are structurally absent, so no sealed filter is required.
     ///
-    /// `policy` carries the three READ-SIDE hides, all of which leave the row
-    /// live in the table and all of which reverse themselves:
+    /// Two READ-SIDE hides apply, both of which leave the row live in the table
+    /// and both of which reverse themselves:
     ///
-    /// * [`suppress_failed_ambiguous_at`] hides rows whose tracking number is an
-    ///   AMBIGUOUS SHAPE (anything that does not identify its own carrier — see
-    ///   [`is_ambiguous_tracking_shape`](crate::triage::is_ambiguous_tracking_shape))
-    ///   AND which the carrier has permanently rejected that many times: a number
-    ///   no carrier will acknowledge, in a shape a retailer item/order id shares,
-    ///   is a phantom. One successful poll zeroes the counter and brings it back.
-    ///   Callers pass the carrier poller's retirement cap; 0 would hide every
-    ///   ambiguous row.
-    /// * [`stale_after_days`] hides rows whose `last_update` is older than that.
-    ///   `last_update` moves ONLY on a user-visible change, so "stale" is
-    ///   literally "nothing has happened to this package in N days". 0 disables.
+    /// * SILENCE, the rule in
+    ///   [`ShipmentListPolicy::hides`](crate::config::ShipmentListPolicy::hides),
+    ///   which the agent door applies too so the two doors list the same
+    ///   packages: `last_update` older than [`stale_after_days`] AND no carrier
+    ///   vouching for the row. `last_update` moves on newer mail about the
+    ///   package or a poll that changed something visible, never on a poll that
+    ///   merely confirms. Newer mail or a poll moves it and the row is back.
     /// * `cleared_at` hides a row the user cleared, but ONLY while
     ///   `last_update <= cleared_at`. There is no un-clear: the comparison IS the
     ///   revival, so the first update to land after the clear brings the row back
@@ -1188,7 +1184,6 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// hidden row keeps being polled, because a poll is the most likely source of
     /// the update that un-hides it.
     ///
-    /// [`suppress_failed_ambiguous_at`]: crate::config::ShipmentListPolicy::suppress_failed_ambiguous_at
     /// [`stale_after_days`]: crate::config::ShipmentListPolicy::stale_after_days
     fn list_shipments(
         &self,

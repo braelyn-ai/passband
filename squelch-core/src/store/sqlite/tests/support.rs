@@ -580,27 +580,28 @@ pub(super) fn vec_count_for(store: &SqliteStore, message_id: i64) -> i64 {
     .unwrap()
 }
 
-/// The listing policy for shipment tests that are NOT about the read-side
-/// filters: an unreachable failure cap and a disabled staleness window, so
-/// nothing is ever hidden and the filters cannot perturb a test asking about
-/// something else. The suppression, staleness and clear tests build their own.
+/// The listing policy for shipment tests that are NOT about the silence
+/// window: an unreachable retirement cap and a disabled window, so nothing is
+/// ever hidden and the filter cannot perturb a test asking about something
+/// else. The silence and clear tests build their own.
 pub(super) const KEEP_ALL_SHIPMENTS: crate::config::ShipmentListPolicy =
     crate::config::ShipmentListPolicy {
-        suppress_failed_ambiguous_at: u32::MAX,
+        retired_at_failures: u32::MAX,
         stale_after_days: 0,
     };
 
-/// [`KEEP_ALL_SHIPMENTS`] with a specific ambiguous-suppression cap, for the
-/// tests that ARE about phantom suppression.
-pub(super) fn suppress_at(cap: u32) -> crate::config::ShipmentListPolicy {
+/// [`KEEP_ALL_SHIPMENTS`] with a specific retirement cap. The window stays off,
+/// so this hides nothing by itself; it exists for tests that read the cap back
+/// or pair it with [`stale_after`].
+pub(super) fn retired_at(cap: u32) -> crate::config::ShipmentListPolicy {
     crate::config::ShipmentListPolicy {
-        suppress_failed_ambiguous_at: cap,
+        retired_at_failures: cap,
         ..KEEP_ALL_SHIPMENTS
     }
 }
 
-/// [`KEEP_ALL_SHIPMENTS`] with a staleness window, for the tests that ARE about
-/// the staleness filter.
+/// [`KEEP_ALL_SHIPMENTS`] with a silence window, for the tests that ARE about
+/// the silence filter.
 pub(super) fn stale_after(days: u32) -> crate::config::ShipmentListPolicy {
     crate::config::ShipmentListPolicy {
         stale_after_days: days,

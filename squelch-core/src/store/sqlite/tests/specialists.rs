@@ -1045,9 +1045,9 @@ fn a_new_email_revives_a_retired_shipment() {
         .upsert_message(&triaged(acct, "g1", "t1").msg())
         .unwrap();
     let t0 = Utc::now();
-    // An AMBIGUOUS shape, so this also exercises the read-side suppression the
-    // same counter drives: a retired row of this shape is invisible to both
-    // doors, not merely unpolled.
+    // An ambiguous shape, which used to drive a read-side suppression as well.
+    // Shape is no longer a listing rule: a retired row is unpolled, and unvouched
+    // for the silence window, and that is all.
     let sid = store
         .upsert_shipment(
             acct,
@@ -1066,7 +1066,7 @@ fn a_new_email_revives_a_retired_shipment() {
     );
     assert_eq!(
         store
-            .list_shipments(acct, false, suppress_at(5))
+            .list_shipments(acct, false, retired_at(5))
             .unwrap()
             .len(),
         1,
@@ -1101,7 +1101,7 @@ fn a_new_email_revives_a_retired_shipment() {
     );
     assert_eq!(
         store
-            .list_shipments(acct, false, suppress_at(5))
+            .list_shipments(acct, false, retired_at(5))
             .unwrap()
             .len(),
         1
@@ -1308,7 +1308,7 @@ fn carrier_failures_do_not_hide_either_tracking_shape() {
     fail_polls(&store, acct, phantom, 5);
     fail_polls(&store, acct, real, 5);
 
-    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
+    let listed = store.list_shipments(acct, false, retired_at(5)).unwrap();
     let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
     assert!(
         ids.contains(&real) && ids.contains(&phantom),
@@ -1348,7 +1348,7 @@ fn an_ambiguous_row_below_the_cap_still_lists() {
         .unwrap();
     fail_polls(&store, acct, sid, 4);
 
-    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
+    let listed = store.list_shipments(acct, false, retired_at(5)).unwrap();
     assert_eq!(listed.len(), 1, "cap-1 failures is not yet a phantom");
     assert_eq!(listed[0].poll_failures, 4);
 }
@@ -1371,7 +1371,7 @@ fn carrier_success_updates_facts_without_changing_visibility() {
     fail_polls(&store, acct, sid, 5);
     assert!(
         !store
-            .list_shipments(acct, false, suppress_at(5))
+            .list_shipments(acct, false, retired_at(5))
             .unwrap()
             .is_empty(),
         "failed carrier polling does not hide records"
@@ -1392,7 +1392,7 @@ fn carrier_success_updates_facts_without_changing_visibility() {
             Utc::now(),
         )
         .unwrap();
-    let listed = store.list_shipments(acct, false, suppress_at(5)).unwrap();
+    let listed = store.list_shipments(acct, false, retired_at(5)).unwrap();
     assert_eq!(listed.len(), 1, "a successful poll brings the row back");
     assert_eq!(listed[0].poll_failures, 0);
 }
@@ -1414,25 +1414,39 @@ fn aged_shipment(store: &SqliteStore, acct: AccountId, number: &str, age_days: i
         .unwrap()
 }
 
+/// The carrier's unchanged answer, for polls that must NOT move `last_update`.
+fn in_transit() -> crate::triage::CarrierTrack {
+    crate::triage::CarrierTrack {
+        status: Some(crate::triage::ShipmentStatus::Shipped),
+        carrier_status_raw: "In Transit".into(),
+        eta: None,
+        delivered_at: None,
+    }
+}
+
+fn listed_ids(store: &SqliteStore, acct: AccountId, days: u32) -> Vec<i64> {
+    store
+        .list_shipments(acct, false, stale_after(days))
+        .unwrap()
+        .iter()
+        .map(|s| s.id)
+        .collect()
+}
+
+/// Mail was the row's only source and the mail stopped: it leaves the list.
 /// `last_update` advances ONLY on a user-visible change, so "older than N days"
-/// is literally "nothing has happened to this package in N days" — which is what
-/// the timeout is for. 0 turns the whole filter off.
+/// is literally "nothing has happened to this package in N days". 0 turns the
+/// whole filter off.
 #[test]
-fn shipment_age_does_not_change_record_visibility() {
+fn a_silent_shipment_no_carrier_vouches_for_leaves_the_list() {
     let (store, acct) = store();
-    let old = aged_shipment(&store, acct, "1Z999AA10123456784", 8);
-    let recent = aged_shipment(&store, acct, "1Z999AA10123456785", 6);
+    let old = aged_shipment(&store, acct, "1Z999AA10123456784", 11);
+    let recent = aged_shipment(&store, acct, "1Z999AA10123456785", 9);
 
-    let listed = store.list_shipments(acct, false, stale_after(7)).unwrap();
-    let ids: Vec<i64> = listed.iter().map(|s| s.id).collect();
-    assert_eq!(ids, vec![recent, old], "age is not a visibility rule");
-
+    assert_eq!(listed_ids(&store, acct, 10), vec![recent]);
     assert_eq!(
-        store
-            .list_shipments(acct, false, stale_after(0))
-            .unwrap()
-            .len(),
-        2,
+        listed_ids(&store, acct, 0),
+        vec![recent, old],
         "stale_after_days = 0 disables the filter entirely"
     );
     assert_eq!(
@@ -1444,16 +1458,154 @@ fn shipment_age_does_not_change_record_visibility() {
         "and the default test policy hides nothing either"
     );
 
-    // HIDDEN IS NOT RETIRED: the stale row is still in the poll queue, because a
-    // poll is exactly what would bring it back.
+    // HIDDEN IS NOT RETIRED: the silent row is still in the poll queue, because
+    // a poll is exactly what would bring it back.
     assert!(
         store
             .list_pollable_shipments(acct, Utc::now() - chrono::Duration::days(45), 5)
             .unwrap()
             .iter()
             .any(|s| s.id == old),
-        "a stale row keeps being polled"
+        "a silent row keeps being polled"
     );
+}
+
+/// AGE ALONE HIDES NOTHING. A package a carrier is still answering for stays
+/// listed however long it sits; each way the carrier can stop vouching hides it.
+#[test]
+fn a_carrier_vouching_for_a_silent_shipment_keeps_it_listed() {
+    let (store, acct) = store();
+    let long_ago = Utc::now() - chrono::Duration::days(12);
+    let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 12);
+
+    // The carrier answered once, long ago, and was never asked again (a removed
+    // key, or a row aged past `max_age_days`). That is not tracking.
+    store
+        .apply_carrier_track(acct, sid, &in_transit(), long_ago)
+        .unwrap();
+    assert!(
+        listed_ids(&store, acct, 10).is_empty(),
+        "an answer nobody has refreshed inside the window vouches for nothing"
+    );
+
+    // The same answer again, today: no visible change, so `last_update` stays 12
+    // days old, but the carrier is demonstrably still tracking the package.
+    store
+        .apply_carrier_track(acct, sid, &in_transit(), Utc::now())
+        .unwrap();
+    let listed = store.list_shipments(acct, false, stale_after(10)).unwrap();
+    assert_eq!(listed.len(), 1, "a live carrier answer keeps the row");
+    assert!(
+        listed[0].last_update < Utc::now() - chrono::Duration::days(10),
+        "and it did so without the confirming poll touching last_update"
+    );
+
+    // ATTEMPTS ARE NOT ANSWERS. A run of transient errors stamps the attempt
+    // clock every six hours while the last real answer recedes past the
+    // window; the vouching must recede with it, or a dead number stays listed
+    // on an answer the carrier has not repeated in weeks.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE shipments SET last_answered_at=?1 WHERE id=?2",
+            params![(Utc::now() - chrono::Duration::days(11)).to_rfc3339(), sid],
+        )
+        .unwrap();
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), false)
+        .unwrap();
+    assert!(
+        listed_ids(&store, acct, 10).is_empty(),
+        "a fresh attempt on an old answer vouches for nothing"
+    );
+    store
+        .apply_carrier_track(acct, sid, &in_transit(), Utc::now())
+        .unwrap();
+    assert_eq!(
+        listed_ids(&store, acct, 10),
+        vec![sid],
+        "a fresh answer does"
+    );
+
+    // The carrier stops vouching at the poller's RETIREMENT CAP, not before.
+    let retire_at_2 = crate::config::ShipmentListPolicy {
+        retired_at_failures: 2,
+        ..stale_after(10)
+    };
+    let listed = |store: &SqliteStore| store.list_shipments(acct, false, retire_at_2).unwrap();
+
+    // A transient failure is not the carrier disowning the number.
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), false)
+        .unwrap();
+    assert_eq!(listed(&store).len(), 1);
+
+    // Nor is one counted rejection: a carrier that answers again next pass had
+    // a blip, and the parcel must not blink off the list for it.
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), true)
+        .unwrap();
+    assert_eq!(listed(&store).len(), 1, "under the cap is still vouched");
+
+    // At the cap the row is retired, nobody will ask again, tracking is over.
+    store
+        .record_poll_outcome(acct, sid, Utc::now(), true)
+        .unwrap();
+    assert!(
+        listed(&store).is_empty(),
+        "a number the carrier rejected into retirement is no longer vouched for"
+    );
+}
+
+/// The window applies to delivered rows too, which is the only way the Mac
+/// client ever asks (`include_delivered=true`): nothing polls a delivered
+/// package, so it leaves one window after it landed.
+#[test]
+fn a_delivered_shipment_goes_silent_like_any_other() {
+    use crate::triage::ShipmentStatus;
+    let (store, acct) = store();
+    for (number, gmail, age) in [
+        ("1Z999AA10123456784", "g-old", 11),
+        ("1Z999AA10123456785", "g-new", 1),
+    ] {
+        let mid = store
+            .upsert_message(&triaged(acct, gmail, "t-delivered").msg())
+            .unwrap();
+        store
+            .upsert_shipment(
+                acct,
+                mid,
+                &shipped("ups", number, ShipmentStatus::Delivered),
+                Utc::now() - chrono::Duration::days(age),
+            )
+            .unwrap();
+    }
+    let listed = store.list_shipments(acct, true, stale_after(10)).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].tracking_number, "1Z999AA10123456785");
+}
+
+/// Cleared and silent are independent: news revives a silent row, but it has to
+/// be news SINCE THE CLEAR to beat that too.
+#[test]
+fn a_clear_still_hides_a_row_the_window_would_show() {
+    let (store, acct) = store();
+    let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 2);
+    assert_eq!(listed_ids(&store, acct, 10), vec![sid]);
+    store.clear_shipment(acct, sid, Utc::now()).unwrap();
+    assert!(listed_ids(&store, acct, 10).is_empty());
+}
+
+/// An operator writing an absurd window to mean "never hide" must get exactly
+/// that. The subtraction overflows chrono, and a panic there used to happen
+/// with the store guard alive, poisoning the mutex for every later caller.
+#[test]
+fn an_absurd_window_hides_nothing_and_does_not_poison_the_store() {
+    let (store, acct) = store();
+    let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 400);
+    assert_eq!(listed_ids(&store, acct, u32::MAX), vec![sid]);
+    assert_eq!(listed_ids(&store, acct, u32::MAX), vec![sid], "and again");
 }
 
 /// The clear, and the whole revival design: there is no un-clear call anywhere in

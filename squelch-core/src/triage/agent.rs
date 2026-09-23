@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PROMPT_VERSION: &str = "agent-triage-v1";
+pub const PROMPT_VERSION: &str = "agent-triage-v2";
 const SYSTEM: &str = include_str!("prompts/agent-v1.txt");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
@@ -131,7 +131,7 @@ async fn run_bounded(
         // Retain provider usage before decoding either JSON syntax or step
         // structure. A malformed paid answer still belongs in the spend ledger.
         *model_calls += 1;
-        let response = llm::classify_llm(
+        let response = llm::classify_agent_step(
             connection.http,
             connection.url,
             connection.api_key,
@@ -733,7 +733,7 @@ pub fn decision_schema() -> Value {
                 "authentication_security",
             ])),
         ),
-        ("destinations", array(enumeration(&["reading", "records"]))),
+        ("destinations", array(enumeration(&["reading"]))),
         ("summary", text()),
         ("reason", text()),
         (
@@ -785,6 +785,7 @@ pub fn decision_schema() -> Value {
             object(vec![
                 ("importance", integer()),
                 ("title", text()),
+                ("login_code", super::login_code::schema()),
                 ("body", text()),
                 ("reason", text()),
             ]),

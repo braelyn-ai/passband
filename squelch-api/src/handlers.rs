@@ -1478,11 +1478,10 @@ pub async fn get_shipments(
     // mail, and hand-sealing a message deletes the shipment row it fed
     // (correct_triage), so there is no sealed filtering to apply.
     //
-    // The operator's `[carriers]` policy decides the rest: phantom digit-runs the
-    // carrier keeps rejecting, rows nothing has happened to for `stale_after_days`,
-    // and rows the user cleared. Every one of those is a READ-SIDE hide — the rows
-    // stay in the store, keep being polled, and come back on their own the moment
-    // an update lands. The AGENT DOOR carries the same policy value.
+    // The operator's `[carriers]` policy decides the rest: rows that have been
+    // silent for `stale_after_days` with no carrier vouching for them, and rows
+    // the user cleared. Both are READ-SIDE hides — the rows stay in the store,
+    // keep being polled, and come back on their own the moment an update lands.
     let policy = state.shipment_policy;
     query(&state, move |store, account_id| {
         store.list_shipments(account_id, q.include_delivered, policy)

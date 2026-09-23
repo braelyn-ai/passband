@@ -590,13 +590,15 @@ pub struct CarriersConfig {
     /// Consecutive per-shipment API failures tolerated before it is dropped.
     /// Env: `SQUELCH_CARRIERS_MAX_FAILURES`.
     pub max_failures: u32,
-    /// Hide a shipment from BOTH DOORS' LISTINGS once nothing user-visible has
-    /// changed about it for this many days. A LISTING concern, like
-    /// [`CarriersConfig::max_failures`], which is why it lives here rather than
-    /// in its own table: the same `[carriers]` block already decides when a row
-    /// stops being shown.
+    /// Hide a shipment from the human door's listing once nothing user-visible
+    /// has changed about it for this many days AND no carrier is vouching for
+    /// it (never polled, permanently rejected, or no longer being asked about).
+    /// A package a carrier is still answering for is never hidden for age. A
+    /// LISTING concern, like [`CarriersConfig::max_failures`], which is why it
+    /// lives here rather than in its own table: the same `[carriers]` block
+    /// already decides when a row stops being shown.
     ///
-    /// `0` DISABLES the filter entirely (nothing is ever hidden for age).
+    /// `0` DISABLES the filter entirely (nothing is ever hidden for silence).
     /// Env: `SQUELCH_CARRIERS_STALE_AFTER_DAYS`.
     pub stale_after_days: u32,
     /// `[carriers.ups]`. `None` (or half a pair) => UPS is never polled.
@@ -616,7 +618,7 @@ impl Default for CarriersConfig {
             ofd_poll_interval_mins: 60,
             max_age_days: 45,
             max_failures: 5,
-            stale_after_days: 7,
+            stale_after_days: 10,
             ups: None,
             fedex: None,
             usps: None,
@@ -640,7 +642,7 @@ impl CarriersConfig {
     /// The listing half of this block, as the value both doors carry.
     pub fn list_policy(&self) -> ShipmentListPolicy {
         ShipmentListPolicy {
-            suppress_failed_ambiguous_at: self.max_failures,
+            retired_at_failures: self.max_failures,
             stale_after_days: self.stale_after_days,
         }
     }
@@ -656,12 +658,76 @@ impl CarriersConfig {
 /// [`Store::list_shipments`](crate::store::Store::list_shipments).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShipmentListPolicy {
-    /// Permanent poll failures after which an AMBIGUOUS-shaped tracking number
-    /// is treated as a phantom and hidden. From `[carriers] max_failures`.
-    pub suppress_failed_ambiguous_at: u32,
-    /// Days without a user-visible change after which a row is hidden as stale.
-    /// `0` disables the staleness filter. From `[carriers] stale_after_days`.
+    /// Permanent poll failures at which the poller retires a row, and so the
+    /// point past which its carrier no longer vouches for it in the listing.
+    /// Shape is no part of it. From `[carriers] max_failures`.
+    pub retired_at_failures: u32,
+    /// Days without a user-visible change after which a row NO CARRIER IS
+    /// VOUCHING FOR is hidden. `0` disables the filter. From `[carriers]
+    /// stale_after_days`.
     pub stale_after_days: u32,
+}
+
+impl ShipmentListPolicy {
+    /// Resolve the policy against the clock, ONCE per request, into the value
+    /// both doors judge every row by. `None` when the window is off, or too
+    /// large for chrono to represent (an operator writing an enormous number
+    /// to mean "never" gets exactly that rather than an overflow).
+    pub fn silence(&self, now: chrono::DateTime<chrono::Utc>) -> Option<Silence> {
+        if self.stale_after_days == 0 {
+            return None;
+        }
+        let cutoff = chrono::Duration::try_days(self.stale_after_days as i64)
+            .and_then(|window| now.checked_sub_signed(window))?;
+        Some(Silence {
+            cutoff,
+            retired_at_failures: self.retired_at_failures,
+        })
+    }
+}
+
+/// THE ONE SILENCE RULE, shared by both doors so they cannot disagree about
+/// which packages exist. A package is hidden when nothing has happened to it
+/// since `cutoff` AND no carrier is vouching for it.
+///
+/// A carrier vouches while its last ANSWER for the number (`last_answered_at`,
+/// which a mere attempt never moves) is inside the window and it has not since
+/// rejected the number into retirement (`poll_failures` under
+/// `retired_at_failures`; the cap rather than zero, because one counted
+/// rejection from a carrier that answers again six hours later is a blip and
+/// must not blink the parcel off the list). So a row with no pollable number,
+/// no configured key, a retired number, one whose answers stopped coming, or
+/// one polling has aged past `[carriers] max_age_days` all count as unvouched.
+///
+/// AGE ALONE HIDES NOTHING: a package a carrier is still answering for stays
+/// listed however long it sits, because that silence is the carrier's word
+/// rather than our ignorance. Shape is no part of any of this; it is evidence
+/// for the agent, never a listing rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Silence {
+    /// Nothing seen since this instant is silence.
+    pub cutoff: chrono::DateTime<chrono::Utc>,
+    /// The poller's retirement cap, past which a carrier no longer vouches.
+    pub retired_at_failures: u32,
+}
+
+impl Silence {
+    /// `last_seen` is the newest thing known about the package; `observation`
+    /// is its carrier row, if it has one.
+    pub fn hides(
+        &self,
+        last_seen: chrono::DateTime<chrono::Utc>,
+        observation: Option<&crate::types::Shipment>,
+    ) -> bool {
+        if last_seen >= self.cutoff {
+            return false;
+        }
+        let vouched = observation.is_some_and(|s| {
+            s.last_answered_at.is_some_and(|at| at >= self.cutoff)
+                && s.poll_failures < self.retired_at_failures
+        });
+        !vouched
+    }
 }
 
 impl Default for ShipmentListPolicy {
@@ -3721,7 +3787,7 @@ backfill_days = 90
         assert_eq!(c.carriers.ofd_poll_interval_mins, 60);
         assert_eq!(c.carriers.max_age_days, 45);
         assert_eq!(c.carriers.max_failures, 5);
-        assert_eq!(c.carriers.stale_after_days, 7);
+        assert_eq!(c.carriers.stale_after_days, 10);
 
         // A config predating the feature has no [carriers] table whatsoever.
         let cfg: Config = toml::from_str("squelch_level = 1\n").unwrap();
@@ -3738,11 +3804,8 @@ backfill_days = 90
             ShipmentListPolicy::default(),
             CarriersConfig::default().list_policy()
         );
-        assert_eq!(ShipmentListPolicy::default().stale_after_days, 7);
-        assert_eq!(
-            ShipmentListPolicy::default().suppress_failed_ambiguous_at,
-            5
-        );
+        assert_eq!(ShipmentListPolicy::default().stale_after_days, 10);
+        assert_eq!(ShipmentListPolicy::default().retired_at_failures, 5);
 
         let carriers = CarriersConfig {
             max_failures: 2,
@@ -3750,7 +3813,7 @@ backfill_days = 90
             ..CarriersConfig::default()
         };
         let policy = ShipmentListPolicy::from(&carriers);
-        assert_eq!(policy.suppress_failed_ambiguous_at, 2);
+        assert_eq!(policy.retired_at_failures, 2);
         assert_eq!(
             policy.stale_after_days, 0,
             "0 is a real value (the filter off), never a fallback to the default"

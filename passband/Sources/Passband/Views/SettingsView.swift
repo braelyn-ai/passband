@@ -1024,7 +1024,7 @@ struct ReadTrackingSection: View {
 struct TriagePipelineSection: View {
     var body: some View {
         SectionCard(label: "How triage works") {
-            SettingsHint("Notifications arrive quickly. Triage then reads the context and decides what belongs in For your eyes, Reading, and Records. An email can belong in more than one place.")
+            SettingsHint("Notifications arrive quickly. Triage then reads the context and decides what needs your attention or belongs in Reading, and extracts Calendar, Shipping, Billing, and Receipt records. An email can belong in more than one place.")
             SettingsHint("Your sender preferences guide those decisions. Exceptional messages can still surface when they deserve your attention.")
             SettingsHint("Authentication mail always qualifies for a notification. Codes and sign-in or reset links stay private from connected agents.")
         }
