@@ -226,7 +226,6 @@ struct SitrepView: View {
     /// The records zones as the pinned rail shows them: full-width rows.
     @ViewBuilder
     private var railZones: some View {
-        AgentRecordsZone()
         CalendarZone().tourTarget(.calendar)
         ShipmentsZone().tourTarget(.shipments)
         BankingZone().tourTarget(.banking)
@@ -240,7 +239,6 @@ struct SitrepView: View {
     private var railCards: some View {
         HStack(alignment: .top, spacing: 16) {
             VStack(spacing: 16) {
-                AgentRecordsZone()
                 CalendarZone().tourTarget(.calendar)
                 BankingZone().tourTarget(.banking)
             }

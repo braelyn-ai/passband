@@ -131,7 +131,7 @@ async fn run_bounded(
         // Retain provider usage before decoding either JSON syntax or step
         // structure. A malformed paid answer still belongs in the spend ledger.
         *model_calls += 1;
-        let response = llm::classify_llm(
+        let response = llm::classify_agent_step(
             connection.http,
             connection.url,
             connection.api_key,
@@ -733,7 +733,7 @@ pub fn decision_schema() -> Value {
                 "authentication_security",
             ])),
         ),
-        ("destinations", array(enumeration(&["reading", "records"]))),
+        ("destinations", array(enumeration(&["reading"]))),
         ("summary", text()),
         ("reason", text()),
         (

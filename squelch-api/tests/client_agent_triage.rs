@@ -29,7 +29,7 @@ fn assess(h: &Harness, id: i64, restricted: bool) {
     }];
     let decision = MessageDecision {
         kinds: vec![EmailKind::Receipt],
-        destinations: vec![MessageDestination::Reading, MessageDestination::Records],
+        destinations: vec![MessageDestination::Reading],
         summary: "A receipt".into(),
         reason: "Keep the record".into(),
         external_access: AccessAssessment {

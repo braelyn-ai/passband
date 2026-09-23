@@ -114,7 +114,6 @@ final class Notifier {
         let copy = EventBanner.copy(for: event)
         let content = UNMutableNotificationContent()
         content.title = copy.title
-        if !copy.subtitle.isEmpty { content.subtitle = copy.subtitle }
         content.body = copy.body
         // The coalescing group, NAMESPACED BY ACCOUNT. Thread ids come from the
         // daemon (and the fallback is built from an event id), so two accounts

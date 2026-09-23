@@ -4,10 +4,11 @@ import Foundation
 struct TriageTargetsTests {
     static func main() throws {
         let reading = TriageTargets.all.first { $0.axis == .destinations && $0.value == "reading" && !$0.removes }!
-        precondition(reading.correctedValues(["records"]) == ["records", "reading"])
-        precondition(reading.correctedValues(["reading", "records"]) == ["reading", "records"])
+        precondition(reading.correctedValues([]) == ["reading"])
+        precondition(reading.correctedValues(["reading"]) == ["reading"])
         let remove = TriageTargets.all.first { $0.axis == .destinations && $0.value == "reading" && $0.removes }!
-        precondition(remove.correctedValues(["reading", "records"]) == ["records"])
+        precondition(remove.correctedValues(["reading"]) == [])
+        precondition(!TriageTargets.all.contains { $0.axis == .destinations && $0.value == "records" })
         let bill = TriageTargets.match("bill").first!
         precondition(bill.axis == .kinds && !bill.removes)
         precondition(bill.correctedValues(["receipt"]) == ["receipt", "bill"])

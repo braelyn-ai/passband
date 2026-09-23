@@ -8,46 +8,56 @@ import SwiftUI
 
 // MARK: - calendar
 
-/// Calendar mail from the last 24h (server window). Records ordered by arrival,
-/// not an agenda; cancellations strike through.
+/// Upcoming calendar records, retained for 24 hours after their first viewing.
 struct CalendarZone: View {
     @Environment(AppStore.self) private var store
-    private var rows: [CalendarUpdate] { store.zones.calendar }
+    private var accountScope: String {
+        RehearsalMode.isEnabled ? "practice" : AccountManager.shared.activeId?.uuidString ?? "disconnected"
+    }
 
     var body: some View {
-        ZoneCard(
-            symbol: "calendar", title: "Calendar", count: rows.count, tint: Palette.accent
-        ) {
-            if rows.isEmpty {
-                EmptyNote("No calendar updates.")
-            } else {
-                VStack(spacing: 1) {
-                    ForEach(rows) { c in
-                        Button {
-                            store.openRecord(thread: c.thread_id, message: c.message_id)
-                        } label: {
-                            HStack(spacing: 7) {
-                                Text(c.event_title ?? c.organizer ?? "calendar event")
-                                    .font(Typo.rowSub)
-                                    .foregroundStyle(Palette.inkDim)
-                                    .strikethrough(c.kind == .cancellation)
-                                    .lineLimit(1)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                if let tag = c.kind.tag {
-                                    Chip(text: tag, tone: tagTone(c.kind))
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            let rows = store.zones.calendar.filter {
+                CalendarVisibility.shared.admits(
+                    account: accountScope, item: $0.id, start: Fmt.date($0.starts_at),
+                    allDay: $0.starts_at?.count == 10, now: context.date)
+            }
+            ZoneCard(
+                symbol: "calendar", title: "Calendar", count: rows.count, tint: Palette.accent
+            ) {
+                if rows.isEmpty {
+                    EmptyNote("No calendar updates.")
+                } else {
+                    VStack(spacing: 1) {
+                        ForEach(rows) { c in
+                            Button {
+                                store.openRecord(thread: c.thread_id, message: c.message_id)
+                            } label: {
+                                HStack(spacing: 7) {
+                                    Text(c.event_title ?? c.organizer ?? "calendar event")
+                                        .font(Typo.rowSub)
+                                        .foregroundStyle(Palette.inkDim)
+                                        .strikethrough(c.kind == .cancellation)
+                                        .lineLimit(1)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    if let tag = c.kind.tag {
+                                        Chip(text: tag, tone: tagTone(c.kind))
+                                    }
+                                    Text(when(c))
+                                        .font(Typo.num(10))
+                                        .foregroundStyle(Palette.inkFaintest)
                                 }
-                                Text(when(c))
-                                    .font(Typo.num(10))
-                                    .foregroundStyle(Palette.inkFaintest)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 5)
+                                .contentShape(Rectangle())
                             }
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 5)
-                            .contentShape(Rectangle())
+                            .buttonStyle(RecordRowStyle())
+                            .modifier(CalendarSeenMarker(account: accountScope, item: c.id))
                         }
-                        .buttonStyle(RecordRowStyle())
                     }
                 }
             }
+            .id(accountScope)
         }
         .task { await store.refreshZones() }
     }
@@ -59,6 +69,28 @@ struct CalendarZone: View {
     private func when(_ c: CalendarUpdate) -> String {
         guard c.starts_at != nil else { return "" }
         return Fmt.isToday(c.starts_at) ? Fmt.timeOfDay(c.starts_at) : Fmt.shortDate(c.starts_at)
+    }
+}
+
+/// Only an on-screen row in the active app starts its retention clock.
+private struct CalendarSeenMarker: ViewModifier {
+    let account: String
+    let item: Int
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var visible = false
+
+    func body(content: Content) -> some View {
+        content
+            .onScrollVisibilityChange(threshold: 0.5) { showing in
+                visible = showing
+                markSeen()
+            }
+            .onChange(of: scenePhase) { _, _ in markSeen() }
+    }
+
+    private func markSeen() {
+        guard visible, scenePhase == .active else { return }
+        CalendarVisibility.shared.markSeen(account: account, item: item)
     }
 }
 
@@ -345,11 +377,11 @@ struct BankingZone: View {
         let inWindow = records.filter { window.admits(Fmt.date($0.received_at)) }
         let rows = expanded ? inWindow : Array(inWindow.prefix(Self.collapsed))
         ZoneCard(
-            symbol: "building.columns", title: "Banking", count: inWindow.count,
+            symbol: "building.columns", title: "Billing", count: inWindow.count,
             tint: Palette.accentInk
         ) {
             if inWindow.isEmpty {
-                EmptyNote("No new statements or alerts.")
+                EmptyNote("No new bills, statements, or alerts.")
             } else {
                 VStack(spacing: 1) {
                     ForEach(rows) { r in
@@ -363,6 +395,12 @@ struct BankingZone: View {
                                     .lineLimit(1)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                 Chip(text: r.kind.tag, tone: Palette.inkFaintest)
+                                if r.autopay == true {
+                                    Chip(text: "autopay", tone: Palette.inkFaintest)
+                                }
+                                if let due = Fmt.deadlineChip(r.due) {
+                                    Chip(text: due.text, tone: due.overdue ? Palette.danger : Palette.inkFaintest)
+                                }
                                 if r.amount != nil {
                                     Text(Fmt.usd(r.amount, currency: r.currency))
                                         .font(Typo.num(11, weight: .medium))
@@ -862,53 +900,5 @@ struct RecordRowStyle: ButtonStyle {
             )
             .opacity(configuration.isPressed ? 0.7 : 1)
             .onHover { hovering = $0 }
-    }
-}
-
-
-
-/// Generic records remain readable even when no specialist card exists yet.
-/// Membership comes from the agent's Records destination, independently of FYE.
-struct AgentRecordsZone: View {
-    @Environment(AppStore.self) private var store
-
-    var body: some View {
-        ZoneCard(symbol: "tray.full", title: "Records", count: store.zones.records.count) {
-            if store.zones.records.isEmpty {
-                EmptyNote("Receipts, bills, deliveries, and other records appear here.")
-            } else {
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(store.zones.records.prefix(20)) { item in
-                        Button {
-                            store.openThread(item.thread_id, queue: store.zones.records,
-                                focusMessage: item.id)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(item.senderString).font(Typo.rowSub).foregroundStyle(Palette.ink)
-                                Text(item.one_line).font(Typo.micro).foregroundStyle(Palette.inkDim)
-                                    .lineLimit(2)
-                                ForEach(Array((store.zones.recordFacts[item.id] ?? []).enumerated()), id: \.offset) { _, record in
-                                    if record.kind == "bill" {
-                                        HStack {
-                                            if let merchant = record.merchant { Text(merchant) }
-                                            if record.amount != nil { Text(Fmt.usd(record.amount, currency: record.currency)) }
-                                            if record.autopay == true { Text("autopay") }
-                                        }
-                                        .font(Typo.micro).foregroundStyle(Palette.ink)
-                                        if let due = Fmt.deadlineChip(record.due?.value) {
-                                            Text(due.text).font(Typo.micro)
-                                                .foregroundStyle(due.overdue ? Palette.danger : Palette.inkDim)
-                                        }
-                                    }
-                                }
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
     }
 }

@@ -139,10 +139,11 @@ ofd_poll_interval_mins = 60
 max_age_days = 45
 # Consecutive permanent failures before a package is retired.
 max_failures = 5
-# Drop a package off both doors' listings after this many days with no news
-# about it at all. 0 disables the filter. A LISTING knob, like max_failures,
-# which is why it lives here rather than in a table of its own.
-stale_after_days = 7
+# Drop a package off the list after this many days with no news about it at
+# all, UNLESS a carrier is still answering for it. 0 disables the filter. A
+# LISTING knob, like max_failures, which is why it lives here rather than in a
+# table of its own.
+stale_after_days = 10
 
 # Each block below is optional, and its presence is what enables that carrier.
 [carriers.ups]
@@ -171,9 +172,10 @@ it holds on a daemon that polls no carrier at all.
 `poll_interval_hours = 0` or `ofd_poll_interval_mins = 0` is floored to 1 with a
 warning on stderr, because a zero interval is a spin loop against somebody else's
 rate-limited API. `max_failures = 0` is accepted and is a footgun: it makes
-nothing pollable at all and hides every ambiguous row from the listing (see
-[Retirement](#retirement-and-suppression)). `stale_after_days = 0` is the
-opposite: it is the documented way to turn the staleness filter off.
+nothing pollable at all (see [Retirement](#retirement-and-suppression)), and a
+row nothing polls is a row no carrier vouches for, so every package then goes
+quiet on the mail-only schedule. `stale_after_days = 0` is the opposite: it is
+the documented way to turn the silence filter off.
 
 ### The environment equivalents
 
@@ -265,16 +267,19 @@ the number's and never count. Transport errors do not count either, but they do
 stamp the attempt, so one unanswerable number cannot hold the front of the queue
 and starve every other package behind it.
 
-At `max_failures` counted rejections the row leaves the pollable set. It also
-disappears from `GET /client/shipments` and from the agent door's
-`get_shipments`, but only if its tracking number is *ambiguous*, meaning it does
-not identify its own carrier: a number in a shape a retailer item id shares, that
-no carrier will acknowledge, was probably never a tracking number. A `1Z…`,
-`TBA…` or IMpb row is never hidden however badly it polls.
+At `max_failures` counted rejections the row leaves the pollable set. Retirement
+does not by itself take the row off `GET /client/shipments`: the shape of a
+tracking number is evidence for the triage agent, not a listing rule, and the
+old "ambiguous digit-run" suppression is gone. What a retired number does lose
+is its carrier's backing, so it goes quiet on the schedule described next.
 
-Retirement is not permanent. The rows stay in the database, the listing filter is
-read-side only, and either a successful poll or a new email that the state
-machine accepts clears the counter and brings the package back.
+Retirement is not permanent. The row stays in the database, and newer mail
+about the package (mail the agent records as a delivery for that tracking
+number, received after the row's last update) zeroes the counter and puts the
+number back in the poll queue: five "not found" answers were about a label the
+shipper had not handed over yet, and the fresh mail is the evidence it is real
+now. Re-deciding old mail resets nothing. A successful poll also zeroes the
+counter, but a retired row does not get one, so mail is the way back.
 
 ### Going quiet, and being told to go away
 
@@ -282,14 +287,65 @@ Two more things take a package off the list, and they work the same way
 retirement does: nothing is deleted, nothing stops being polled, and the row
 comes back on its own.
 
-**Staleness.** A row nothing has happened to for `stale_after_days` (default 7)
-drops off both doors' listings. "Nothing has happened" is precise here rather
-than approximate: a shipment's `last_update` only ever moves when something the
-user can see changes, which is its status, its ETA, or the carrier's own status
-string. A poll that confirms what the row already said does not move it. So the
-window is genuinely "seven days without news", not "seven days since we last
-looked". Set `stale_after_days = 0` to switch the filter off entirely and keep
-every package on the list forever.
+**Silence.** A row nothing has happened to for `stale_after_days` (default 10)
+drops off both doors, `GET /client/shipments` and the agent door's
+`get_shipments`, *unless a carrier is vouching for it*.
+"Nothing has happened" is precise here rather than approximate. Two things move
+a shipment's `last_update`: newer mail about the package (any mail the agent
+reads as a delivery record for that tracking number, including a reminder that
+says nothing new), and a poll that changes something the user can see, which is
+its status, its ETA, or the carrier's own status string. A poll that confirms
+what the row already said does not move it. So the window is genuinely "ten days
+without news", not "ten days since we last looked".
+
+A carrier vouches for a row while both of these hold:
+
+| Test | Column | What failing it means |
+|---|---|---|
+| it has *answered* for this number inside the window | `last_answered_at` is at or after the cutoff | no tracking (Amazon, an unknown carrier, no key configured, a number the carrier never recognised), nobody asking any more (the key was removed, or the row aged past `max_age_days`), or the answers stopped coming (a body that no longer parses, a run of transient errors) |
+| it has not rejected the number into retirement since | `poll_failures` is under `max_failures` | tracking stopped working. One counted rejection is a blip and changes nothing; at the cap the row is retired and nobody asks again |
+
+`last_answered_at` is the carrier's *answer* clock and only a returned track
+moves it. `last_polled_at` is the *attempt* clock, stamped on every try so the
+poll queue rotates, and it is deliberately not what vouching reads: a number
+whose carrier has not actually answered in three weeks is not being tracked,
+however often we ask.
+
+So age alone hides nothing. A parcel that really has sat in a depot for three
+weeks stays on the list for as long as the carrier keeps saying so, because that
+silence is the carrier's word rather than our ignorance. What goes is the row
+whose only source was mail, once the mail stops: the order that never sent a
+delivery notice, the Amazon package, everything on a daemon with no carrier keys.
+The last test is also the backstop. Polling ends at `max_age_days` (45), so even
+a row the carrier never closes out leaves about ten days after that. One honest
+edge: a daemon that could not poll at all for a whole window (asleep, or a
+credential outage) gets no answers, so it hides its long-sitting parcels until
+the first pass that succeeds.
+
+Mail brings a silent row back the same way for every row, including the ones
+written before the triage agent owned deliveries: newer mail naming the tracking
+number becomes the row's click target, sets its carrier (so an un-retired poll
+goes to the carrier the mail names), moves `last_update` and un-retires the
+number (see [Retirement](#retirement-and-suppression)). Only mail *newer than
+the row* counts, so re-triaging an old mailbox does not refill the list. The
+status is the one place the two kinds of row differ: a row the agent owns takes
+the newest proposal's status, because a retraction has to be able to walk it
+back; a row written before the agent owned deliveries goes through the
+no-regress merge, so a delivered package is never walked back to "shipped" by a
+re-ship notice or a survey the model misread. One limit for both: the agent has
+to name a carrier and a status it recognises. A follow-up it reads as
+carrier-unknown or status-unknown is not a delivery record and revives nothing,
+on either door.
+
+Set `stale_after_days = 0` to switch the filter off entirely and keep every
+package on the list forever.
+
+**Both doors apply the same rule**, `ShipmentListPolicy::hides`, and the daemon
+hands both the same policy value. The agent door builds its list from the
+agent's delivery records decorated with carrier rows; a record hit with a
+carrier row is aged by *that row's* `last_update`, which already holds every
+mail the reconcile accepted, and is vouched for by the same row the human door
+sees. A package is on both lists or on neither.
 
 **A user clear.** `POST /client/shipments/{id}/clear` is the "I do not need to
 see this any more" button. It stamps the row and hides it, and that is all it
@@ -306,15 +362,15 @@ is fine and simply restamps it. An id this account does not have is a 404.
 
 **Both hidings undo themselves, and there is no un-clear endpoint on purpose.**
 A cleared row is hidden only for as long as it has not moved since you cleared
-it; a stale row is hidden only for as long as it stays silent. The instant
-anything advances the package (a carrier poll that finds it has moved, or a new
-email about it that the state machine accepts), it is back on the list with no
+it; a silent row is hidden only for as long as it stays silent. The instant
+anything advances the package (a carrier poll that finds it has moved, or newer
+mail about it that the agent records as a delivery), it is back on the list with no
 second call from anybody. That is why the two hidings are a comparison at read
 time rather than a flag: there is no state to get stuck in.
 
 **The rows keep being polled the whole time.** This is the part worth stating
 plainly, because it looks like an obvious thing to optimise away and is not:
-cleared packages and stale packages stay in the poll queue exactly as before.
+cleared packages and silent packages stay in the poll queue exactly as before.
 The poll is what produces the update that brings them back. Filtering them out of
 the queue would make "hidden" mean "hidden forever", which is the opposite of the
 design.

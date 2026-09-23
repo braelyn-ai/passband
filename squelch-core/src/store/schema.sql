@@ -399,6 +399,14 @@ CREATE TABLE IF NOT EXISTS shipments (
     -- `last_update` past this stamp the row returns by itself. The row keeps
     -- being polled the whole time — polling is what produces that update.
     cleared_at      TEXT,
+    -- THE CARRIER'S ANSWER CLOCK (RFC3339, NULL = never answered): the last
+    -- poll the carrier actually answered for this number, written only by
+    -- `apply_carrier_track`. `last_polled_at` is the ATTEMPT clock and stamps
+    -- on every try, answered or not, because the poll queue rotates on it. The
+    -- listing's "a carrier is vouching for this row" reads THIS one, so a
+    -- number whose answers stopped (transient errors, an unparseable body) is
+    -- vouched for only as long as its last real answer is inside the window.
+    last_answered_at TEXT,
     UNIQUE(account_id, tracking_number)
 );
 
@@ -1380,7 +1388,7 @@ CREATE TABLE IF NOT EXISTS agent_message_decisions (
 CREATE TABLE IF NOT EXISTS agent_message_destinations (
     account_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
-    destination TEXT NOT NULL CHECK(destination IN ('reading','records')),
+    destination TEXT NOT NULL CHECK(destination = 'reading'),
     PRIMARY KEY(account_id,message_id,destination)
 );
 CREATE TABLE IF NOT EXISTS agent_thread_attention (

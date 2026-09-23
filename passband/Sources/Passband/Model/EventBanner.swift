@@ -95,7 +95,6 @@ enum EventBanner {
     /// The display copy for one event. Pure: same event in, same banner out.
     struct Copy: Equatable {
         var title: String
-        var subtitle: String
         var body: String
         var threadIdentifier: String
         var sound: Bool
@@ -121,32 +120,21 @@ enum EventBanner {
         if event.kind == .opened {
             return Copy(
                 title: "Opened",
-                subtitle: "",
                 body: summary.isEmpty ? "Someone opened your email." : "Opened: \(summary)",
                 threadIdentifier: group,
                 // News, not an obligation — no chime.
                 sound: false)
         }
 
-        let subtitle: String
-        switch event.kind {
-        // The time-bound kinds get a second line saying WHY the banner is worth
-        // the interruption, but NOT the date. The event's deadline is a
-        // snapshot taken at triage, and a banner sits on a lock screen for
-        // hours: "due today" read tomorrow morning is wrong, and "2d PAST DUE"
-        // on mail the human already handled is a nag. The thread has the live
-        // chip; the banner says only that there is one.
-        case .urgent: subtitle = "needs attention"
-        case .deadline: subtitle = "has a deadline"
-        // No second line for the ordinary case: a subtitle on every
-        // notification is a subtitle that means nothing. `.opened` returned
-        // above and is listed only to keep this switch exhaustive.
-        case .surfaced, .opened: subtitle = ""
-        }
-
+        // NO second line, for any kind. Banners used to say "needs attention"
+        // on urgent mail and "has a deadline" on dated mail, and a banner that
+        // opens by telling the human they are behind is one they flinch away
+        // from rather than tap. The date was never there either: the event's
+        // deadline is a snapshot taken at triage, and a banner sits on a lock
+        // screen for hours. The sender, the summary, and the chime carry all
+        // the weight; the thread has the live chip.
         return Copy(
             title: sender.isEmpty ? "Passband" : sender,
-            subtitle: subtitle,
             // An empty one_line means triage stored no summary; say something
             // true rather than posting a blank banner.
             body: summary.isEmpty ? "New mail worth your attention." : summary,
@@ -185,7 +173,6 @@ enum EventBanner {
         let who = flatten(SenderID.readableName(sender), max: 64)
         return Copy(
             title: accountName.map { "\(label) · \($0)" } ?? label,
-            subtitle: "",
             body: who.isEmpty ? "New auth mail." : "from \(who)",
             // One group per account's auth mail: a login code and the sign-in
             // alert behind it are the same conversation. Account-prefixed by

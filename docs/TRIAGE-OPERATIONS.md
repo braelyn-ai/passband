@@ -29,7 +29,7 @@ It returns an explicit unsupported result; the prompt prohibits claiming to have
 read unavailable evidence. Stored plain text is paged, with Unicode character
 positions. Context and tool results have separate byte budgets.
 
-Model output owns categories, Reading/Records membership, thread-level FYE
+Model output owns categories, Reading membership, typed record facts, thread-level FYE
 membership, extracted facts, auth classification, external access, and proposed
 revisits. Structural validation checks IDs, evidence, numeric ranges, and observed
 revisions. User done/snooze/corrections and completed actions remain authoritative.
@@ -247,3 +247,11 @@ Tests use mocked providers. Live-mail accuracy and latency still need evaluation
 a green suite does not establish model quality. Binary/PDF evidence extraction,
 provider-specific conversation-prefix caching, and removal of the remaining
 legacy compatibility modules are separate follow-ups.
+
+Records is an umbrella for Calendar, Shipping, Billing, and Receipts, not an
+independent placement. Only Reading is selectable in `destinations`; record
+membership is derived from typed `records` facts. The aggregate Records API
+remains available, but never includes a message solely because of a placement
+label. On upgrade, legacy Records placements and corrections are removed while
+preserving typed facts and other choices. Messages with a legacy Records label
+but no typed facts are queued once for re-triage (`records_cleanup`).

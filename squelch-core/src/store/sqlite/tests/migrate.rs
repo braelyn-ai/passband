@@ -771,6 +771,60 @@ fn migrate_rebuilds_the_staging_table_onto_the_merchant_scoped_key() {
     assert_eq!(idx, 1, "the rebuild re-creates the dropped index");
 }
 
+/// The carrier's answer clock lands on a pre-existing `shipments` table, and
+/// its history is backfilled ONCE from the best available bound: a row holding
+/// a carrier's words was answered no later than its last attempt. A row never
+/// answered stays NULL, and a re-open does not re-backfill over a real answer
+/// that has since been written.
+#[test]
+fn migrate_adds_last_answered_at_and_backfills_it_from_answered_rows_once() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments(
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             tracking_number TEXT NOT NULL, carrier TEXT NOT NULL,
+             item_name TEXT NOT NULL DEFAULT '', last_message_id INTEGER,
+             carrier_status_raw TEXT, last_polled_at TEXT);
+         INSERT INTO shipments(id,account_id,tracking_number,carrier,carrier_status_raw,last_polled_at)
+         VALUES (1,1,'a','ups','In Transit','2026-09-01T00:00:00+00:00'),
+                (2,1,'b','ups',NULL,'2026-09-01T00:00:00+00:00'),
+                (3,1,'c','ups',NULL,NULL);",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    let answered = |id: i64| -> Option<String> {
+        conn.query_row(
+            "SELECT last_answered_at FROM shipments WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        answered(1).as_deref(),
+        Some("2026-09-01T00:00:00+00:00"),
+        "answered rows backfill from the attempt clock"
+    );
+    assert_eq!(
+        answered(2),
+        None,
+        "an attempt with no answer is not an answer"
+    );
+    assert_eq!(answered(3), None);
+
+    conn.execute(
+        "UPDATE shipments SET last_answered_at='2026-09-20T00:00:00+00:00', last_polled_at='2026-09-21T00:00:00+00:00' WHERE id=1",
+        [],
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(
+        answered(1).as_deref(),
+        Some("2026-09-20T00:00:00+00:00"),
+        "a re-open never overwrites a real answer"
+    );
+}
+
 #[test]
 fn migrate_adds_reminder_columns_and_the_due_index_to_preexisting_triage() {
     // A `triage` table predating "remind me later". Both columns must land (the
