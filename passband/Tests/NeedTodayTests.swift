@@ -45,13 +45,14 @@ struct NeedTodayTests {
         projected.items[0].decision.records = try JSONDecoder().decode([AgentRecordProposal].self, from: Data("""
         [{"kind":"receipt","merchant":"Shop","amount":12.5,"currency":"USD"},
          {"kind":"receipt","merchant":"Other Shop","amount":20,"currency":"USD"},
-         {"kind":"event","title":"Dinner","start":{"value":"2026-10-01"}},
+         {"kind":"event","title":"Dinner","start":{"value":"2026-10-01","timezone":"America/Los_Angeles"}},
          {"kind":"financial_update","institution":"Bank","description":"Statement ready"},
          {"kind":"bill","merchant":"Utility","amount":42,"currency":"USD","due":{"value":"2026-10-02"},"autopay":true}]
         """.utf8))
         precondition(projected.receipts.count == 2 && Set(projected.receipts.map(\.id)).count == 2)
         precondition(projected.receipts[0].amount == 12.5 && projected.receipts[0].message_id == 9)
         precondition(projected.calendar[0].starts_at == "2026-10-01", "Record date precision survives presentation")
+        precondition(projected.calendar[0].start_timezone == "America/Los_Angeles", "Event timezone survives projection")
         precondition(projected.banking[0].kind == .update, "Do not invent financial subtypes")
         precondition(projected.banking.count == 2, "Bills belong in Billing, not a generic Records card")
         let billingRow = projected.banking[1]
