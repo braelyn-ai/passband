@@ -1,8 +1,13 @@
-// The send ceremony — the one irreversible action in the app, so it gets two
-// phases: edit (⌘Enter → review), then review, which submits once *without*
-// override_guard to get the outbound-guard verdict. A clean pass has already
-// sent; a 422 shows the redacted guard kinds and demands a distinct override
-// (shift+Enter or the danger button). 403 means no write credential.
+// The send ceremony — the one irreversible action in the app. ⌘Enter closes
+// the composer and HOLDS the mail for five seconds behind an undo toast
+// (`AppStore.sendWithUndo`); only then does it go out, once *without*
+// override_guard. A clean pass is sent; a 422 reopens this composer with the
+// redacted guard kinds, and sending past them is a distinct act (⌘⇧Enter or
+// the danger button). 403 means no write credential.
+//
+// There used to be a review phase between the two. The hold replaced it: a
+// read-back screen on every send taxed every mail to catch the rare wrong one,
+// and an undo catches that one for free.
 //
 // This is the PANE composer: a right-hand working surface in MainShell's
 // layout, half the window wide — the page beside it shrinks and stays live,
@@ -43,8 +48,16 @@ struct ComposePane: View {
     @State private var groupMemberCount = 0
 
     private var compose: ComposeState? { store.compose }
-    private var inReview: Bool { compose?.phase == .review }
     private var guarded: Bool { !(compose?.guardKinds.isEmpty ?? true) }
+    /// Opened out to a centred column over the page. The Mac's alone: a phone
+    /// sheet is already the whole screen.
+    private var expanded: Bool {
+        #if os(macOS)
+            store.composeExpanded
+        #else
+            false
+        #endif
+    }
 
     var body: some View {
         if let compose {
@@ -52,10 +65,11 @@ struct ComposePane: View {
                 header(compose)
 
                 VStack(alignment: .leading, spacing: 12) {
-                    if inReview {
-                        reviewPane(compose)
-                    } else {
-                        editPane(compose)
+                    editPane(compose)
+                    // A held send came back blocked: the verdict, and with it
+                    // the override in the footer.
+                    if guarded {
+                        GuardVerdictBox(kinds: compose.guardKinds)
                     }
                     if let error = compose.error {
                         Text(error).font(Typo.micro).foregroundStyle(Palette.danger)
@@ -65,16 +79,21 @@ struct ComposePane: View {
                 .padding(.vertical, 14)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
-                // EDIT HAS NO FOOTER ON A PHONE. Its two buttons went to the
-                // header and to the drag-down gesture, and a bar left behind
-                // with nothing in it would still cost its own height and
-                // hairline between the editor and the keyboard.
+                // NO FOOTER ON A PHONE, unless the guard blocked a send. Send
+                // went to the header and cancel to the drag-down gesture, and a
+                // bar left behind with nothing in it would still cost its own
+                // height between the editor and the keyboard. A blocked send
+                // needs the override, and the override deserves a wide target.
                 #if os(macOS)
                     footer(compose)
                 #else
-                    if inReview { footer(compose) }
+                    if guarded { footer(compose) }
                 #endif
             }
+            // FULL SCREEN IS A COLUMN, not the window: a line of mail as wide
+            // as a monitor is unreadable. The reader's own measure, so a mail
+            // is written at the width it will be read at.
+            .frame(maxWidth: expanded ? ThreadViewer.columnWidth : .infinity)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             // A pane is an EDGE in a window: glass, and a shadow thrown left
             // over the page it half-covers. A sheet is neither — it has its own
@@ -88,39 +107,42 @@ struct ComposePane: View {
             #endif
             .keyContext(.modal)
             .keyBindings(.modal, bindings)
-            .onAppear { if !inReview { focusedField = .recipient(.to) } }
+            .onAppear { focusedField = .recipient(.to) }
             // ANYWHERE ON THE PANE: a file let go over the subject line or
-            // the tray still lands. Edit phase only — review is for reading —
-            // and `ComposeAttach.add` is what refuses a drop during review.
+            // the tray still lands.
             .composeDropTarget(.compose, targeted: $dropTargeted)
         }
     }
 
     private func header(_ compose: ComposeState) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            // THE SERIF MOMENT. On the Mac this line is one engraved label among
-            // the rail, the zone heads and the page chrome, and a second display
-            // face there would be wallpaper. A sheet has no chrome around it —
-            // it IS the screen — so the phone spends Newsreader here, once, on
-            // the word that names what you are doing.
+            // THE SERIF MOMENT. A sheet has no chrome around it — it IS the
+            // screen — so the phone spends Newsreader here, once, on the word
+            // that names what you are doing.
+            //
+            // The Mac names the KIND of mail instead, in plain SF: this was
+            // "COMPOSE" in the engraved, width-expanded label face with the kind
+            // whispered beside it, which said the same thing twice in two
+            // voices, the louder one the less useful.
             #if os(macOS)
-                Text(inReview ? "review · confirm send" : "compose")
-                    .font(Typo.sectionLabel)
+                Text(kindLabel(compose))
+                    .font(Typo.zoneTitle)
                     .foregroundStyle(Palette.ink)
-                    .textCase(.uppercase)
             #else
-                Text(inReview ? "review" : "compose")
+                Text("compose")
                     .font(Typo.serif(24, weight: .medium))
                     .foregroundStyle(Palette.ink)
+                Text(kindLabel(compose))
+                    .font(Typo.micro)
+                    .foregroundStyle(Palette.inkFaintest)
             #endif
-            Text(kindLabel(compose))
-                .font(Typo.micro)
-                .foregroundStyle(Palette.inkFaintest)
             Spacer()
             // NO `Esc close` CHIP ON THE MAC. The footer's cancel button names
             // the same key, and the header saying it too made three places on
             // one pane promising Esc.
-            #if os(iOS)
+            #if os(macOS)
+                expandButton
+            #else
                 // THE PHONE'S PRIMARY ACTION, IN THE CORNER IT LIVES IN. On a
                 // phone the edit phase is a sheet with the keyboard up, and the
                 // bottom of the screen is spoken for three times over — the
@@ -135,20 +157,42 @@ struct ComposePane: View {
                 // Two doors out, one of them costing a corner of the bar, was a
                 // button spent on something the gesture already did.
                 //
-                // Review keeps its footer: no keyboard is up there, and `send`
-                // is the one irreversible thing in the app — it stays a wide,
-                // deliberate target rather than a chip in the corner.
-                if !inReview {
-                    Button("review →") { toReview() }
-                        .buttonStyle(.glassProminent)
-                        .tint(Palette.accent)
-                }
+                // A BLOCKED send keeps the corner for the plain send (after
+                // editing the match out) and puts the override in a footer of
+                // its own: sending through the guard stays a wide, deliberate
+                // target rather than a chip in the corner.
+                Button("send") { send(override: false) }
+                    .buttonStyle(.glassProminent)
+                    .tint(Palette.accent)
             #endif
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 13)
         .overlay(alignment: .bottom) { Hairline() }
     }
+
+    #if os(macOS)
+        /// Open the pane out to a centred column over the page, or back.
+        private var expandButton: some View {
+            Button {
+                store.composeExpanded.toggle()
+            } label: {
+                Image(
+                    systemName: expanded
+                        ? "arrow.down.right.and.arrow.up.left"
+                        : "arrow.up.left.and.arrow.down.right"
+                )
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Palette.inkFaint)
+            .pointingHand()
+            .help(expanded ? "back to the side pane" : "full screen")
+            .accessibilityLabel(expanded ? "Exit full screen" : "Full screen")
+        }
+    #endif
 
     /// Which of the three this composer is, in the header's lowercase voice.
     private func kindLabel(_ compose: ComposeState) -> String {
@@ -246,50 +290,37 @@ struct ComposePane: View {
         // half a window wide the hints lost the fight for room and wrapped
         // mid-word. One statement per verb: the button, with its key beside it.
         HStack(spacing: 8) {
-            if inReview {
-                Spacer()
-                Button { patch { $0.phase = .edit; $0.error = nil } } label: {
-                    keyed("back", "esc")
-                }
-                .buttonStyle(.glass)
-                if guarded {
-                    Button { Task { await fire(override: true) } } label: {
-                        keyed(compose.sending ? "sending…" : "override + send", "⇧↵")
-                    }
+            // THE MESSAGE OPTIONS, DESKTOP ONLY. The phone renders this bar
+            // only for a blocked send (see the call site): the tracker switch
+            // is what a phone would have to give the row for, and one switch
+            // nobody came here to touch is not worth a strip of chrome between
+            // the editor and the keyboard. A phone that wants the pixel changes
+            // the account default.
+            //
+            // At the far LEFT, away from the verbs: a switch beside the send
+            // button is a switch nobody meant to touch.
+            #if os(macOS)
+                AttachButton(slot: .compose)
+                TrackerToggle(on: bindFlag(\.includeTracker))
+            #endif
+            Spacer()
+            #if os(macOS)
+                Button { store.closeCompose() } label: { keyed("cancel", "esc") }
+                    .buttonStyle(.glass)
+            #endif
+            // Past a blocked verdict the plain send stays (the match may have
+            // been edited out) and the override stands beside it in danger red:
+            // two acts, never one button that quietly means both.
+            if guarded {
+                Button { send(override: true) } label: { keyed("send anyway", "⌘⇧↵") }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.danger)
-                    .disabled(compose.sending)
-                } else {
-                    Button { Task { await fire(override: false) } } label: {
-                        keyed(compose.sending ? "sending…" : "send", "↵")
-                    }
+            }
+            #if os(macOS)
+                Button { send(override: false) } label: { keyed("send", "⌘↵") }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.accent)
-                    .disabled(compose.sending)
-                }
-            } else {
-                // EDIT PHASE, DESKTOP ONLY — the phone never renders this bar
-                // (see the call site) and must not start: the tracker switch is
-                // what a phone would have to give the row for, and one switch
-                // nobody came here to touch is not worth a strip of chrome
-                // between the editor and the keyboard. A phone that wants the
-                // pixel changes the account default; review still SAYS when one
-                // is armed, so a tracked send is never a silent one.
-                #if os(macOS)
-                    // What goes out is settled by the time review is up, and a
-                    // switch beside the send button is a switch nobody meant to
-                    // touch. So the two message options sit at the far LEFT,
-                    // away from the verbs, and the verbs stand together.
-                    AttachButton(slot: .compose)
-                    TrackerToggle(on: bindFlag(\.includeTracker))
-                    Spacer()
-                    Button { store.closeCompose() } label: { keyed("cancel", "esc") }
-                        .buttonStyle(.glass)
-                    Button { toReview() } label: { keyed("review", "⌘↵") }
-                        .buttonStyle(.glassProminent)
-                        .tint(Palette.accent)
-                #endif
-            }
+            #endif
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
@@ -498,33 +529,6 @@ struct ComposePane: View {
         return out.joined(separator: ", ")
     }
 
-    /// The `to` row in review. A fan-out's field holds only a token, which is a
-    /// client encoding and not something to show a person; the group's own name
-    /// is what they picked and what they should be asked to confirm.
-    private func reviewTo(_ compose: ComposeState) -> String {
-        if compose.groupMode == .individual, let name = compose.groupName {
-            return name
-        }
-        return compose.to.isEmpty ? "(none)" : compose.to
-    }
-
-    /// How this send is about to happen, when a group decided it. nil for an
-    /// ordinary message, whose fields already say everything.
-    private func reviewShape(_ compose: ComposeState) -> String? {
-        guard let mode = compose.groupMode, let name = compose.groupName else { return nil }
-        switch mode {
-        case .to:
-            return "\(name) · everyone can see the whole list"
-        case .bcc:
-            return "\(name) · nobody sees who else got it"
-        case .individual:
-            let n = groupMemberCount
-            return n > 0
-                ? "\(n) separate emails, one per person in \(name)"
-                : "one separate email per person in \(name)"
-        }
-    }
-
     private var isReply: Bool { compose?.replyToMessageId != nil }
 
     /// Stands in for an empty subject on a reply, in both panes: the daemon titles
@@ -534,173 +538,27 @@ struct ComposePane: View {
         isReply ? ComposeCopy.derivedSubject : "subject"
     }
 
-    /// WHAT THE MAIL WILL BE TITLED, which is not always what is in the subject
-    /// field: review's whole job is promising what goes out, so an empty field
-    /// has to show the title the DAEMON will derive rather than a blank row.
-    ///
-    /// The empty test is `trimmed.isEmpty`, because that is the DAEMON's test:
-    /// `action_send` filters the subject through `!s.trim().is_empty()` before
-    /// falling back to its derivation, so a field holding only spaces hands
-    /// titling back to the daemon exactly as a cleared one does. (`fire` sends
-    /// the spaces, and the daemon discards them — the wire carries them, the
-    /// mail never does.) Testing `isEmpty` here promised a blank title for a
-    /// mail about to go out titled `Fwd: …`, one whitespace away from the lie
-    /// this function exists to remove.
-    ///
-    /// Three empty cases, and they derive differently:
-    /// - a reply: `gmail_write::reply_subject` from the parent, which the
-    ///   composer's update cannot see (it carries an LLM summary, not headers).
-    /// - a FORWARD: `gmail_write::forward_subject` of the original, which we CAN
-    ///   mirror, because the original's subject is right here as
-    ///   `forwardedSubject`. Reachable exactly when the sender cleared the field
-    ///   the composer opened pre-filled.
-    /// - a new message: nothing derives one; it goes out untitled.
-    private func reviewSubject(_ compose: ComposeState) -> String {
-        guard compose.subject.trimmed.isEmpty else { return compose.subject }
-        if compose.forwardOfMessageId != nil {
-            return ComposeCopy.forwardSubject(compose.forwardedSubject ?? "")
-        }
-        return isReply ? ComposeCopy.derivedSubject : "(none)"
-    }
-
-    private func reviewPane(_ compose: ComposeState) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ComposeSummaryRow("to", reviewTo(compose))
-            // Only when there is one, and BOTH when there are — review's whole
-            // job is stating what goes out, and a blind copy is the part of that
-            // the sent mail will not show anybody, including the sender.
-            if !compose.cc.trimmed.isEmpty {
-                ComposeSummaryRow("cc", compose.cc)
-            }
-            if !compose.bcc.trimmed.isEmpty {
-                ComposeSummaryRow("bcc", compose.bcc)
-            }
-            // THE SHAPE OF THE SEND, said out loud, and only when a group made it
-            // something other than one message to the people listed above. This
-            // is the one irreversible action in the app and the mode is the part
-            // of it that the fields cannot show: twelve separate emails and one
-            // bcc'd email look identical up there and are nothing alike.
-            if let shape = reviewShape(compose) {
-                ComposeSummaryRow("sending", shape)
-            }
-            ComposeSummaryRow("subject", reviewSubject(compose))
-            // Review states what is about to go out, and an invisible pixel in
-            // it is part of that. Only when armed: a row saying "no" on every
-            // ordinary send is a row nobody reads.
-            if compose.includeTracker && store.trackingAvailable {
-                ComposeSummaryRow("tracking", ComposeCopy.trackedSend)
-            }
-            // What rides along, said in the summary's own grammar — and then
-            // shown, below the note, as the tray it was reviewed in.
-            if let files = ComposeCopy.attachmentSummary(compose) {
-                ComposeSummaryRow("files", files)
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    // The scanner's own styling, so review shows the formatting
-                    // the HTML half will carry — not a second interpretation of
-                    // it.
-                    Text(MarkdownStyle.attributed(compose.body))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    AttachmentTray(slot: .compose, editable: false)
-                    // INSIDE this scroller rather than beside it, and under the
-                    // note exactly as it will sit in the mail: on a forward the
-                    // quote is most of what goes out, and review's whole job is
-                    // stating what goes out. No inner ScrollView here — one
-                    // scroll surface, the outer one.
-                    forwardedQuote(compose)
-                }
-            }
-            .frame(maxHeight: .infinity)
-            .padding(10)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Palette.canvas.opacity(0.6))
-            )
-
-            // THE GUARD SPEAKS ONLY WHEN IT HAS SOMETHING TO SAY. This slot used
-            // to carry a standing line announcing that the outbound secret scan
-            // had not run yet and that sending is what runs it — true, and no use
-            // to anybody: it named an internal subsystem, promised a "verdict" on
-            // a trial the reader never knew about, and said "not yet checked"
-            // about the one thing they could not check. A review pane's job is to
-            // state what goes out, and "a thing you have not heard of has not
-            // happened yet" is not part of that.
-            //
-            // Nothing about the scan changed. It still runs daemon-side on the
-            // send itself (squelch-api/src/guard.rs), a clean pass still means the
-            // mail is already gone, and a match still stops the send dead and
-            // brings up the box below with the redacted kinds and the override.
-            // The mechanism was never what needed explaining on a clean draft.
-            if !compose.guardKinds.isEmpty {
-                GuardVerdictBox(kinds: compose.guardKinds)
-            }
-        }
-    }
-
     // MARK: - keymap
 
-    /// True while the caret sits in the body editor. The body is a platform text
-    /// view (FocusState cannot see into AppKit or UIKit), and plain Enter there
-    /// must stay a newline.
-    ///
-    /// `@FocusState` is deliberately NOT the answer on either side: it tracks
-    /// the SwiftUI fields above (to, subject) and has no opinion about a
-    /// representable's first responder. AppKit is asked directly; UIKit
-    /// publishes no current-responder API, so the editors report themselves into
-    /// `MarkdownFocus` and this reads that. Same fact, same freshness — dynamic
-    /// on every evaluation, never a flag someone has to remember to clear.
-    private var bodyHasFocus: Bool {
-        #if os(macOS)
-            NSApp.keyWindow?.firstResponder is NSTextView
-        #else
-            MarkdownFocus.shared.isEditing
-        #endif
-    }
-
+    /// ⌘Enter sends from anywhere in the pane, the body included. Plain Enter
+    /// is left alone everywhere: it used to open review from the to/subject
+    /// lines, and with review gone an Enter that SENDS from the subject line
+    /// would be a mail out the door on the keystroke people use to finish a
+    /// field.
     private var bindings: [KeyBinding] {
         [
-            KeyBinding("Escape", inReview ? "back to edit" : "cancel", allowInInput: true) {
-                if store.compose?.phase == .review {
-                    patch { $0.phase = .edit; $0.error = nil }
-                } else {
-                    store.closeCompose()
-                }
+            KeyBinding("Escape", "cancel", allowInInput: true) { store.closeCompose() },
+            KeyBinding("Enter", "send", meta: true, allowInInput: true) {
+                send(override: false)
             },
-            // In the body field plain Enter is a newline; ⌘Enter reviews. In
-            // review, Enter fires without override — that call is the verdict.
-            KeyBinding(declining: "Enter", inReview ? "send" : "review", allowInInput: true) {
-                guard let compose = store.compose else { return false }
-                // THE ASK BAR IS A MODAL ON TOP OF THIS PANE. KeyMonitor walks
-                // the sets newest-first and AskBar binds only Escape, so a
-                // Return typed into its field falls through to here — and in
-                // review that would SEND THE MAIL, the one irreversible thing
-                // this app does, instead of asking the question. The edit branch
-                // survives on the firstResponder check below; review has no such
-                // luck, so both decline while the bar is up.
-                guard !store.askBarOpen else { return false }
-                if compose.phase == .edit {
-                    guard !bodyHasFocus else { return false }  // let it type a newline
-                    toReview()
-                } else {
-                    Task { await fire(override: false) }
-                }
-                return true
-            },
-            KeyBinding("Enter", "review", meta: true, allowInInput: true) {
-                if store.compose?.phase == .edit { toReview() }
-            },
-            // Explicit override, review phase only.
-            KeyBinding(declining: "shift+Enter", "override guard and send", allowInInput: true) {
-                // Same trap as plain Enter, one notch worse: this one sends
-                // THROUGH the outbound guard.
-                guard !store.askBarOpen else { return false }
-                guard let compose = store.compose, compose.phase == .review,
-                    !compose.guardKinds.isEmpty
-                else { return false }
-                Task { await fire(override: true) }
+            // Past a blocked verdict only; declines otherwise, so the chord is
+            // not a quiet way to skip a guard that has not spoken.
+            KeyBinding(declining: "shift+Enter", "send anyway", meta: true, allowInInput: true) {
+                // THE ASK BAR IS A MODAL ON TOP OF THIS PANE, and KeyMonitor
+                // walks the sets newest-first; a chord typed into its field
+                // must not send THROUGH the outbound guard from under it.
+                guard !store.askBarOpen, guarded else { return false }
+                send(override: true)
                 return true
             },
         ]
@@ -749,23 +607,13 @@ struct ComposePane: View {
         store.compose = next
     }
 
-    /// Patch the slot ONLY IF it still holds the composer `id` names. Every
-    /// write that happens after an `await` goes through here: the plain `patch`
-    /// above is safe only because its callers run synchronously off a keystroke,
-    /// while a send's continuation resumes into whatever the slot holds by then,
-    /// which may be an entirely different draft (see `ComposeState.id`).
-    /// Silently does nothing in that case, by design — the composer that moved
-    /// on is not this send's to edit, and the mail may well have gone out.
-    private func patch(_ id: UUID, _ mutate: (inout ComposeState) -> Void) {
-        guard var next = store.compose, next.id == id else { return }
-        mutate(&next)
-        store.compose = next
-    }
-
-    private func toReview() {
+    /// Hand the mail to the hold (`AppStore.sendWithUndo`), after the two
+    /// checks that have to happen while the composer is still on screen to
+    /// show their answer.
+    private func send(override: Bool) {
         guard let compose = store.compose else { return }
         // Untouched covers the seeded signature: a signature under nothing is
-        // not a message, and review must not put it one Enter from going out.
+        // not a message, and must not be one keystroke from going out.
         //
         // A FORWARD IS EXEMPT, and has to be: its content is the original the
         // daemon quotes underneath, so "here, look at this" with nothing typed
@@ -780,75 +628,12 @@ struct ComposePane: View {
         }
         // THE TRAY IS THE PROMISE. A file still uploading has no id for the
         // send to name, and one that failed would go out missing; both stop
-        // the ceremony here, in words, rather than at the send.
+        // the send here, in words.
         if let problem = ComposeCopy.trayProblem(compose) {
             patch { $0.error = problem }
             return
         }
-        patch {
-            $0.phase = .review
-            $0.error = nil
-            $0.guardKinds = []
-        }
-    }
-
-    /// The request lives in `ComposeSubmit`; what is left here is this surface's
-    /// own reaction to each outcome.
-    ///
-    /// EVERY WRITE BELOW IS KEYED TO `slot`, the composer this send belongs to.
-    /// `store.compose` is a slot, not an object: while the await is out the
-    /// sender can Escape (which flushes the draft and empties the slot) and open
-    /// a different composer into it, and an unkeyed continuation would then land
-    /// on a stranger's draft — `noteSent` clearing its touched mark, so the
-    /// close's flush refuses to save, so everything typed into it is gone. See
-    /// `ComposeState.id`.
-    private func fire(override: Bool) async {
-        guard let compose = store.compose, !compose.sending else { return }
-        let slot = compose.id
-        patch(slot) {
-            $0.sending = true
-            $0.error = nil
-        }
-        switch await ComposeSubmit.fire(compose, override: override) {
-        case .sent:
-            // The daemon resolved the replied-to update; without this the row
-            // sits in its band until the next poll, reading as a no-op. No undo
-            // pairs with it — a send is the one irreversible action.
-            //
-            // These two are facts about the MAIL, not about the slot, so they
-            // stand whoever holds the composer now: it really went out, and the
-            // person who sent it is owed the toast that says so.
-            if let repliedTo = compose.replyToMessageId { store.noteResolved(repliedTo) }
-            store.pushToast("sent", .success)
-            // The slot half. The send already deleted the draft it carried, so
-            // without `noteSent` the close would flush it straight back and
-            // offer to restore mail that is gone — but only for THIS composer.
-            // If the slot moved on, both of these belong to someone else's
-            // draft and the right amount of work to do is none.
-            if store.compose?.id == slot {
-                DraftSaver.shared.noteSent(.compose)
-                store.closeCompose()
-            }
-        case .guardBlocked(let kinds):
-            // Stay in review with the redacted verdict; the override must be an
-            // explicit second act, not a re-fire of the same call.
-            patch(slot) {
-                $0.phase = .review
-                $0.guardKinds = kinds
-                $0.sending = false
-                $0.error = nil
-            }
-        case .forbidden:
-            patch(slot) {
-                $0.sending = false
-                $0.error = ComposeCopy.noWriteCredential
-            }
-        case .failure(let text):
-            patch(slot) {
-                $0.sending = false
-                $0.error = text
-            }
-        }
+        store.sendWithUndo(.compose, override: override)
     }
 }
 

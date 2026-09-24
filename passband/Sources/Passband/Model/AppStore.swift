@@ -276,7 +276,11 @@ struct RefreshError: Equatable, Sendable {
 /// `remind` is its own kind rather than a flavour of `done`: the forward action
 /// resolves the thread AND schedules its return, so the inverse is two calls,
 /// and "undo_fired kind=done" would count a reminder as a completion.
-enum UndoKind: Sendable { case archive, done, label, ruleDelete, groupDelete, remind }
+///
+/// `send` is the odd one out: nothing has gone out yet. The mail is HELD for
+/// the undo window and only leaves when it closes, so its "inverse" is simply
+/// not sending (see `AppStore.sendWithUndo`).
+enum UndoKind: Sendable { case archive, done, label, ruleDelete, groupDelete, remind, send }
 
 /// A queued undo. `revert` is the exact inverse call to fire on `u`/toast-click;
 /// the forward action has already gone out.
@@ -322,12 +326,10 @@ let ringSeconds: TimeInterval = 60
 
 // MARK: - compose
 
-/// Draft + review state for the send ceremony. ONE type for both composers: the
+/// Draft state for the send ceremony. ONE type for both composers: the
 /// `ComposePane` (new message, the right-hand pane) and the reader's inline
 /// reply.
 struct ComposeState: Sendable, Equatable {
-    enum Phase: Sendable { case edit, review }
-
     /// WHICH COMPOSER THIS IS. Minted once when the state is built and carried
     /// through every copy of it, because this is a value type living in a slot
     /// (`AppStore.compose` / `AppStore.inlineReply`) that anything can replace:
@@ -410,10 +412,10 @@ struct ComposeState: Sendable, Equatable {
     /// Rides along to `send` so a successful send deletes the draft in the same
     /// transaction — otherwise the next `c` would restore mail already gone.
     var draftId: Int?
-    /// "edit" = composing; "review" = guard verdict shown, second Enter fires.
-    var phase: Phase = .edit
-    /// Redacted guard kinds from a 422; empty means the guard passed (or hasn't
-    /// been asked yet).
+    /// Redacted guard kinds from a 422, set when a held send comes back
+    /// blocked and the composer reopens on it. Empty means the guard passed (or
+    /// hasn't been asked yet). Non-empty is the ONLY state that offers an
+    /// override.
     var guardKinds: [String] = []
     var sending = false
     var error: String?
@@ -757,6 +759,10 @@ final class AppStore {
     /// difference lives.
     private var arrivals = ThreadArrivals()
     var compose: ComposeState?
+    /// The pane composer opened out to a centred column over the whole page.
+    /// Kept across composers on purpose: somebody who writes long mail
+    /// full-size wants the next one full-size too.
+    var composeExpanded = false
     /// The reader's inline reply composer. Deliberately NOT part of
     /// `modalOverlayOpen`: it is a bar inside the reading surface, not an overlay
     /// on one, so the thread behind it must stay unblurred and clickable — you
@@ -3017,6 +3023,169 @@ final class AppStore {
         inlineReply = nil
     }
 
+    // MARK: - undo send
+
+    /// How long a send is HELD before it goes out, which is the whole of the
+    /// undo: the same window every other undo toast gets.
+    static let sendHold: TimeInterval = 5
+
+    /// A send waiting out its hold. The composer that made it is already gone
+    /// from the screen; this is everything needed to either fire it or put it
+    /// back.
+    private struct HeldSend {
+        var state: ComposeState
+        var slot: DraftSaver.Slot
+        var override: Bool
+        /// The thread the reader was on, for putting an inline reply back
+        /// where it was typed. See `putBack`.
+        var threadId: String?
+        /// The account it was written in. An account switch inside the hold
+        /// must not let the mail leave from the OTHER account.
+        var epoch: Int
+        var undoId = UUID()
+    }
+
+    private var heldSends: [UUID: HeldSend] = [:]
+
+    /// A reply typed in the reader went out and is already in the local store
+    /// (the daemon echoed it), so that thread's reader refetches and shows it.
+    /// The send outlives the composer now, so the reader cannot be handed a
+    /// callback; it watches this instead.
+    struct SendEcho: Equatable {
+        let threadId: String
+        let id = UUID()
+    }
+    private(set) var lastSendEcho: SendEcho?
+
+    /// THE SEND: close the composer now, send in `sendHold` seconds unless the
+    /// toast's undo (or `u`) puts it back first.
+    ///
+    /// There is no review step in front of this any more. The hold is what
+    /// replaced it: a send you did not mean is undone by one keystroke, and the
+    /// outbound guard still runs on the real send, reopening the composer with
+    /// its verdict when it blocks.
+    ///
+    /// The draft is NOT flushed on the way out. The daemon's copy stays as the
+    /// autosave left it until the send deletes it (`draftId` rides along), and
+    /// a flush racing the send could put it back after the delete. An undo or a
+    /// failure reopens the composer with everything, so nothing typed is lost
+    /// either way.
+    func sendWithUndo(_ slot: DraftSaver.Slot, override: Bool = false) {
+        guard var state = slot == .compose ? compose : inlineReply, !state.sending else { return }
+        state.error = nil
+        DraftSaver.shared.noteSent(slot)
+        switch slot {
+        case .compose: compose = nil
+        case .inlineReply: inlineReply = nil
+        }
+        let key = UUID()
+        var held = HeldSend(
+            state: state, slot: slot, override: override, threadId: threadId, epoch: epoch)
+        // `messageId: -1`: this undo resolves nothing, so the id it un-hides
+        // on firing must match no message.
+        held.undoId = pushUndo(kind: .send, messageId: -1, label: Self.holdLabel(state)) {
+            [weak self] in
+            guard let self, await self.unhold(key) else { throw HoldError.alreadySent }
+        }
+        heldSends[key] = held
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.sendHold))
+            await self?.release(key)
+        }
+    }
+
+    private enum HoldError: Error { case alreadySent }
+
+    /// "sending to alice@example.com" — the toast names who it is for, because
+    /// that is the question somebody reaching for undo is asking.
+    private static func holdLabel(_ state: ComposeState) -> String {
+        if state.groupMode == .individual, let name = state.groupName {
+            return "sending to \(name)"
+        }
+        if let first = state.recipients.tokens(.to).first {
+            let more = state.recipients.tokens(.to).count - 1
+            return more > 0 ? "sending to \(first) +\(more)" : "sending to \(first)"
+        }
+        return state.replyToMessageId != nil ? "sending reply" : "sending"
+    }
+
+    /// Undo: the send never happens and the composer comes back. False when
+    /// the hold already ended, so the toast says the undo failed rather than
+    /// claiming a mail that left was stopped.
+    private func unhold(_ key: UUID) -> Bool {
+        guard let held = heldSends.removeValue(forKey: key) else { return false }
+        putBack(held, error: nil)
+        return true
+    }
+
+    /// The hold ran out: the mail goes. Removed from `heldSends` FIRST and on
+    /// the main actor, so an undo landing now finds nothing and cannot also
+    /// reopen a composer for a mail that is on the wire.
+    private func release(_ key: UUID) async {
+        guard let held = heldSends.removeValue(forKey: key) else { return }
+        undos.removeAll { $0.id == held.undoId }
+        guard held.epoch == epoch else {
+            pushToast("not sent: you switched accounts while it was waiting", .error)
+            return
+        }
+        switch await ComposeSubmit.fire(held.state, override: held.override) {
+        case .sent(let result):
+            // The daemon resolved the replied-to update; without this the row
+            // sits in its band until the next poll, reading as a no-op.
+            if let repliedTo = held.state.replyToMessageId { noteResolved(repliedTo) }
+            pushToast("sent", .success)
+            // Only an INLINE reply names its thread: the pane's mail (a new
+            // message, a forward) starts a thread of its own, and refetching
+            // whatever happens to be open would move somebody's reading.
+            if result.echo_message_id != nil, held.slot == .inlineReply,
+                let thread = held.threadId
+            {
+                lastSendEcho = SendEcho(threadId: thread)
+            }
+        case .guardBlocked(let kinds):
+            var state = held.state
+            state.guardKinds = kinds
+            putBack(HeldSend(
+                state: state, slot: held.slot, override: false, threadId: held.threadId,
+                epoch: held.epoch), error: nil, blocked: true)
+        case .forbidden:
+            putBack(held, error: ComposeCopy.noWriteCredential)
+        case .failure(let text):
+            putBack(held, error: text)
+        }
+    }
+
+    /// Reopen a held send's composer: after an undo, or when the send came back
+    /// refused.
+    ///
+    /// Back WHERE IT WAS when that place is still there — the pane, or the
+    /// inline reply under the thread it was typed in. An inline reply renders
+    /// only under its own thread, so one whose reader has moved on goes to the
+    /// pane instead, which carries the reply shape too. With both slots taken
+    /// by newer composers nothing is overwritten, and the toast says only what
+    /// is true about what is left: the daemon's last autosave, if there ever
+    /// was one (a forward never autosaves; a mail sent inside the first
+    /// debounce never did).
+    private func putBack(_ held: HeldSend, error: String?, blocked: Bool = false) {
+        guard held.epoch == epoch else { return }
+        var state = held.state
+        state.sending = false
+        state.error = error
+        let reason = blocked ? "the outbound guard stopped it" : error
+        if held.slot == .inlineReply, inlineReply == nil, threadId == held.threadId {
+            inlineReply = state
+            DraftSaver.shared.noteChange(.inlineReply)
+        } else if compose == nil {
+            compose = state
+            DraftSaver.shared.noteChange(.compose)
+        } else {
+            let saved = state.draftId != nil ? ". Its last autosave is in your drafts" : ""
+            pushToast("not sent: \(reason ?? "undone")\(saved)", .error)
+            return
+        }
+        if let reason { pushToast("not sent: \(reason)", .error) }
+    }
+
     // MARK: - assistant relay
 
     /// Whether the ⌘K assistant can go through the daemon instead of a local
@@ -3183,18 +3352,22 @@ final class AppStore {
 
     private static let undoTTL: TimeInterval = 5
 
+    @discardableResult
     func pushUndo(
         kind: UndoKind, messageId: Int, label: String,
         revert: @escaping @Sendable () async throws -> Void
-    ) {
+    ) -> UUID {
         let entry = PendingUndo(kind: kind, messageId: messageId, label: label, revert: revert)
         undos.append(entry)
         // Let the guided undo lesson wait for the learner.
-        if RehearsalMode.isEnabled && tour.active && messageId == 1 && tour.practiceStep == .done { return }
+        if RehearsalMode.isEnabled && tour.active && messageId == 1 && tour.practiceStep == .done {
+            return entry.id
+        }
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.undoTTL))
             self?.undos.removeAll { $0.id == entry.id }
         }
+        return entry.id
     }
 
     /// Undo the given (or most recent) queued action.

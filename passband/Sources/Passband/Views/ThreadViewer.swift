@@ -302,6 +302,13 @@ struct ThreadViewer: View {
         .onChange(of: store.openThreadRefreshToken) { _, _ in
             Task { await refreshInPlace() }
         }
+        // A HELD REPLY LANDED and the daemon already has the sent copy. The
+        // send outlives the composer (see `AppStore.sendWithUndo`), so this is
+        // how the reply shows up in the thread it answers.
+        .onChange(of: store.lastSendEcho) { _, echo in
+            guard echo?.threadId == threadId else { return }
+            Task { await reloadAfterSend() }
+        }
         .onChange(of: store.focusedMessageView) { _, direct in
             guard store.threadId == threadId, let direct, direct.thread_id == threadId else { return }
             adopt(direct, opening: true)
@@ -421,8 +428,7 @@ struct ThreadViewer: View {
     /// composer closes.
     private var composer: some View {
         InlineReply(
-            messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
-            onEchoed: { Task { await reloadAfterSend() } })
+            messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "")
     }
 
     // MARK: - chrome

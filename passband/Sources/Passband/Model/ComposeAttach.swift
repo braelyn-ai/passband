@@ -70,10 +70,9 @@ enum ComposeAttach {
         // THE ONE DOOR, so the gate is here whatever opened it: a daemon that
         // cannot stage files gets no row, no marker and no upload to fail.
         guard AppStore.shared.composeAttachmentsAvailable else { return nil }
-        // Edit phase only. Review is for reading what goes out, and a file
-        // arriving there — a drop that missed, a late paste — would change
-        // the mail under the sender's eyes without the ceremony noticing.
-        guard var state = read(slot), state.phase == .edit, !state.sending else { return nil }
+        // Not while it is sending: a file arriving then — a drop that missed,
+        // a late paste — would change a mail already on its way.
+        guard var state = read(slot), !state.sending else { return nil }
         guard !data.isEmpty else {
             AppStore.shared.pushToast("\(filename) is empty", .error)
             return nil
