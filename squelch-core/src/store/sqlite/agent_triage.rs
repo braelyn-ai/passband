@@ -427,6 +427,7 @@ fn queue_investigation(
     trigger: &str,
     eligible: bool,
     foreground: bool,
+    requested_foreground: bool,
 ) -> Result<()> {
     let existing: Option<(i64,String,String,String)> = conn.query_row(
         "SELECT id,state,kind,trigger FROM agent_triage_jobs WHERE account_id=?1 AND message_id=?2 AND input_revision=?3
@@ -441,9 +442,13 @@ fn queue_investigation(
             "access"
         };
         if state == "leased" {
-            conn.execute("INSERT INTO agent_triage_followups(job_id,kind,trigger,arrival_eligible) VALUES(?1,?2,?3,?4)
+            // A human's one-message request keeps its foreground lane through
+            // the wait, whichever way the running job ends.
+            let lane = requested_foreground && kind == "triage";
+            conn.execute("INSERT INTO agent_triage_followups(job_id,kind,trigger,arrival_eligible,foreground) VALUES(?1,?2,?3,?4,?5)
                 ON CONFLICT(job_id) DO UPDATE SET kind=CASE WHEN kind='triage' OR excluded.kind='triage' THEN 'triage' ELSE 'access' END,
-                trigger=excluded.trigger,arrival_eligible=MAX(arrival_eligible,excluded.arrival_eligible)",params![id,kind,trigger,eligible])?;
+                trigger=excluded.trigger,arrival_eligible=MAX(arrival_eligible,excluded.arrival_eligible),
+                foreground=MAX(foreground,excluded.foreground)",params![id,kind,trigger,eligible,lane])?;
             return Ok(());
         }
         if ((state == "completed" && existing_trigger != trigger)
@@ -455,7 +460,10 @@ fn queue_investigation(
         {
             conn.execute("UPDATE agent_triage_jobs SET state='queued',kind=?2,trigger=?3,attempts=0,available_at=?4,last_error=NULL WHERE id=?1",
                 params![id,kind,trigger,Utc::now().to_rfc3339()])?;
-            conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,0) ON CONFLICT(job_id) DO UPDATE SET foreground=0",[id])?;
+            // A requeued job is refresh work, so background, unless a human
+            // asked for this one message by hand.
+            let lane = requested_foreground && kind == "triage";
+            conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,?2) ON CONFLICT(job_id) DO UPDATE SET foreground=excluded.foreground",params![id,lane])?;
             return Ok(());
         }
         if state == "completed" {
@@ -466,6 +474,17 @@ fn queue_investigation(
             // churn. A real content revision creates a new input instead.
             conn.execute("UPDATE agent_triage_jobs SET kind=?2,trigger=?3,arrival_eligible=MAX(arrival_eligible,?4) WHERE id=?1",
                 params![id,kind,trigger,eligible])?;
+            // The one exception: a job parked on the daily budget is not
+            // backoff. A human re-asking for this message moves it to the
+            // foreground budget, which may well have room, so it may run now.
+            // Other deferrals (provider cooldown, retries) keep their schedule.
+            if requested_foreground && kind == "triage" && state == "queued" {
+                conn.execute(
+                    "UPDATE agent_triage_jobs SET available_at=?2,last_error=NULL
+                    WHERE id=?1 AND last_error='daily_budget_exhausted'",
+                    params![id, Utc::now().to_rfc3339()],
+                )?;
+            }
             conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,?2) ON CONFLICT(job_id) DO UPDATE SET foreground=MAX(foreground,excluded.foreground)",params![id,foreground])?;
             return Ok(());
         }
@@ -480,6 +499,25 @@ fn queue_investigation(
 }
 
 fn absorb_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
+    // The job goes back to the queue carrying the follow-up. A human's
+    // one-message request makes it foreground, and, exactly as a re-ask on a
+    // queued job does, lifts a daily-budget park (never other backoff).
+    let requested: bool = conn
+        .query_row(
+            "SELECT foreground FROM agent_triage_followups WHERE job_id=?1",
+            [job.id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if requested {
+        conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,1) ON CONFLICT(job_id) DO UPDATE SET foreground=1",[job.id])?;
+        conn.execute(
+            "UPDATE agent_triage_jobs SET available_at=?2,last_error=NULL
+             WHERE id=?1 AND state='queued' AND last_error='daily_budget_exhausted'",
+            params![job.id, Utc::now().to_rfc3339()],
+        )?;
+    }
     conn.execute("UPDATE agent_triage_jobs SET
         kind=CASE WHEN kind='triage' OR (SELECT kind FROM agent_triage_followups WHERE job_id=?1)='triage' THEN 'triage' ELSE kind END,
         trigger=COALESCE((SELECT trigger FROM agent_triage_followups WHERE job_id=?1),trigger),
@@ -493,18 +531,18 @@ fn absorb_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
 }
 
 fn release_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
-    let followup: Option<(String, String, bool)> = conn
+    let followup: Option<(String, String, bool, bool)> = conn
         .query_row(
-            "SELECT kind,trigger,arrival_eligible FROM agent_triage_followups WHERE job_id=?1",
+            "SELECT kind,trigger,arrival_eligible,foreground FROM agent_triage_followups WHERE job_id=?1",
             [job.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
     conn.execute(
         "DELETE FROM agent_triage_followups WHERE job_id=?1",
         [job.id],
     )?;
-    if let Some((kind, trigger, eligible)) = followup {
+    if let Some((kind, trigger, eligible, requested)) = followup {
         let revision: i64 = conn.query_row(
             "SELECT input_revision FROM agent_triage_jobs WHERE id=?1",
             [job.id],
@@ -518,7 +556,8 @@ fn release_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
             &kind,
             &trigger,
             eligible,
-            false,
+            requested,
+            requested,
         )?;
     }
     Ok(())
@@ -532,6 +571,22 @@ pub(crate) fn enqueue_agent_triage_conn(
     message: i64,
     trigger: &str,
     arrival_eligible: bool,
+) -> Result<()> {
+    enqueue_agent_triage_lane(conn, account, message, trigger, arrival_eligible, false)
+}
+
+/// [`enqueue_agent_triage_conn`] with an explicit foreground request: a human
+/// asked for this ONE message, so its triage job is charged to the global
+/// budget only and claimed ahead of background work, and a queued job parked
+/// on `daily_budget_exhausted` is un-parked. Bulk work never passes `true`, so
+/// one click cannot spend the arrival reserve on a whole window of mail.
+pub(crate) fn enqueue_agent_triage_lane(
+    conn: &Connection,
+    account: AccountId,
+    message: i64,
+    trigger: &str,
+    arrival_eligible: bool,
+    requested_foreground: bool,
 ) -> Result<()> {
     let m = read_message(conn, account, message)?;
     let snapshot = content_snapshot(&m)?;
@@ -612,13 +667,23 @@ pub(crate) fn enqueue_agent_triage_conn(
     let new_arrival = arrival_eligible && previous.is_none();
     let eligible = (new_arrival || (changed && pending_arrival)) && !m.is_sent && !m.is_spam;
     let foreground = kind == "triage"
-        && (unclassified_arrival || (revision == 1 && matches!(trigger, "ingest" | "arrival")));
+        && (requested_foreground
+            || unclassified_arrival
+            || (revision == 1 && matches!(trigger, "ingest" | "arrival")));
     if trigger.starts_with("revisit:") {
         conn.execute("INSERT INTO agent_triage_jobs(account_id,message_id,kind,trigger,input_revision,arrival_eligible,available_at)
             VALUES(?1,?2,?3,?4,?5,0,?6) ON CONFLICT DO NOTHING",params![account,message,kind,trigger,revision,now])?;
     } else {
         queue_investigation(
-            conn, account, message, revision, kind, trigger, eligible, foreground,
+            conn,
+            account,
+            message,
+            revision,
+            kind,
+            trigger,
+            eligible,
+            foreground,
+            requested_foreground,
         )?;
     }
     if eligible && (new_arrival || pending_notification) {
@@ -688,6 +753,7 @@ fn queue_dependent_refreshes(
             input_revision,
             &kind,
             &format!("source_changed:{source}:{revision}"),
+            false,
             false,
             false,
         )?;

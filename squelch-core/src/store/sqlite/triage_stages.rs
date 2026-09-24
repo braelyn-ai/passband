@@ -202,11 +202,17 @@ fn list_usage_category(
 
 // Keep the time-window range as the outer loop. Each matching request makes an
 // indexed equality probe into jobs, including the computed trigger value.
+// A job is PARKED when the worker deferred it past now because a daily budget
+// ran out; ?3 is now.
 pub(super) const RETRIAGE_PROGRESS_SQL: &str =
     "SELECT COUNT(*),COALESCE(SUM(CASE WHEN j.state IN ('completed','failed')
-                 THEN 1 ELSE 0 END),0),MIN(t.retriage_at)
+                 THEN 1 ELSE 0 END),0),MIN(t.retriage_at),
+                 COALESCE(SUM(CASE WHEN j.state='queued' AND j.last_error='daily_budget_exhausted'
+                     AND j.available_at>?3 THEN 1 ELSE 0 END),0),
+                 MIN(CASE WHEN j.state='queued' AND j.last_error='daily_budget_exhausted'
+                     AND j.available_at>?3 THEN j.available_at END)
              FROM triage t INDEXED BY idx_triage_retriage_window
-             CROSS JOIN agent_triage_jobs j INDEXED BY idx_agent_jobs_manual_progress
+             CROSS JOIN agent_triage_jobs j INDEXED BY idx_agent_jobs_retriage_progress
                ON j.account_id=t.account_id AND j.message_id=t.message_id
               AND j.trigger='manual:' || t.retriage_at
               AND j.kind IN ('triage','access')
@@ -363,13 +369,18 @@ impl SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?
         };
+        // One named message is a human waiting on an answer: foreground, so it
+        // pays from the global budget only. A window stays background so one
+        // click cannot spend the reserve that new arrivals rely on.
+        let foreground = message_id.is_some();
         for id in &ids {
-            super::agent_triage::enqueue_agent_triage_conn(
+            super::agent_triage::enqueue_agent_triage_lane(
                 &tx,
                 account_id,
                 *id,
                 &format!("manual:{now}"),
                 false,
+                foreground,
             )?;
             tx.execute(
                 "UPDATE triage SET retriage_at=?3 WHERE account_id=?1 AND message_id=?2",
@@ -384,18 +395,38 @@ impl SqliteStore {
     /// A failed job is terminal; diagnostics preserve its failure separately.
     pub(super) fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
         let conn = self.lock()?;
-        let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-        let (total, done, started_at): (i64, i64, Option<String>) =
-            conn.query_row(RETRIAGE_PROGRESS_SQL, params![account_id, since], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+        let now = Utc::now();
+        let since = (now - chrono::Duration::hours(24)).to_rfc3339();
+        let (total, done, started_at, parked, resumes_at): (
+            i64,
+            i64,
+            Option<String>,
+            i64,
+            Option<String>,
+        ) = conn.query_row(
+            RETRIAGE_PROGRESS_SQL,
+            params![account_id, since, now.to_rfc3339()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let parse = |time: Option<String>| {
+            time.as_deref()
+                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                .map(|time| time.with_timezone(&Utc))
+        };
         Ok(RetriageProgress {
             total,
             done,
-            started_at: started_at
-                .as_deref()
-                .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
-                .map(|time| time.with_timezone(&Utc)),
+            started_at: parse(started_at),
+            budget_parked: parked,
+            budget_resumes_at: parse(resumes_at),
         })
     }
 

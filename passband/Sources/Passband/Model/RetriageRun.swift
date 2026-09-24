@@ -30,6 +30,12 @@ struct RetriageRun: Sendable, Equatable {
     /// the way out, because this modal has no other one and a wedged daemon
     /// would otherwise cost the user a force-quit.
     var stalled = false
+    /// Jobs the daemon parked on the daily triage budget, and when the first of
+    /// them resumes. A parked run is PAUSED, not stuck: it will not move until
+    /// the budget resets, which can be hours, so it says why and opens the door
+    /// at once instead of making somebody sit out the stall window first.
+    var parked = 0
+    var resumesAt: String?
 
     /// Sized on what a human will stare at, NOT on the daemon's cadence — which
     /// this client cannot see and which has already moved once (`sync.poll_secs`
@@ -57,6 +63,32 @@ struct RetriageRun: Sendable, Equatable {
         if next != done { lastAdvance = now }
         done = next
         stalled = now.timeIntervalSince(lastAdvance) > Self.stallSeconds
+        parked = max(p.budget_parked ?? 0, 0)
+        resumesAt = parked > 0 ? p.budget_resumes_at : nil
+    }
+
+    /// Some of the run is waiting on tomorrow's budget.
+    var paused: Bool { counted && parked > 0 && !finished }
+
+    /// The pause in plain words, with the resume time in the viewer's own clock.
+    static func pauseNote(
+        resumesAt: Date?, now: Date = Date(), calendar: Calendar = .current,
+        locale: Locale = .current
+    ) -> String {
+        let lead = "Paused: today's triage budget is used up."
+        guard let resumesAt else { return lead }
+        var style = Date.FormatStyle(date: .omitted, time: .shortened)
+        style.calendar = calendar
+        style.timeZone = calendar.timeZone
+        style.locale = locale
+        let time = resumesAt.formatted(style)
+        if calendar.isDate(resumesAt, inSameDayAs: now) { return "\(lead) Resumes at \(time)." }
+        if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now),
+            calendar.isDate(resumesAt, inSameDayAs: tomorrow)
+        {
+            return "\(lead) Resumes tomorrow at \(time)."
+        }
+        return lead
     }
 
     /// Nothing left in either queue. Only ever true once a poll has ANSWERED:
@@ -71,7 +103,7 @@ struct RetriageRun: Sendable, Equatable {
     /// Whether to offer the way out. A live, moving run does NOT — that is the
     /// whole point of the modal — but a run nobody can watch or that has stopped
     /// moving must never be a window the user cannot get back.
-    var canClose: Bool { !watching || stalled }
+    var canClose: Bool { !watching || stalled || paused }
 
     /// 0...1 for the bar, and a full bar only for a run that really finished.
     var fraction: Double {

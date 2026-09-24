@@ -17,6 +17,7 @@ struct RetriageRunTests {
         neverBackwards()
         stalling()
         deadEnds()
+        pausing()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -110,6 +111,52 @@ struct RetriageRunTests {
         equal(lost.watching, false, "nor can a dead connection")
         equal(lost.canClose, true, "same door")
         equal(lost.finished, false, "same refusal to claim success")
+    }
+
+    /// A run parked on the daily budget will not move for hours. It must say
+    /// why, open the door at once, and drop the pause when the budget resets.
+    static func pausing() {
+        var run = RetriageRun(total: 3)
+        run.adopt(.init(total: 3, done: 1, started_at: "x"))
+        equal(run.paused, false, "an old daemon sends no parked count: not paused")
+        equal(run.canClose, false, "so a live run keeps its door shut")
+
+        run.adopt(
+            .init(
+                total: 3, done: 1, started_at: "x", budget_parked: 2,
+                budget_resumes_at: "2026-09-25T00:00:01+00:00"))
+        equal(run.paused, true, "parked jobs pause the run")
+        equal(run.canClose, true, "and a pause opens the door without a stall wait")
+        equal(run.watching, true, "while the poll keeps watching for the reset")
+        equal(run.resumesAt, "2026-09-25T00:00:01+00:00", "the resume time is kept")
+
+        run.adopt(.init(total: 3, done: 3, started_at: "x", budget_parked: 0))
+        equal(run.paused, false, "a run that resumed and finished is not paused")
+        equal(run.resumesAt, nil, "and forgets the resume time")
+
+        var pacific = Calendar(identifier: .gregorian)
+        pacific.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let en = Locale(identifier: "en_US")
+        // 2026-09-24 12:00 PDT, resuming at 17:00:01 PDT the same day.
+        let now = Date(timeIntervalSince1970: 1_790_276_400)
+        let resume = Date(timeIntervalSince1970: 1_790_294_401)
+        let today = RetriageRun.pauseNote(resumesAt: resume, now: now, calendar: pacific, locale: en)
+        equal(
+            today.replacingOccurrences(of: "\u{202F}", with: " "),
+            "Paused: today's triage budget is used up. Resumes at 5:00 PM.",
+            "same-day resume reads as a local clock time")
+        let next = RetriageRun.pauseNote(
+            resumesAt: resume.addingTimeInterval(86_400), now: now, calendar: pacific, locale: en)
+        equal(
+            next.replacingOccurrences(of: "\u{202F}", with: " "),
+            "Paused: today's triage budget is used up. Resumes tomorrow at 5:00 PM.",
+            "a next-day resume says tomorrow")
+        equal(
+            RetriageRun.pauseNote(resumesAt: nil, now: now, calendar: pacific, locale: en),
+            "Paused: today's triage budget is used up.", "no time, no promise")
+        equal(
+            today.contains("\u{2014}") || next.contains("\u{2014}"), false,
+            "no em dashes in copy")
     }
 
     // MARK: - assertions

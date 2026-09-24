@@ -1937,6 +1937,8 @@ mod tests {
                 total: 7,
                 done: 3,
                 started_at: None,
+                budget_parked: 0,
+                budget_resumes_at: None,
             },
         };
         let text = render(&m, Some(&db));

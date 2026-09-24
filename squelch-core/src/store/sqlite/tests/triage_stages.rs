@@ -368,6 +368,235 @@ fn manual_retriage_windows_bulk_requests_but_accepts_an_explicit_old_message() {
     assert_eq!(store.retriage_progress(account).unwrap().total, 2);
 }
 
+/// One settled message whose ingest work is done, so the only job left to
+/// claim is whatever the test asks for next.
+fn settled_message(store: &SqliteStore, account: AccountId) -> i64 {
+    use crate::store::agent_triage::AgentTriageStore;
+    let id = triaged_row(
+        account,
+        "message",
+        "thread",
+        None,
+        false,
+        Sensitivity::Normal,
+    )
+    .ingest(store);
+    while let Some(job) = store
+        .claim_agent_job(account, "investigation", Utc::now(), 60)
+        .unwrap()
+    {
+        store.complete_agent_job(&job).unwrap();
+    }
+    id
+}
+
+fn manual_job_row(store: &SqliteStore, id: i64) -> (String, Option<String>, i64, i64) {
+    store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT j.available_at,j.last_error,j.attempts,COALESCE(l.foreground,0)
+             FROM agent_triage_jobs j LEFT JOIN agent_job_lanes l ON l.job_id=j.id
+             WHERE j.message_id=?1 AND j.trigger LIKE 'manual:%'",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn single_message_retriage_is_foreground_and_a_window_is_not() {
+    use crate::store::agent_triage::AgentTriageStore;
+    for single in [true, false] {
+        let (store, account) = store();
+        let id = settled_message(&store, account);
+        store
+            .retriage_reset(account, single.then_some(id), 7)
+            .unwrap();
+        let job = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!(job.trigger.starts_with("manual:"));
+        assert_eq!(
+            job.foreground, single,
+            "only a one-message request skips the background budget"
+        );
+    }
+}
+
+#[test]
+fn reasking_for_one_message_unparks_a_budget_deferral_only() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let later = Utc::now() + chrono::Duration::hours(6);
+    for (error, unparks) in [
+        ("daily_budget_exhausted", true),
+        ("provider_cooldown", false),
+    ] {
+        let (store, account) = store();
+        let id = settled_message(&store, account);
+        // A window request runs in the background and gets parked.
+        store.retriage_reset(account, None, 7).unwrap();
+        let job = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        store.defer_agent_job(&job, later, error).unwrap();
+        let parked = manual_job_row(&store, id);
+        assert_eq!(parked.1.as_deref(), Some(error));
+        store.retriage_reset(account, Some(id), 7).unwrap();
+        let after = manual_job_row(&store, id);
+        assert_eq!(after.2, parked.2, "{error}: attempts are never reset");
+        assert_eq!(after.3, 1, "{error}: the re-ask is foreground work");
+        let claimed = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap();
+        if unparks {
+            assert_eq!(after.1, None, "the budget deferral is cleared");
+            assert!(after.0 < parked.0, "and it is claimable now");
+            assert!(claimed.unwrap().foreground);
+        } else {
+            assert_eq!(after.0, parked.0, "{error}: genuine backoff is kept");
+            assert_eq!(after.1.as_deref(), Some(error));
+            assert!(claimed.is_none());
+        }
+    }
+}
+
+/// A click that lands while the message's job is LEASED is stored as a
+/// follow-up. Whichever way the running job ends, the re-run it leaves behind
+/// is the human's one-message request, so it must be foreground; a window
+/// request's follow-up stays background.
+#[test]
+fn a_one_message_request_during_a_lease_keeps_its_foreground_lane() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let later = Utc::now() + chrono::Duration::hours(6);
+    for (single, ending) in [
+        (true, "complete"),
+        (false, "complete"),
+        (true, "budget"),
+        (false, "budget"),
+        (true, "cooldown"),
+    ] {
+        let (store, account) = store();
+        let id = settled_message(&store, account);
+        // A window request runs in the background and is mid-flight.
+        store.retriage_reset(account, None, 7).unwrap();
+        let running = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!(!running.foreground);
+        // Distinct manual stamps: the request identity is the timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .retriage_reset(account, single.then_some(id), 7)
+            .unwrap();
+        match ending {
+            "complete" => {
+                store.complete_agent_job(&running).unwrap();
+            }
+            "budget" => {
+                store
+                    .defer_agent_job(&running, later, "daily_budget_exhausted")
+                    .unwrap();
+            }
+            _ => {
+                store
+                    .defer_agent_job(&running, later, "provider_cooldown")
+                    .unwrap();
+            }
+        }
+        let row = manual_job_row(&store, id);
+        assert_eq!(
+            row.3 == 1,
+            single,
+            "{single}/{ending}: the re-run's lane follows the request"
+        );
+        let claimed = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap();
+        match (single, ending) {
+            (_, "complete") | (true, "budget") => {
+                let job = claimed.expect("the re-run is claimable now");
+                assert_eq!(job.foreground, single, "{single}/{ending}");
+                assert!(job.trigger.starts_with("manual:"));
+            }
+            _ => assert!(
+                claimed.is_none(),
+                "{single}/{ending}: a window stays parked and genuine backoff is kept"
+            ),
+        }
+    }
+}
+
+#[test]
+fn retriage_progress_reports_budget_parked_jobs_and_when_they_resume() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let (store, account) = store();
+    let first = settled_message(&store, account);
+    let second =
+        triaged_row(account, "second", "other", None, false, Sensitivity::Normal).ingest(&store);
+    while let Some(job) = store
+        .claim_agent_job(account, "investigation", Utc::now(), 60)
+        .unwrap()
+    {
+        store.complete_agent_job(&job).unwrap();
+    }
+    store.retriage_reset(account, None, 7).unwrap();
+    let progress = store.retriage_progress(account).unwrap();
+    assert_eq!((progress.total, progress.budget_parked), (2, 0));
+    assert_eq!(progress.budget_resumes_at, None);
+
+    let soon = Utc::now() + chrono::Duration::hours(2);
+    let later = Utc::now() + chrono::Duration::hours(5);
+    for when in [later, soon] {
+        let job = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!([first, second].contains(&job.message_id));
+        store
+            .defer_agent_job(&job, when, "daily_budget_exhausted")
+            .unwrap();
+    }
+    let progress = store.retriage_progress(account).unwrap();
+    assert_eq!(progress.budget_parked, 2);
+    assert_eq!(
+        progress.budget_resumes_at.map(|t| t.timestamp()),
+        Some(soon.timestamp()),
+        "the earliest resume time is the one worth showing"
+    );
+    let wire = serde_json::to_value(&progress).unwrap();
+    assert_eq!(wire["budget_parked"], 2);
+    assert!(wire["budget_resumes_at"].is_string());
+
+    // A cooldown is not a budget pause, and a deferral that has come due is
+    // just queued work again.
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_triage_jobs SET available_at=?2 WHERE message_id=?1",
+            params![
+                first,
+                (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+            ],
+        )
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE agent_triage_jobs SET last_error='provider_cooldown' WHERE message_id=?1",
+            [second],
+        )
+        .unwrap();
+    let progress = store.retriage_progress(account).unwrap();
+    assert_eq!(progress.budget_parked, 0);
+    assert_eq!(progress.budget_resumes_at, None);
+}
+
 #[test]
 fn retriage_progress_expires_old_requests_without_touching_their_jobs() {
     let (store, account) = store();
@@ -2178,7 +2407,10 @@ fn retriage_progress_uses_covering_range_and_trigger_lookups() {
     let plan: Vec<String> = conn
         .prepare(&sql)
         .unwrap()
-        .query_map(params![account, Utc::now().to_rfc3339()], |row| row.get(3))
+        .query_map(
+            params![account, Utc::now().to_rfc3339(), Utc::now().to_rfc3339()],
+            |row| row.get(3),
+        )
         .unwrap()
         .collect::<std::result::Result<_, _>>()
         .unwrap();
@@ -2189,7 +2421,7 @@ fn retriage_progress_uses_covering_range_and_trigger_lookups() {
     );
     assert!(plan.contains("retriage_at>?"), "{plan}");
     assert!(
-        plan.contains("SEARCH j USING COVERING INDEX idx_agent_jobs_manual_progress"),
+        plan.contains("SEARCH j USING COVERING INDEX idx_agent_jobs_retriage_progress"),
         "{plan}"
     );
     assert!(plan.contains("trigger=?"), "{plan}");
