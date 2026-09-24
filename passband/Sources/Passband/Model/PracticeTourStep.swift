@@ -64,15 +64,16 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         }
     }
 
-    /// A key in braces, `{e}`, renders as an inline keycap in the guide card.
+    /// A key in braces, `{e}`, renders as an inline keycap in the guide card,
+    /// and `**For Your Eyes**` marks a section name to set in bold.
     var explanation: String {
         switch self {
         case .welcome:
             "Let’s try a few things in this practice inbox. The mail is fictional, but the mailbox is the real Passband experience."
         case .needsYou:
-            "Think of For Your Eyes as your to-do list. Reading a message keeps it here. Marking it done clears it from your board."
+            "Think of **For Your Eyes** as your to-do list. Reading a message keeps it here. Marking it done clears it from your board."
         case .openMaya:
-            "Maya has a short update for you. Click her message in For Your Eyes to read it."
+            "Maya has a short update for you. Click her message in **For Your Eyes** to read it."
         case .done:
             "Maya’s note needs a read, not a reply. Press {e} when you’re done. It leaves your board and stays in your mail."
         case .undo:

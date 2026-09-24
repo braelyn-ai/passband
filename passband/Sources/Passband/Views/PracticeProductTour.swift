@@ -188,10 +188,23 @@ struct PracticeProductTour: View {
         while let open = rest.firstIndex(of: "{"),
               let close = rest[open...].firstIndex(of: "}") {
             let key = String(rest[rest.index(after: open)..<close])
-            text = Text("\(text)\(Text(verbatim: String(rest[..<open])))\(inlineKeycap(key))")
+            text = Text("\(text)\(styledRun(rest[..<open]))\(inlineKeycap(key))")
             rest = rest[rest.index(after: close)...]
         }
-        return Text("\(text)\(Text(verbatim: String(rest)))")
+        return Text("\(text)\(styledRun(rest))")
+    }
+
+    /// `**Section**` runs set in full ink at semibold, so a section name reads
+    /// as a place in the app against the dimmed sentence around it.
+    private func styledRun(_ run: Substring) -> Text {
+        var text = Text(verbatim: "")
+        for (index, part) in run.components(separatedBy: "**").enumerated() {
+            let piece = Text(verbatim: part)
+            text = index.isMultiple(of: 2)
+                ? Text("\(text)\(piece)")
+                : Text("\(text)\(piece.fontWeight(.semibold).foregroundStyle(Palette.ink))")
+        }
+        return text
     }
 
     private func inlineKeycap(_ key: String) -> Text {
