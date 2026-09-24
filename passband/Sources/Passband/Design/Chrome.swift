@@ -37,7 +37,10 @@ enum TopBar {
     /// strip and it yields the whole span. A surface that goes FULL WINDOW WIDTH
     /// covers the rail as well, and then its own header starts at x 0 — under
     /// the buttons, which is where fullscreen search was drawing its title.
-    static let dotsClearance: CGFloat = 78
+    ///
+    /// The buttons are AppKit's and do not zoom, so the clearance is 78 WINDOW
+    /// points, divided back into the zoomed layout's points.
+    @MainActor static var dotsClearance: CGFloat { 78 / Prefs.shared.zoom }
 }
 
 // MARK: - waiting

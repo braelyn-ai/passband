@@ -128,6 +128,7 @@ final class Prefs {
         static let tourCompleted = "passband.pref.tourCompleted"
         static let lastSeenReleaseNotes = "passband.pref.lastSeenReleaseNotes"
         static let theme = "passband.pref.theme"
+        static let zoom = "passband.pref.zoom"
         static let threadStyle = "passband.pref.threadStyle"
         static let searchSort = "passband.pref.searchSort"
         static let notificationSound = "passband.pref.notificationSound"
@@ -148,6 +149,7 @@ final class Prefs {
             Key.developerMode: false,
             Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
+            Key.zoom: 1.0,
             Key.threadStyle: ThreadStyleDefault.auto.rawValue,
             Key.searchSort: SearchSortChoice.recent.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
@@ -162,6 +164,7 @@ final class Prefs {
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _lastSeenReleaseNotes = defaults.string(forKey: Key.lastSeenReleaseNotes)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
+        _zoom = Zoom.clamp(defaults.double(forKey: Key.zoom))
         _threadStyle =
             ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto
         _searchSort =
@@ -286,6 +289,17 @@ final class Prefs {
         set {
             _theme = newValue
             defaults.set(newValue.rawValue, forKey: Key.theme)
+        }
+    }
+
+    /// The whole window's scale, ⌘+ / ⌘- / ⌘0 (see App/Zoom.swift). Always a
+    /// step on `Zoom.steps`.
+    private var _zoom: Double
+    var zoom: Double {
+        get { _zoom }
+        set {
+            _zoom = Zoom.clamp(newValue)
+            defaults.set(_zoom, forKey: Key.zoom)
         }
     }
 
