@@ -704,6 +704,34 @@ fn migrate_adds_shipment_provenance_and_backfills_it_from_the_pointer() {
         (Some(7), None, None),
         "no name and no order reference means nothing to attribute"
     );
+
+    // ORDER LINKS: the open that creates the table backfills a 'legacy' link
+    // for every row with both an order reference and a merchant, and no other.
+    let links = |conn: &Connection| -> Vec<(i64, String, String, String)> {
+        conn.prepare(
+            "SELECT shipment_id, merchant_key, order_key, source FROM shipment_order_links",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    };
+    let want = vec![(1, "shopacom".into(), "1042".into(), "legacy".into())];
+    assert_eq!(links(&conn), want);
+    // ONE-SHOT: a later open must not pair an agent-written merchant with the
+    // extractor's stale order_ref.
+    conn.execute(
+        "UPDATE shipments SET order_merchant = 'Shop A', order_ref = '1042' WHERE id = 2",
+        [],
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(links(&conn), want, "the backfill never runs again");
+    // Deleting a shipment deletes its links, whichever path deletes it.
+    conn.execute("DELETE FROM shipments WHERE id = 1", [])
+        .unwrap();
+    assert!(links(&conn).is_empty(), "links follow their shipment out");
 }
 
 #[test]

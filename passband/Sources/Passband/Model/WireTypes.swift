@@ -427,6 +427,15 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     /// Rate limits and transport errors never count, which is what makes a
     /// nonzero value evidence about the NUMBER rather than about the network.
     var poll_failures: Int?
+    /// THE ORDER FIELDS, absent from a daemon older than order linking.
+    ///
+    /// Who sold it, as the customer knows the store. Never the carrier.
+    var merchant: String?
+    /// Every order this card carries, deduped by the daemon.
+    var orders: [ShipmentOrder]?
+    /// The OTHER tracking numbers the daemon folded into this card because they
+    /// share an order. Empty (or absent) for a lone package.
+    var legs: [ShipmentLeg]?
 
     /// The item name as a LABEL: emoji dropped, whitespace collapsed. The
     /// daemon lifts this out of a subject line and its strip leaves pictographs
@@ -434,6 +443,60 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     /// Empty when nothing survives (a name that was only decoration), which is
     /// each caller's cue to use its own fallback.
     var displayItem: String { item_name.withoutEmoji }
+
+    /// The merchant as a label, same strip as the item name. Empty when absent.
+    var displayMerchant: String { (merchant ?? "").withoutEmoji }
+
+    /// The card's name: what is in the box, else who sold it, else "Package".
+    /// Never the carrier: the carrier is already the badge beside it.
+    var displayTitle: String {
+        let item = displayItem
+        if !item.isEmpty { return item }
+        let store = displayMerchant
+        return store.isEmpty ? "Package" : store
+    }
+
+    /// Order refs as printed on the card, each with ONE leading "#".
+    var displayOrderRefs: [String] {
+        (orders ?? []).compactMap {
+            var ref = $0.order_ref.withoutEmoji
+            while ref.hasPrefix("#") { ref.removeFirst() }
+            ref = ref.trimmingCharacters(in: .whitespaces)
+            return ref.isEmpty ? nil : "#\(ref)"
+        }
+    }
+
+    /// The quiet line under the title: merchant, order refs, and a box count
+    /// when the daemon merged several. The merchant is left out when it is
+    /// already the title. nil when there is nothing to say.
+    var orderLine: String? {
+        var parts: [String] = []
+        let store = displayMerchant
+        if !store.isEmpty, store != displayTitle { parts.append(store) }
+        let refs = displayOrderRefs
+        if !refs.isEmpty { parts.append(refs.joined(separator: ", ")) }
+        let boxes = (legs ?? []).count + 1
+        if boxes > 1 { parts.append("\(boxes) packages") }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
+/// One order a shipment card carries (core::types::ShipmentOrder).
+struct ShipmentOrder: Codable, Sendable, Hashable {
+    var merchant: String?
+    var order_ref: String
+}
+
+/// Another tracking number merged into a card (core::types::ShipmentLeg).
+/// Carrier and status decode leniently, like `Shipment`'s own.
+struct ShipmentLeg: Codable, Sendable, Hashable, Identifiable {
+    var id: Int
+    var carrier: Carrier
+    var tracking_number: String
+    var status: ShipmentStatus
+    var tracking_url: String?
+    var last_update: String
+    var delivered_at: String?
 }
 
 // MARK: - receipts / calendar / banking

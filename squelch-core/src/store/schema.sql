@@ -1441,6 +1441,10 @@ CREATE TABLE IF NOT EXISTS agent_delivery_projections (
     PRIMARY KEY(account_id,shipment_id)
 );
 
+-- `shipment_order_links` (which orders each package carries) is created in
+-- migrate.rs, NOT here: its creation triggers a one-shot backfill, which only
+-- works if this file cannot have created it first.
+
 -- Independent model assessments for human notification diagnostics. Multiple
 -- attempts remain inspectable; the notification ledger still records delivery.
 CREATE TABLE IF NOT EXISTS notification_assessments (

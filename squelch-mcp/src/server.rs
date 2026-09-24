@@ -23,7 +23,9 @@ use squelch_core::triage::agent_config::RankingConfig;
 use squelch_core::triage::decision::{
     EmailKind, MessageDestination, RecordProposal, SupportedTime, ThreadAttentionDecision,
 };
-use squelch_core::types::{AccountId, Disposition, SenderRule, ThreadView};
+use squelch_core::types::{
+    AccountId, Disposition, SenderRule, ShipmentLeg, ShipmentOrder, ThreadView,
+};
 
 /// The squelch MCP server. Single-account: the account is resolved once at
 /// construction, though every row already carries `account_id`.
@@ -158,6 +160,93 @@ pub struct ShipmentHit {
     /// poll. Carried because our five-rung ladder loses detail the agent can
     /// usefully relay ("Delivered to neighbor", "Held at customs").
     pub carrier_status_raw: Option<String>,
+    /// Who sold it, when known. Same meaning as the human door's.
+    pub merchant: Option<String>,
+    /// The orders this package (or, on a grouped hit, every package in the
+    /// group) carries.
+    pub orders: Vec<ShipmentOrder>,
+    /// The other packages folded into this hit because they share an order.
+    /// Grouped by the same rule as the human door, after the same hides.
+    pub legs: Vec<ShipmentLeg>,
+    /// The carrier row behind this hit, for grouping. Not served.
+    #[serde(skip)]
+    row: Option<squelch_core::types::Shipment>,
+}
+
+impl ShipmentHit {
+    fn from_row(shipment: squelch_core::types::Shipment) -> Self {
+        Self {
+            item_name: shipment.item_name.clone(),
+            carrier: shipment.carrier.clone(),
+            status: shipment.status.clone(),
+            tracking_number: shipment.tracking_number.clone(),
+            tracking_url: shipment.tracking_url.clone(),
+            last_update: shipment.last_update,
+            eta: shipment.eta,
+            carrier_status_raw: shipment.carrier_status_raw.clone(),
+            merchant: shipment.merchant.clone(),
+            orders: shipment.orders.clone(),
+            legs: Vec::new(),
+            row: Some(shipment),
+        }
+    }
+}
+
+/// One purchase, one hit: the human door's grouping (`order_link`), applied to
+/// the agent door's merged list. Only a hit backed by a carrier row can carry
+/// orders, so a record with no tracking number always stands alone. The
+/// representative is the newest (`last_update`, then the higher row id); the
+/// name and merchant fall back to the newest non-empty one in the group.
+fn group_hits(hits: Vec<ShipmentHit>) -> Vec<ShipmentHit> {
+    use squelch_core::triage::order_link::{order_groups, union_orders};
+    let groups = {
+        let orders: Vec<&[ShipmentOrder]> = hits.iter().map(|h| h.orders.as_slice()).collect();
+        order_groups(&orders)
+    };
+    let mut slots: Vec<Option<ShipmentHit>> = hits.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(groups.len());
+    for group in groups {
+        let mut members: Vec<ShipmentHit> =
+            group.into_iter().filter_map(|i| slots[i].take()).collect();
+        let row_id = |h: &ShipmentHit| h.row.as_ref().map_or(0, |r| r.id);
+        members.sort_by(|a, b| {
+            b.last_update
+                .cmp(&a.last_update)
+                .then_with(|| row_id(b).cmp(&row_id(a)))
+        });
+        let orders = union_orders(members.iter().map(|m| m.orders.as_slice()));
+        let item_name = members
+            .iter()
+            .map(|m| m.item_name.trim())
+            .find(|n| !n.is_empty())
+            .unwrap_or("")
+            .to_string();
+        let merchant = members
+            .iter()
+            .filter_map(|m| m.merchant.as_deref().map(str::trim))
+            .find(|m| !m.is_empty())
+            .map(str::to_string);
+        let mut members = members.into_iter();
+        let Some(mut hit) = members.next() else {
+            continue;
+        };
+        hit.legs = members
+            .map(|m| ShipmentLeg {
+                id: row_id(&m),
+                delivered_at: m.row.as_ref().and_then(|r| r.delivered_at),
+                carrier: m.carrier,
+                tracking_number: m.tracking_number,
+                status: m.status,
+                tracking_url: m.tracking_url,
+                last_update: m.last_update,
+            })
+            .collect();
+        hit.item_name = item_name;
+        hit.merchant = merchant;
+        hit.orders = orders;
+        out.push(hit);
+    }
+    out
 }
 
 /// Parameters for `set_sender_rule`.
@@ -666,6 +755,10 @@ impl SquelchServer {
                 }
                 let mut hit = ShipmentHit {
                     item_name: item.decision.summary.clone(),
+                    merchant: None,
+                    orders: Vec::new(),
+                    legs: Vec::new(),
+                    row: None,
                     carrier: carrier.unwrap_or_default(),
                     status,
                     tracking_number: number,
@@ -683,6 +776,15 @@ impl SquelchServer {
                     hit.tracking_url = observation.tracking_url.clone();
                     hit.eta = observation.eta;
                     hit.carrier_status_raw = observation.carrier_status_raw.clone();
+                    // The row's name, merchant and orders are the reconciled
+                    // ones (sanitized, newest first); the summary is only the
+                    // fallback for a row that has no name.
+                    if !observation.item_name.trim().is_empty() {
+                        hit.item_name = observation.item_name.clone();
+                    }
+                    hit.merchant = observation.merchant.clone();
+                    hit.orders = observation.orders.clone();
+                    hit.row = Some(observation.clone());
                     if observation.carrier_status_raw.is_some() {
                         hit.status = observation.status.clone();
                     }
@@ -708,19 +810,10 @@ impl SquelchServer {
             {
                 continue;
             }
-            out.push(ShipmentHit {
-                item_name: shipment.item_name,
-                carrier: shipment.carrier,
-                status: shipment.status,
-                tracking_number: shipment.tracking_number,
-                tracking_url: shipment.tracking_url,
-                last_update: shipment.last_update,
-                eta: shipment.eta,
-                carrier_status_raw: shipment.carrier_status_raw,
-            });
+            out.push(ShipmentHit::from_row(shipment));
         }
         out.sort_by(|a, b| b.last_update.cmp(&a.last_update));
-        Self::ok_json(out)
+        Self::ok_json(group_hits(out))
     }
 
     /// Create or update a local sender rule. Writes ONLY squelch's local store;
@@ -1036,6 +1129,9 @@ mod tests {
                     carrier: Some("ups".into()),
                     tracking_number: Some(" 1z999 aa10 1234 56784 ".into()),
                     status: "shipped".into(),
+                    item_name: None,
+                    merchant: None,
+                    order_refs: vec![],
                     evidence: vec![],
                 },
             ],
@@ -1159,6 +1255,100 @@ mod tests {
         );
     }
 
+    /// ONE PURCHASE, ONE HIT, on both doors. Two tracking numbers that share an
+    /// order (the supplier leg and the leg to the user) come back from
+    /// `get_shipments` as one hit shaped like the human door's one card: the
+    /// newest package represents, the other is a leg, the name and merchant
+    /// are the reconciled ones, and the orders are the union.
+    #[tokio::test]
+    async fn get_shipments_groups_one_order_like_the_human_door() {
+        use squelch_core::store::agent_triage::AgentCommitOutcome;
+        use squelch_core::triage::decision::MessageDecision;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let leg = |number: &str, item: Option<&str>, refs: &[&str]| MessageDecision {
+            summary: "Shipment update".into(),
+            records: vec![RecordProposal::Delivery {
+                carrier: Some("ups".into()),
+                tracking_number: Some(number.into()),
+                status: "shipped".into(),
+                item_name: item.map(str::to_string),
+                merchant: Some("Bill's Exhausts".into()),
+                order_refs: refs.iter().map(|r| r.to_string()).collect(),
+                evidence: vec![],
+            }],
+            ..Default::default()
+        };
+        for (thread, decision) in [
+            ("inbound", leg("1ZW061R3DG21045729", None, &["21470"])),
+            (
+                "outbound",
+                leg(
+                    "1ZB8B2560323528551",
+                    Some("Austin Racing DB Killer AUR10"),
+                    &["#21470"],
+                ),
+            ),
+        ] {
+            let id = seed(&store, account, thread, "Shipment update");
+            while let Some(job) = store
+                .claim_agent_job(account, "triage", Utc::now(), 120)
+                .unwrap()
+            {
+                assert_eq!(job.message_id, id);
+                let context = store.load_agent_context(&job).unwrap();
+                assert_eq!(
+                    store
+                        .commit_agent_decision(
+                            &job,
+                            &context,
+                            &decision,
+                            std::slice::from_ref(&context.message.source)
+                        )
+                        .unwrap(),
+                    AgentCommitOutcome::Applied
+                );
+            }
+        }
+        assert_eq!(
+            store.external_shipments(account, true).unwrap().len(),
+            2,
+            "the raw observation feed stays ungrouped"
+        );
+        let human = store.list_shipments(account, true, policy).unwrap();
+        let agent = values(
+            &server
+                .get_shipments(Parameters(GetShipmentsParams {
+                    include_delivered: Some(true),
+                }))
+                .await
+                .unwrap(),
+        );
+        let agent = agent.as_array().unwrap();
+        assert_eq!((human.len(), agent.len()), (1, 1), "one card on both doors");
+        let hit = &agent[0];
+        assert_eq!(hit["tracking_number"], human[0].tracking_number);
+        assert_eq!(hit["item_name"], "Austin Racing DB Killer AUR10");
+        assert_eq!(hit["item_name"], human[0].item_name);
+        assert_eq!(hit["merchant"], "Bill's Exhausts");
+        assert_eq!(hit["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(hit["orders"][0]["order_ref"], "21470");
+        assert_eq!(hit["legs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hit["legs"][0]["tracking_number"],
+            human[0].legs[0].tracking_number
+        );
+        assert_eq!(hit["legs"][0]["id"], human[0].legs[0].id);
+        assert!(
+            hit.get("row").is_none(),
+            "the grouping handle is not served"
+        );
+    }
+
     /// TWO DOORS, ONE PACKAGE LIST. The agent door applies the human door's
     /// silence rule to its merged list, on both of its paths (a record hit and
     /// a carrier row no record represents), and the same carrier evidence keeps
@@ -1209,6 +1399,9 @@ mod tests {
                 carrier: Some("ups".into()),
                 tracking_number: Some("1Z999AA10123456784".into()),
                 status: "shipped".into(),
+                item_name: None,
+                merchant: None,
+                order_refs: vec![],
                 evidence: vec![],
             }],
             ..Default::default()
@@ -1305,6 +1498,9 @@ mod tests {
                 carrier: None,
                 tracking_number: Some("1Z999AA10123456784".into()),
                 status: "unknown".into(),
+                item_name: None,
+                merchant: None,
+                order_refs: vec![],
                 evidence: vec![],
             }],
             ..Default::default()

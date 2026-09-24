@@ -3723,6 +3723,9 @@ mod tests {
             carrier: Some("ups".into()),
             tracking_number: Some("1Z999AA10123456784".into()),
             status: "shipped".into(),
+            item_name: None,
+            merchant: None,
+            order_refs: vec![],
             evidence: vec![],
         });
         store
@@ -3804,6 +3807,9 @@ mod tests {
                     carrier: Some("ups".into()),
                     tracking_number: Some("1Z999AA10123456784".into()),
                     status: status.into(),
+                    item_name: None,
+                    merchant: None,
+                    order_refs: vec![],
                     evidence: vec![],
                 });
             }

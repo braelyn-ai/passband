@@ -491,6 +491,75 @@ Staged orders are not currently served on either door. They exist so that the
 shipment you eventually see is named "Anker USB-C charger" instead of "your
 package", and so that a future orders view has something to read.
 
+### Names, merchants and one card per order
+
+Since the triage-agent rewrite, packages are written by `reconcile`
+(`store/sqlite/agent_deliveries.rs`) from the agent's `delivery` records. A
+record carries, besides carrier, tracking number and status:
+
+| Field | Meaning |
+|---|---|
+| `item_name` | What is in the box, as a short label ("Austin Racing DB Killer AUR10"). Null when the mail does not say. |
+| `merchant` | Who sold it, as the customer knows the store ("Bill's Exhausts"). Never the carrier, never a relay platform like Shopify. |
+| `order_refs` | Every order number the box carries. When a ship notice is about an order but does not print its number, the agent looks it up in the sender's history (`read_sender_history`, `search_mail`) and cites that earlier message as evidence. Any message a tool exposed during the run is valid evidence. |
+
+All three default when absent, so decisions stored before they existed still
+reconcile.
+
+**Laundering.** The name goes through the old extractor's sanitizer
+(`sanitize_item_name`: controls, bidi, subject echoes, URLs, carrier names,
+status prose, 60-char cap) and is then dropped if it is only the merchant, the
+carrier or one of the order numbers. The merchant is stripped of controls,
+capped at 60 characters, and refused if it is a carrier or a relay platform. Each
+ref goes through `sanitize_order_ref`.
+
+**Who wins.** On a row the agent created, the name and merchant follow the newest
+retained proposal that states them; a proposal that names nothing never erases a
+name, and retracting the last one that named it clears it. On a legacy row
+(written before the agent owned deliveries), the agent's name and merchant
+replace the old ones only when mail newer than the row lands, the same gate that
+revives a silent row. An agent name is stamped `item_name_source = 'agent'`
+(alongside the older `'regex'` and `'llm'`) and `item_name_msg` points at the
+mail that named it, so the agent door's provenance guard
+(`external_shipment_allowed_conn`) judges the naming mail too. The merchant lands in
+`shipments.order_merchant`; rows the old extractor wrote hold the sender's
+registrable domain there ("amazon.com") instead.
+
+**Order links.** `shipment_order_links(account_id, shipment_id, merchant_key,
+order_key, merchant, order_ref, source)` records which orders each package
+carries, many-to-many. `merchant_key` is the merchant's lowercase alphanumerics
+("Bill's Exhausts" and "BILLS EXHAUSTS" are both `billsexhausts`); `order_key`
+is the ref's uppercase alphanumerics (`#21470` is `21470`). A proposal that names
+orders but no merchant borrows the package's merchant from its other proposals.
+`source = 'agent'` rows are rebuilt by every reconcile from the retained
+proposals for that number, so a retraction removes them. `source = 'legacy'`
+rows were backfilled once, on the open that created the table, from rows the old
+extractor gave both an order ref and a merchant; reconcile never touches them.
+Deleting a shipment deletes its links (an `AFTER DELETE` trigger). It is not
+`shipment_orders`, which is the old extractor's staging table for orders with no
+tracking number yet.
+
+**One card per order.** `GET /client/shipments` groups rows after the hides
+(silence, cleared): two visible rows are one card when they share an order with a
+non-empty merchant key, transitively, so a box carrying orders 1 and 2 and a box
+carrying 2 and 3 are one card. A ref with no merchant never groups, since "#1001"
+is a different purchase at every shop. The newest row (`last_update`, then the
+higher id) represents the card: its status, carrier, tracking, ETA and thread
+are the card's. The name and merchant are its own when it has them, else the
+newest non-empty one in the group. Rows gained:
+
+| Field | Meaning |
+|---|---|
+| `merchant` | Who sold it, or `null`. |
+| `orders` | `[{merchant, order_ref}]`, the union across the card, deduped by key. |
+| `legs` | `[{id, carrier, tracking_number, status, tracking_url, last_update, delivered_at}]`, the other rows folded into this card. Empty for a lone package. |
+
+An older client ignores the new fields and simply sees one row per order. The
+agent door's `get_shipments` groups its merged list by the same rule and serves
+the same three fields; a record hit takes its row's reconciled name when the row
+has one, and the decision summary otherwise. The carrier poller is untouched:
+every tracking number is still its own row and still polled.
+
 ### The detector, tightened
 
 The regex detector still runs at ingest on every non-sealed inbound mail, and

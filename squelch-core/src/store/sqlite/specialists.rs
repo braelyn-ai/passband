@@ -497,7 +497,7 @@ fn shipments_by_order_ref(
 const SHIPMENT_COLUMNS: &str = "s.id, s.account_id, s.tracking_number, s.carrier,
             s.item_name, s.status, s.tracking_url, s.first_seen, s.last_update,
             m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at,
-            s.poll_failures, s.last_answered_at";
+            s.poll_failures, s.last_answered_at, NULLIF(TRIM(s.order_merchant), '')";
 
 /// The tables [`SHIPMENT_COLUMNS`] is read from, split out so the listing can
 /// append its own column (`cleared_at`, which the wire type deliberately does
@@ -523,7 +523,47 @@ fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipmen
         last_polled_at: dt_opt(r, 13)?,
         poll_failures: r.get(14)?,
         last_answered_at: dt_opt(r, 15)?,
+        merchant: r.get(16)?,
+        // Filled by `attach_orders` where a listing wants them.
+        orders: Vec::new(),
+        legs: Vec::new(),
     })
+}
+
+/// Fill each row's `orders` from `shipment_order_links`. The table's key
+/// already dedupes a row's orders, so this is a plain read.
+fn attach_orders(
+    conn: &Connection,
+    account_id: AccountId,
+    rows: &mut [crate::types::Shipment],
+) -> Result<()> {
+    if rows.is_empty() || !super::migrate::order_links_exist(conn)? {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT shipment_id, NULLIF(merchant, ''), order_ref FROM shipment_order_links
+         WHERE account_id = ?1 ORDER BY shipment_id, source, merchant_key, order_key",
+    )?;
+    let mut by_row: std::collections::HashMap<i64, Vec<crate::types::ShipmentOrder>> =
+        std::collections::HashMap::new();
+    for link in stmt.query_map(params![account_id], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            crate::types::ShipmentOrder {
+                merchant: r.get(1)?,
+                order_ref: r.get(2)?,
+            },
+        ))
+    })? {
+        let (id, order) = link?;
+        by_row.entry(id).or_default().push(order);
+    }
+    for row in rows {
+        if let Some(orders) = by_row.remove(&row.id) {
+            row.orders = orders;
+        }
+    }
+    Ok(())
 }
 
 fn list_shipments_conn(
@@ -544,13 +584,13 @@ fn list_shipments_conn(
     let mut stmt = conn.prepare(&sql)?;
     let out = stmt
         .query_map(params![account_id], |r| {
-            Ok((shipment_row(r)?, dt_opt(r, 16)?))
+            Ok((shipment_row(r)?, dt_opt(r, 17)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     // BOTH HIDES ARE READ-SIDE and both reverse themselves: the rows stay live,
     // keep being polled (`list_pollable_shipments` filters on none of this), and
     // come back the moment `last_update` moves.
-    Ok(out
+    let mut visible: Vec<crate::types::Shipment> = out
         .into_iter()
         .filter(|(shipment, cleared_at)| {
             // CLEARED. The comparison IS the revival: hide only while the row
@@ -562,7 +602,9 @@ fn list_shipments_conn(
             !(cleared || silent)
         })
         .map(|(s, _)| s)
-        .collect())
+        .collect();
+    attach_orders(conn, account_id, &mut visible)?;
+    Ok(visible)
 }
 
 impl SqliteStore {
@@ -778,7 +820,13 @@ impl SqliteStore {
     ) -> Result<Vec<crate::types::Shipment>> {
         let silence = policy.silence(Utc::now());
         let conn = self.lock()?;
-        list_shipments_conn(&conn, account_id, include_delivered, silence)
+        // One purchase, one card. Grouped AFTER the hides above, so only rows
+        // the user would see anyway can merge, and a hidden leg never drags its
+        // order onto a visible one. `external_shipments` stays ungrouped: it is
+        // the raw observation feed the agent door groups for itself.
+        Ok(crate::triage::order_link::group_shipments(
+            list_shipments_conn(&conn, account_id, include_delivered, silence)?,
+        ))
     }
 
     /// Read carrier facts and validate all contributing messages under one lock.

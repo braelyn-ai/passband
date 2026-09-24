@@ -136,10 +136,7 @@ private struct ShipmentCard: View {
 
     @State private var hovering = false
 
-    private var title: String {
-        let name = shipment.displayItem
-        return name.isEmpty ? "Package via \(shipment.carrier.label)" : name
-    }
+    private var title: String { shipment.displayTitle }
 
     /// Status → tone: out_for_delivery is the loud one, delivered fades back.
     private var tone: Color {
@@ -268,12 +265,24 @@ private struct ShipmentCard: View {
                 } else {
                     CarrierBadge(carrier: shipment.carrier)
                 }
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(titleHelp)
+                // The order line sits UNDER the title in the same column, so
+                // the badge and chip stay beside the name rather than floating
+                // over a separate row.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Palette.ink)
+                        .lineLimit(2)
+                        .help(titleHelp)
+                    if let orderLine = shipment.orderLine {
+                        Text(orderLine)
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaint)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Chip(
                     text: statusText, tone: tone,
                     symbol: shipment.status == .delivered ? "checkmark.circle.fill" : nil,
@@ -350,15 +359,6 @@ private struct CarrierBadge: View {
             failed = image == nil
         }
     }
-}
-
-// MARK: - banking
-
-/// Statements & transaction alerts, latest first: institution + kind tag +
-/// masked account hint, amount right-aligned (a statement's amount is the TOTAL
-/// balance the extractor pulled).
-///
-/// WINDOWED, not capped: the card shows the last 24 hours, or everything since
 
     /// Per domain, so a rail of UPS cards pays for the flood fill once.
     @MainActor private static var knockouts: [String: PlatformImage] = [:]
@@ -429,6 +429,15 @@ enum FaviconMatte {
             return UIImage(cgImage: out, scale: image.scale, orientation: image.imageOrientation)
         #endif
     }
+}
+
+// MARK: - banking
+
+/// Statements & transaction alerts, latest first: institution + kind tag +
+/// masked account hint, amount right-aligned (a statement's amount is the TOTAL
+/// balance the extractor pulled).
+///
+/// WINDOWED, not capped: the card shows the last 24 hours, or everything since
 /// this zone was last SEEN, whichever reaches further back (SitrepWindow). The
 /// old fixed "latest 8" held week-old rows forever — issue #82.
 struct BankingZone: View {

@@ -523,6 +523,8 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         eprintln!("squelch: migration re-queued {unstamped} row(s) whose body has since arrived");
     }
 
+    create_shipment_order_links(conn)?;
+
     // Guarded on table existence — migration unit tests build partial schemas.
     if !tables_exist(conn, &["triage", "deadlines", "messages"])? {
         return Ok(());
@@ -598,6 +600,95 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Is `shipment_order_links` there? Readers guard on it because the migration
+/// unit tests build partial schemas.
+pub(super) fn order_links_exist(conn: &Connection) -> Result<bool> {
+    tables_exist(conn, &["shipment_order_links"])
+}
+
+/// ORDER LINKS: which orders each package carries, many-to-many, so the
+/// listing can fold one purchase's packages into one card.
+///
+/// NOT `shipment_orders`: that name is the old extractor's staging table for
+/// orders with no tracking number yet, a different thing.
+///
+/// Created HERE rather than in schema.sql because its creation is the one-shot
+/// backfill's trigger: schema.sql runs on every open before this function, so
+/// a table it created would already exist and the backfill could never tell a
+/// first open from the hundredth. On the open that creates it, every shipment
+/// the old extractor gave both an order reference and a merchant gets a
+/// 'legacy' link. Once, and never again: after this, `shipments.order_merchant`
+/// is also written by the agent (a store name, not a domain), and re-running
+/// the backfill would pair that with a stale extractor `order_ref`.
+///
+/// The AFTER DELETE trigger is how every path that deletes a shipment (the
+/// agent projection's retirement, the extractor's phantom reaping, anything
+/// added later) also deletes its links, without each remembering to.
+fn create_shipment_order_links(conn: &Connection) -> Result<()> {
+    if !tables_exist(conn, &["shipments"])? {
+        return Ok(());
+    }
+    if !order_links_exist(conn)? {
+        conn.execute_batch(
+            "CREATE TABLE shipment_order_links (
+                 account_id   INTEGER NOT NULL,
+                 shipment_id  INTEGER NOT NULL,
+                 -- lowercase alphanumerics of `merchant`; '' = unknown seller,
+                 -- which never groups (see triage::order_link).
+                 merchant_key TEXT NOT NULL,
+                 -- uppercase alphanumerics of the sanitized `order_ref`.
+                 order_key    TEXT NOT NULL,
+                 merchant     TEXT NOT NULL DEFAULT '',
+                 order_ref    TEXT NOT NULL,
+                 -- 'agent': rebuilt by reconcile from the retained delivery
+                 -- proposals. 'legacy': the backfill; reconcile never touches it.
+                 source       TEXT NOT NULL CHECK (source IN ('agent', 'legacy')),
+                 PRIMARY KEY (account_id, shipment_id, merchant_key, order_key)
+             );
+             CREATE INDEX IF NOT EXISTS idx_shipment_order_links_order
+                 ON shipment_order_links(account_id, merchant_key, order_key);",
+        )?;
+        if has_columns(conn, "shipments", &["order_ref", "order_merchant"])? {
+            let legacy: Vec<(i64, i64, String, String)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT account_id, id, order_merchant, order_ref FROM shipments
+                     WHERE TRIM(COALESCE(order_ref, '')) <> ''
+                       AND TRIM(COALESCE(order_merchant, '')) <> ''",
+                )?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            for (account, id, merchant, raw_ref) in legacy {
+                use crate::triage::order_link::{merchant_key, order_key};
+                let Some(order_ref) =
+                    crate::triage::extract::shipments::sanitize_order_ref(Some(&raw_ref))
+                else {
+                    continue;
+                };
+                let (mkey, okey) = (merchant_key(&merchant), order_key(&order_ref));
+                if mkey.is_empty() || okey.is_empty() {
+                    continue;
+                }
+                conn.execute(
+                    "INSERT OR IGNORE INTO shipment_order_links
+                         (account_id, shipment_id, merchant_key, order_key, merchant, order_ref, source)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'legacy')",
+                    params![account, id, mkey, okey, merchant.trim(), order_ref],
+                )?;
+            }
+        }
+    }
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS shipment_order_links_follow_shipment
+         AFTER DELETE ON shipments BEGIN
+             DELETE FROM shipment_order_links
+             WHERE account_id = OLD.account_id AND shipment_id = OLD.id;
+         END",
+        [],
+    )?;
     Ok(())
 }
 
