@@ -231,8 +231,11 @@ struct SearchView: View {
         }
         .keyBindings(.modal, bindings)
         .onAppear { focused = true }
-        .onChange(of: store.search.query) { _, _ in
+        .onChange(of: store.search.query) { _, query in
             store.search.index = -1
+            if query.trimmed.isEmpty {
+                store.resetSearchLane()
+            }
         }
         // The reader steals focus while it is up. When it closes and this
         // panel is the surface again, typing must just work — without this the
