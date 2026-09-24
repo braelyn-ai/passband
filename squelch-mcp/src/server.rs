@@ -700,15 +700,20 @@ impl SquelchServer {
                 },
             )
             .map_err(Self::map_err)?;
-        // The RAW observation feed, silent rows included: a record hit is
-        // decorated with its carrier row first and judged after, so the same
-        // `Silence::hides` the human door applies sees the same carrier
+        // The observation feed, UNGROUPED and not yet judged silent: a record
+        // hit is decorated with its carrier row first and judged after, so the
+        // same `Silence::hides` the human door applies sees the same carrier
         // evidence here. Two doors, one rule, one package list.
+        //
+        // Only the rows the window is CERTAIN to hide are cut, in SQL (a long
+        // delivered history stays on disk), and a record whose row was cut is
+        // dropped by `agent_shipment_is_hidden` below, exactly as the row's
+        // own `Silence::hides` would have dropped it.
+        let silence = self.shipment_policy.silence(Utc::now());
         let shipments = self
             .store
-            .external_shipments(self.account_id, true)
+            .external_shipments_within(self.account_id, silence)
             .map_err(Self::map_err)?;
-        let silence = self.shipment_policy.silence(Utc::now());
         let mut out: Vec<ShipmentHit> = Vec::new();
         let mut represented = std::collections::HashSet::new();
         for item in records {
@@ -737,7 +742,7 @@ impl SquelchServer {
                 if !number.is_empty()
                     && self
                         .store
-                        .agent_shipment_is_cleared(self.account_id, &number)
+                        .agent_shipment_is_hidden(self.account_id, &number, silence)
                         .map_err(Self::map_err)?
                 {
                     continue;
@@ -774,9 +779,15 @@ impl SquelchServer {
                     hit.merchant = observation.merchant.clone();
                     hit.orders = observation.orders.clone();
                     hit.row = Some(observation.clone());
-                    if observation.carrier_status_raw.is_some() {
-                        hit.status = observation.status.clone();
-                    }
+                    // THE ROW'S STATUS IS THE PACKAGE'S STATUS, not this
+                    // record's. Reconcile already decided it from every
+                    // retained proposal plus the carrier: the newest proposal
+                    // on an owned row, the no-regress merge on a legacy one
+                    // (a delivered legacy row stays delivered when newer mail
+                    // says "shipped"). Reading the record here instead made the
+                    // doors pick different representatives, and disagree about
+                    // which cards `include_delivered=false` drops.
+                    hit.status = observation.status.clone();
                     // THE ROW'S CLOCK IS THE PACKAGE'S CLOCK. Reconcile already
                     // folded every accepted mail into `last_update`; a mail it
                     // rejected (no carrier, a status it could not read) is not
@@ -1363,12 +1374,35 @@ mod tests {
         merchant: Option<&str>,
         refs: &[&str],
     ) -> i64 {
+        let record = RecordProposal::Delivery {
+            carrier: Some("ups".into()),
+            tracking_number: Some(number.into()),
+            status: status.into(),
+            item_name: None,
+            merchant: merchant.map(str::to_string),
+            order_refs: refs.iter().map(|r| r.to_string()).collect(),
+            evidence: vec![],
+        };
+        ingest_decided(store, account, thread, at, restricted, number, vec![record])
+    }
+
+    /// Ingest one mail received at `at` (gmail id `{thread}-{key}`) and commit
+    /// a decision carrying `records` for it. Returns the message id.
+    fn ingest_decided(
+        store: &SqliteStore,
+        account: i64,
+        thread: &str,
+        at: chrono::DateTime<Utc>,
+        restricted: bool,
+        key: &str,
+        records: Vec<RecordProposal>,
+    ) -> i64 {
         use squelch_core::store::agent_triage::AgentCommitOutcome;
         use squelch_core::sync::ingest::{RawFetched, ingest_with_rules};
         use squelch_core::triage::decision::MessageDecision;
         let raw = RawFetched {
             account_id: account,
-            gmail_msg_id: format!("{thread}-{number}"),
+            gmail_msg_id: format!("{thread}-{key}"),
             gmail_thread_id: Some(thread.into()),
             raw: format!(
                 "From: shop@example.com\r\nTo: me@localhost\r\nSubject: Update\r\nDate: {}\r\n\r\nUpdate",
@@ -1384,15 +1418,7 @@ mod tests {
         let id = store.ingest_message(&message).unwrap();
         let mut decision = MessageDecision {
             summary: "Shipment update".into(),
-            records: vec![RecordProposal::Delivery {
-                carrier: Some("ups".into()),
-                tracking_number: Some(number.into()),
-                status: status.into(),
-                item_name: None,
-                merchant: merchant.map(str::to_string),
-                order_refs: refs.iter().map(|r| r.to_string()).collect(),
-                evidence: vec![],
-            }],
+            records,
             ..Default::default()
         };
         decision.external_access.restricted = restricted;
@@ -1505,6 +1531,87 @@ mod tests {
                 (want, want),
                 "{include_delivered}"
             );
+        }
+    }
+
+    /// A LEGACY ROW'S STATUS IS THE ROW'S, on both doors. The old extractor
+    /// recorded box X delivered; newer mail the model read as "shipped" (a
+    /// re-ship notice, a survey) cannot walk a legacy row back, so the row
+    /// stays delivered. The agent door used to serve the record's "shipped"
+    /// instead, so it picked X to represent the order and kept the card under
+    /// `include_delivered=false`; the human door picked box Y, still coming.
+    #[tokio::test]
+    async fn both_doors_take_a_legacy_rows_status_from_the_row() {
+        use squelch_core::triage::ShipmentStatus;
+        use squelch_core::triage::extract::shipments::ShipmentsApplied;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let days = |n| Utc::now() - chrono::Duration::days(n);
+        let (legacy, coming) = ("1ZW061R3DG21045729", "1ZB8B2560323528551");
+        // The legacy row: the old extractor's delivered verdict on an allowed
+        // mail that carries no delivery record of its own.
+        let minted = ingest_decided(&store, account, "old", days(5), false, "old", vec![]);
+        assert!(
+            store
+                .shipments_extract_apply(&ShipmentsApplied {
+                    message_id: minted,
+                    account_id: account,
+                    thread_id: "old".into(),
+                    is_shipment: true,
+                    tracking_number: Some(legacy.into()),
+                    order_ref: None,
+                    item_name: None,
+                    carrier: "ups".into(),
+                    status: Some(ShipmentStatus::Delivered),
+                    received_at: days(5),
+                    extractor_model_used: "legacy-extractor".into(),
+                })
+                .unwrap()
+        );
+        deliver(
+            &store,
+            account,
+            "y",
+            days(3),
+            false,
+            coming,
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        // Newer mail about the legacy box, read as "shipped", naming the order.
+        deliver(
+            &store,
+            account,
+            "x",
+            days(1),
+            false,
+            legacy,
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        let raw = store.external_shipments(account, true).unwrap();
+        let row = raw.iter().find(|s| s.tracking_number == legacy).unwrap();
+        assert_eq!(row.status, "delivered", "the no-regress merge held");
+        for include_delivered in [true, false] {
+            let human = store
+                .list_shipments(account, include_delivered, policy)
+                .unwrap();
+            let agent = agent_hits(&server, include_delivered).await;
+            let agent = agent.as_array().unwrap();
+            assert_eq!((human.len(), agent.len()), (1, 1), "{include_delivered}");
+            assert_eq!(human[0].tracking_number, coming);
+            assert_eq!(agent[0]["tracking_number"], coming, "{include_delivered}");
+            assert_eq!(agent[0]["status"], human[0].status);
+            assert_eq!(agent[0]["status"], "shipped");
+            assert_eq!(human[0].legs[0].status, "delivered");
+            assert_eq!(agent[0]["legs"][0]["tracking_number"], legacy);
+            assert_eq!(agent[0]["legs"][0]["status"], "delivered");
         }
     }
 

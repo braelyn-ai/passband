@@ -639,9 +639,11 @@ pub(super) fn order_links_exist(conn: &Connection) -> Result<bool> {
 /// done", and the legacy links it never wrote would be lost for good; and two
 /// daemons opening one file could both see "absent" and both backfill.
 ///
-/// On failure (a busy sibling, a row the backfill cannot read) it rolls back,
-/// says so, and returns Ok: the next open tries again, and every reader and
-/// writer of the table guards on [`order_links_exist`].
+/// A legacy row it cannot read or sanitize is SKIPPED (see the body): junk in
+/// one row must not cost every other row its link. On a real failure (a busy
+/// sibling, an SQL error) it rolls back, says so, and returns Ok: the next open
+/// tries again, and every reader and writer of the table guards on
+/// [`order_links_exist`].
 pub(super) fn create_shipment_order_links(conn: &Connection) -> Result<()> {
     if !tables_exist(conn, &["shipments"])? {
         return Ok(());
@@ -705,17 +707,30 @@ fn create_and_backfill_order_links(conn: &Connection) -> Result<()> {
     if !has_columns(conn, "shipments", &["order_ref", "order_merchant"])? {
         return Ok(());
     }
-    let legacy: Vec<(i64, i64, String, String)> = {
+    // A ROW THE BACKFILL CANNOT READ IS SKIPPED, NOT FATAL. A merchant or
+    // reference that is not valid text (a number, a blob, bytes that are not
+    // UTF-8) is junk this link could not have been built from anyway, and
+    // failing the whole backfill on it would fail it on every open, forever,
+    // while the table's absence also turns off every agent link write. Only a
+    // real SQL error (the `?`s below) rolls the transaction back.
+    type LegacyRow = (i64, i64, Option<String>, Option<String>);
+    let legacy: Vec<LegacyRow> = {
         let mut stmt = conn.prepare(
             "SELECT account_id, id, order_merchant, order_ref FROM shipments
              WHERE TRIM(COALESCE(order_ref, '')) <> ''
                AND TRIM(COALESCE(order_merchant, '')) <> ''",
         )?;
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<Option<String>> {
+            Ok(r.get_ref(i)?.as_str().ok().map(str::to_owned))
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, text(r, 2)?, text(r, 3)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
     for (account, id, merchant, raw_ref) in legacy {
         use crate::triage::order_link::{merchant_key, order_key};
+        let (Some(merchant), Some(raw_ref)) = (merchant, raw_ref) else {
+            continue;
+        };
         let Some(order_ref) = crate::triage::extract::shipments::sanitize_order_ref(Some(&raw_ref))
         else {
             continue;

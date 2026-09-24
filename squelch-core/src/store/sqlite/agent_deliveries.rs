@@ -1181,6 +1181,111 @@ mod tests {
         );
     }
 
+    /// A LONG DELIVERED HISTORY IS NEVER LOADED. Two thousand packages that
+    /// landed two months ago, every one linked to the same order as today's
+    /// box, are hidden for certain by the silence rule, so the listing, the
+    /// agent door's feed, its per-number check and a clear all read only the
+    /// rows that could show: today's box, and an old one a carrier answered
+    /// for yesterday (vouched, so still listed). Had the old rows been read
+    /// and wrongly kept, they would be legs on today's card.
+    #[test]
+    fn a_long_delivered_history_is_never_loaded() {
+        use super::super::specialists::{SHIPMENT_LINKS_READ, SHIPMENT_ROWS_READ};
+        use crate::store::agent_triage::AgentTriageStore;
+        let rows_read = || SHIPMENT_ROWS_READ.with(|n| n.replace(0));
+        let links_read = || SHIPMENT_LINKS_READ.with(|n| n.replace(0));
+        let store = fixture();
+        let policy = crate::config::ShipmentListPolicy::default();
+        let silence = policy.silence(Utc::now());
+        assert!(silence.is_some(), "the default policy goes silent");
+        write(
+            &store,
+            1,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                None,
+                Some("Shop A"),
+                &["1042"],
+            ),
+        );
+        {
+            let mut conn = store.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            let old = (Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+            for i in 0..2000 {
+                tx.execute(
+                    "INSERT INTO shipments(account_id,tracking_number,carrier,item_name,status,
+                         first_seen,last_update,delivered_at)
+                     VALUES(1,?1,'ups','','delivered',?2,?2,?2)",
+                    params![format!("OLD{i:06}"), old],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO shipment_order_links(account_id,shipment_id,merchant_key,
+                         order_key,merchant,order_ref,source)
+                     VALUES(1,?1,'shopa','1042','Shop A','1042','legacy')",
+                    [tx.last_insert_rowid()],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO shipments(account_id,tracking_number,carrier,item_name,status,
+                     first_seen,last_update,delivered_at,last_answered_at)
+                 VALUES(1,'VOUCHED','ups','','delivered',?1,?1,?1,?2)",
+                params![old, (Utc::now() - chrono::Duration::days(1)).to_rfc3339()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        rows_read();
+        links_read();
+
+        let cards = store.list_shipments(1, true, policy).unwrap();
+        let mut numbers: Vec<_> = cards.iter().map(|c| c.tracking_number.as_str()).collect();
+        numbers.sort();
+        assert_eq!(numbers, ["1Z999AA10123456784", "VOUCHED"]);
+        assert!(
+            cards.iter().all(|c| c.legs.is_empty()),
+            "no old box is a leg"
+        );
+        assert_eq!(rows_read(), 2, "only the rows that could show are read");
+        assert_eq!(links_read(), 1, "only the listed rows' links are read");
+
+        store.external_shipments_within(1, silence).unwrap();
+        assert_eq!(rows_read(), 2, "the agent door's feed is cut the same way");
+        assert!(
+            store
+                .agent_shipment_is_hidden(1, "OLD000007", silence)
+                .unwrap(),
+            "a record whose row was cut is hidden with it"
+        );
+        assert!(
+            !store
+                .agent_shipment_is_hidden(1, "VOUCHED", silence)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .agent_shipment_is_hidden(1, "OLD000007", None)
+                .unwrap(),
+            "with the window off, nothing is silent"
+        );
+
+        let fresh = cards
+            .iter()
+            .find(|c| c.tracking_number == "1Z999AA10123456784")
+            .unwrap();
+        assert!(
+            store
+                .clear_shipment(1, fresh.id, Utc::now(), policy)
+                .unwrap()
+        );
+        assert_eq!(rows_read(), 2, "a clear reads no history either");
+        assert_eq!(store.list_shipments(1, true, policy).unwrap().len(), 1);
+    }
+
     /// A row written before the agent owned deliveries, `age_days` silent.
     fn legacy_row(store: &SqliteStore, number: &str, age_days: i64) -> i64 {
         let at = (Utc::now() - chrono::Duration::days(age_days)).to_rfc3339();

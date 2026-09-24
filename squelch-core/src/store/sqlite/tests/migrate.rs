@@ -1662,22 +1662,20 @@ fn event_auth_flag_migration_defaults_legacy_rows_without_inferring_urgency() {
     );
 }
 
-/// THE ORDER-LINKS MIGRATION IS ONE TRANSACTION. A backfill that fails partway
-/// must leave NO table behind: the table's existence is what tells every later
-/// open the backfill already ran, so a half-done one would lose the legacy
-/// links for good. Here a row the backfill cannot read (a merchant stored as a
-/// number) fails it; the next open, with the row fixed, does the whole job.
+/// THE ORDER-LINKS BACKFILL SKIPS JUNK AND IS ALL-OR-NOTHING ON A REAL ERROR.
+///
+/// A legacy row it cannot read (a merchant stored as a number, a reference
+/// stored as a blob or as bytes that are not UTF-8) is skipped, and every other
+/// row still gets its link: one bad row must not fail the backfill on every
+/// open forever.
+///
+/// A real SQL failure must leave NO table behind: the table's existence is
+/// what tells every later open the backfill already ran, so a half-done one
+/// would lose the legacy links for good. Here a temp view shadowing
+/// `shipments` fails the migration after the table was created; the next
+/// open, with the fault gone, does the whole job.
 #[test]
 fn order_links_migration_is_all_or_nothing() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE shipments (
-             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
-             order_ref TEXT, order_merchant);
-         INSERT INTO shipments VALUES (1, 1, '1042', 'Shop A'), (2, 1, '77', 42);",
-    )
-    .unwrap();
-    create_shipment_order_links(&conn).expect("a failed backfill is not a failed open");
     let exists = |conn: &Connection| -> bool {
         conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'shipment_order_links'",
@@ -1687,6 +1685,50 @@ fn order_links_migration_is_all_or_nothing() {
         .unwrap()
             == 1
     };
+    let links = |conn: &Connection| -> Vec<(i64, String)> {
+        conn.prepare("SELECT shipment_id, order_ref FROM shipment_order_links ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+
+    // JUNK IS SKIPPED: rows 2-4 cannot be read as text, rows 1 and 5 backfill.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             order_ref, order_merchant);
+         INSERT INTO shipments VALUES
+             (1, 1, '1042', 'Shop A'),
+             (2, 1, '77', 42),
+             (3, 1, x'0102', 'Shop C'),
+             (4, 1, '88', CAST(x'ff' AS TEXT)),
+             (5, 1, '1043', 'Shop E');",
+    )
+    .unwrap();
+    create_shipment_order_links(&conn).unwrap();
+    assert!(exists(&conn), "junk rows do not fail the backfill");
+    assert_eq!(
+        links(&conn),
+        vec![(1, "1042".to_string()), (5, "1043".to_string())],
+        "every readable row is linked, the junk ones skipped"
+    );
+
+    // A REAL SQL ERROR ROLLS EVERYTHING BACK. A temp view shadowing
+    // `shipments` makes the migration's AFTER DELETE trigger fail to create,
+    // after the table and its index already have, inside the transaction.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             order_ref TEXT, order_merchant TEXT);
+         INSERT INTO shipments VALUES (1, 1, '1042', 'Shop A'), (2, 1, '77', 'Shop B');
+         CREATE TEMP VIEW shipments AS SELECT * FROM main.shipments;",
+    )
+    .unwrap();
+    create_shipment_order_links(&conn).expect("a failed backfill is not a failed open");
     assert!(
         !exists(&conn),
         "rolled back: no table claims the backfill ran"
@@ -1695,20 +1737,14 @@ fn order_links_migration_is_all_or_nothing() {
         conn.is_autocommit(),
         "the transaction is closed, not left open"
     );
-
-    conn.execute(
-        "UPDATE shipments SET order_merchant = 'Shop B' WHERE id = 2",
-        [],
-    )
-    .unwrap();
+    conn.execute_batch("DROP VIEW temp.shipments").unwrap();
     create_shipment_order_links(&conn).unwrap();
     assert!(exists(&conn));
-    let links: i64 = conn
-        .query_row("SELECT COUNT(*) FROM shipment_order_links", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(links, 2, "the retry backfills every legacy row");
+    assert_eq!(
+        links(&conn).len(),
+        2,
+        "the retry backfills every legacy row"
+    );
 }
 
 /// A DB that already ran the first version of the order-links migration (the
