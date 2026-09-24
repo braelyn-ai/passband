@@ -305,11 +305,6 @@ enum Fmt {
         String(format: n < 1 ? "$%.4f" : "$%.2f", n)
     }
 
-    /// Today's date, "Mon, Jul 27" — the sitrep masthead stamp.
-    static func todayStamp(now: Date = Date()) -> String {
-        now.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
-    }
-
     /// Truncate into a copy budget of `n` characters, the ellipsis included, so
     /// a cut announces itself rather than landing mid-word the way the system's
     /// own truncation does.

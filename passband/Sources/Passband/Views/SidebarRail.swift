@@ -30,6 +30,8 @@ struct SidebarRail: View {
     static let iconWidth: CGFloat = 44
     static let iconHeight: CGFloat = 36
     static let selectorRadius: CGFloat = 11
+    /// The space between a tile and the rail's edge, (60 - 44) / 2.
+    static let sideGutter: CGFloat = (railWidth - iconWidth) / 2
 
     /// How long the pane takes to cross — short enough to read as a response to
     /// the click rather than a thing you wait out.
@@ -124,7 +126,12 @@ struct SidebarRail: View {
             // The app draws from the window's true top edge now, so this is the
             // rail's whole clearance for the title strip — not a nudge on top of
             // a safe area that no longer applies.
-            .padding(.top, TopBar.height + 10)
+            //
+            // FULLSCREEN HAS NO STRIP to clear (see `railMaterial`), so the
+            // stack goes to the corner: Sitrep sits the same gutter from the top
+            // as the tiles sit from the rail's sides, and nothing above it
+            // reads as a margin waiting for buttons that are not there.
+            .padding(.top, WindowState.shared.isFullscreen ? Self.sideGutter : TopBar.height + 10)
             .padding(.bottom, 10)
             .frame(width: Self.railWidth)
             .frame(maxHeight: .infinity)

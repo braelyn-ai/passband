@@ -100,6 +100,8 @@ struct SitrepView: View {
 
         return VStack(spacing: 0) {
             masthead
+                // The shortcut hints hang below the bar, over the hero.
+                .zIndex(1)
             // ABOVE THE HERO, because it outranks it. The hero's question is
             // "what needs you today", and its answer is worthless while the
             // mailbox behind it has been frozen since Tuesday. This is the
@@ -283,10 +285,14 @@ struct SitrepView: View {
                 .padding(.vertical, 3)
                 .glassCapsule(tint: Palette.danger.opacity(0.18), interactive: false)
             }
-            Text(Fmt.todayStamp())
-                .font(Typo.num(11, weight: .medium))
-                .foregroundStyle(Palette.inkFaint)
-            if !RehearsalMode.isEnabled { SyncLabel() }
+            #if os(macOS)
+                // The practice board has no `/` (the global set is cut down to
+                // undo + theme there), so an icon for it would be a button
+                // that does nothing. The phone has its own sitrep.
+                if !RehearsalMode.isEnabled {
+                    MastheadShortcuts()
+                }
+            #endif
         }
         .padding(.horizontal, 24)
         // THE TOP BAR. The wordmark sits on the traffic lights' line rather than
@@ -507,25 +513,6 @@ private struct IngestIndicator: View {
     }
 }
 
-/// The masthead's freshness stamp, isolated ON PURPOSE: `lastRefresh` changes on
-/// every 10s poll, so read inline in the dashboard body it would invalidate the
-/// entire sitrep. Scoped here, a poll re-renders one line of text.
-private struct SyncLabel: View {
-    @Environment(AppStore.self) private var store
-
-    var body: some View {
-        Text(label)
-            .font(Typo.micro)
-            .foregroundStyle(Palette.inkFaintest)
-    }
-
-    private var label: String {
-        guard let last = store.lastRefresh else { return "syncing…" }
-        let rel = Fmt.relAge(last)
-        return (rel == "now" || rel.isEmpty) ? "synced just now" : "synced \(rel) ago"
-    }
-}
-
 // MARK: - GREETING
 
 /// "GOOD MORNING, BRAELYN" — the one line on either client that says the human's
@@ -721,6 +708,87 @@ private struct DashHero: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
+
+#if os(macOS)
+    // MARK: - masthead shortcuts
+
+    /// Compose and search, at the top bar's right end.
+    /// Both are one keystroke away already; these are for the reader who has
+    /// not learned the keys yet, and hovering is how they learn them.
+    private struct MastheadShortcuts: View {
+        @Environment(AppStore.self) private var store
+
+        var body: some View {
+            HStack(spacing: 2) {
+                MastheadShortcut(symbol: "square.and.pencil", label: "new message", key: "c") {
+                    store.openComposeNew()
+                }
+                MastheadShortcut(symbol: "magnifyingglass", label: "search", key: "/") {
+                    store.openSearch()
+                }
+            }
+            // The bar and the records rail are both inset 24, so pull the
+            // cluster out until the last GLYPH (not its 30pt hit tile) lands
+            // on the rail's right edge.
+            .padding(.trailing, -6)
+        }
+    }
+
+    private struct MastheadShortcut: View {
+        let symbol: String
+        let label: String
+        let key: String
+        let action: () -> Void
+
+        @State private var hovering = false
+
+        var body: some View {
+            Button(action: action) {
+                Image(systemName: symbol)
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundStyle(hovering ? Palette.ink : Palette.inkFaint)
+                    .frame(width: 30, height: 30)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .background {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(Palette.hairline.opacity(hovering ? 0.7 : 0))
+            }
+            // Our own hint rather than `.help`: the system tooltip waits most
+            // of a second and cannot draw a key cap, and the key is the point.
+            // Trailing-anchored: these sit on the window's right edge, and a
+            // centered hint under the last icon would run off it.
+            .overlay(alignment: .topTrailing) {
+                HStack(spacing: 5) {
+                    Text(label)
+                        .font(Typo.micro)
+                        .foregroundStyle(Palette.inkDim)
+                    Kbd(key)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Palette.canvas)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(Palette.hairline, lineWidth: 0.5)
+                )
+                .fixedSize()
+                .offset(y: 34)
+                .opacity(hovering ? 1 : 0)
+                .allowsHitTesting(false)
+            }
+            .animation(.easeOut(duration: 0.12), value: hovering)
+            .onHover { hovering = $0 }
+            .pointingHand()
+            .accessibilityLabel(label)
+            .accessibilityHint("shortcut \(key)")
+        }
+    }
+#endif
 
 // MARK: - obligation row
 
