@@ -437,6 +437,21 @@ struct Shipment: Codable, Sendable, Identifiable, Hashable {
     /// share an order. Empty (or absent) for a lone package.
     var legs: [ShipmentLeg]?
 
+    /// Is any package on this card still on its way? The representative, or
+    /// any leg. A daemon picks an undelivered representative whenever there is
+    /// one, so the legs are belt and braces against one that does not.
+    var anyUndelivered: Bool {
+        status != .delivered || (legs ?? []).contains { $0.status != .delivered }
+    }
+
+    /// Does the card stay on the shipments rail? While ANY of its packages is
+    /// still coming, yes; once all have landed, only on the day the
+    /// representative did (`isToday` judges the timestamp, so a test can pin
+    /// the clock).
+    func staysOnRail(isToday: (String?) -> Bool) -> Bool {
+        anyUndelivered || isToday(delivered_at ?? last_update)
+    }
+
     /// The item name as a LABEL: emoji dropped, whitespace collapsed. The
     /// daemon lifts this out of a subject line and its strip leaves pictographs
     /// standing, so "🚚 Your order from X" reaches us with the truck attached.

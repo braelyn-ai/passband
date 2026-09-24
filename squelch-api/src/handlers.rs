@@ -1605,8 +1605,10 @@ pub async fn clear_shipment(
     Path(shipment_id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
     let at = Utc::now();
+    // The listing's own policy, so the card cleared is the card the user saw.
+    let policy = state.shipment_policy;
     let cleared = store_call(&state, move |store, account_id| {
-        store.clear_shipment(account_id, shipment_id, at)
+        store.clear_shipment(account_id, shipment_id, at, policy)
     })
     .await?;
     if !cleared {

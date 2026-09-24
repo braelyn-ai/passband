@@ -17,6 +17,7 @@ struct ShipmentWireTests {
         anUnknownLegCarrierDoesNotSinkTheRow()
         theTitleFallsBackToMerchantThenPackage()
         anOrderRefGetsExactlyOneHash()
+        aCardStaysWhileAnyPackageIsComing()
 
         if failures > 0 {
             print("FAILED: \(failures) of \(checks) checks")
@@ -80,5 +81,21 @@ struct ShipmentWireTests {
     static func anOrderRefGetsExactlyOneHash() {
         let row = decode(##"{\##(base),"item_name":"x","orders":[{"merchant":null,"order_ref":"#1001"},{"merchant":null,"order_ref":"1002"}]}"##)
         expect(row?.orderLine == "#1001, #1002", "one hash each, joined with a comma")
+    }
+
+    static func aCardStaysWhileAnyPackageIsComing() {
+        let never: (String?) -> Bool = { _ in false }
+        let landed = #""status":"delivered","delivered_at":"2026-09-20T10:00:00Z""#
+        let base = #""id":7,"account_id":1,"tracking_number":"1ZB8B2560323528551","carrier":"ups","first_seen":"2026-09-20T10:00:00Z","last_update":"2026-09-22T10:00:00Z","item_name":"x""#
+        let leg = { (status: String) in
+            #"{"id":8,"carrier":"ups","tracking_number":"1ZW061R3DG21045729","status":"\#(status)","last_update":"2026-09-19T10:00:00Z"}"#
+        }
+        let coming = decode("{\(base),\(landed),\"legs\":[\(leg("shipped"))]}")
+        expect(coming?.staysOnRail(isToday: never) == true, "a delivered representative with a leg in transit stays")
+        let done = decode("{\(base),\(landed),\"legs\":[\(leg("delivered"))]}")
+        expect(done?.staysOnRail(isToday: never) == false, "all landed, not today: gone")
+        expect(done?.staysOnRail(isToday: { _ in true }) == true, "all landed today: stays")
+        let lone = decode("{\(base),\"status\":\"shipped\"}")
+        expect(lone?.staysOnRail(isToday: never) == true, "a lone package in transit stays")
     }
 }

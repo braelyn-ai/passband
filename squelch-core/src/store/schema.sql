@@ -370,6 +370,10 @@ CREATE TABLE IF NOT EXISTS shipments (
     -- every order_ref lookup is scoped by this column. NULL alongside a NULL
     -- order_ref, and on rows written before the column existed.
     order_merchant  TEXT,
+    -- Which message named the CURRENT `order_merchant` when the triage agent
+    -- wrote it (a store name). NULL for the old extractor's domain merchant.
+    -- The agent door serves the merchant only when this message is allowed.
+    order_merchant_msg INTEGER,
     -- IMMUTABLE PROVENANCE: the message that CREATED this row, written once on
     -- INSERT and never updated. `last_message_id` moves to whichever mail most
     -- recently advanced the row, so it answers "who touched this last", not

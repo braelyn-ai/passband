@@ -193,39 +193,28 @@ impl ShipmentHit {
 }
 
 /// One purchase, one hit: the human door's grouping (`order_link`), applied to
-/// the agent door's merged list. Only a hit backed by a carrier row can carry
-/// orders, so a record with no tracking number always stands alone. The
-/// representative is the newest (`last_update`, then the higher row id); the
-/// name and merchant fall back to the newest non-empty one in the group.
+/// the agent door's merged list, with the same representative rule
+/// ([`representative_first`](squelch_core::triage::order_link::representative_first):
+/// the newest package still on its way, the newest overall only when all have
+/// landed). Only a hit backed by a carrier row can carry orders, so a record
+/// with no tracking number always stands alone. The name and merchant fall
+/// back to the newest non-empty one in the group.
 fn group_hits(hits: Vec<ShipmentHit>) -> Vec<ShipmentHit> {
-    use squelch_core::triage::order_link::{order_groups, union_orders};
-    let groups = {
-        let orders: Vec<&[ShipmentOrder]> = hits.iter().map(|h| h.orders.as_slice()).collect();
-        order_groups(&orders)
-    };
-    let mut slots: Vec<Option<ShipmentHit>> = hits.into_iter().map(Some).collect();
+    use squelch_core::triage::order_link::{card_name_and_merchant, fold_groups, union_orders};
+    let row_id = |h: &ShipmentHit| h.row.as_ref().map_or(0, |r| r.id);
+    let groups = fold_groups(
+        hits,
+        |h| h.orders.as_slice(),
+        |h| (h.status == "delivered", h.last_update, row_id(h)),
+    );
     let mut out = Vec::with_capacity(groups.len());
-    for group in groups {
-        let mut members: Vec<ShipmentHit> =
-            group.into_iter().filter_map(|i| slots[i].take()).collect();
-        let row_id = |h: &ShipmentHit| h.row.as_ref().map_or(0, |r| r.id);
-        members.sort_by(|a, b| {
-            b.last_update
-                .cmp(&a.last_update)
-                .then_with(|| row_id(b).cmp(&row_id(a)))
-        });
+    for members in groups {
         let orders = union_orders(members.iter().map(|m| m.orders.as_slice()));
-        let item_name = members
-            .iter()
-            .map(|m| m.item_name.trim())
-            .find(|n| !n.is_empty())
-            .unwrap_or("")
-            .to_string();
-        let merchant = members
-            .iter()
-            .filter_map(|m| m.merchant.as_deref().map(str::trim))
-            .find(|m| !m.is_empty())
-            .map(str::to_string);
+        let (item_name, merchant) = card_name_and_merchant(
+            members
+                .iter()
+                .map(|m| (m.item_name.as_str(), m.merchant.as_deref())),
+        );
         let mut members = members.into_iter();
         let Some(mut hit) = members.next() else {
             continue;
@@ -795,9 +784,10 @@ impl SquelchServer {
                     // doors disagree about exactly the hidden rows.
                     hit.last_update = observation.last_update;
                 }
-                if (include_delivered || hit.status != "delivered")
-                    && !silence.is_some_and(|s| s.hides(hit.last_update, observation))
-                {
+                // NO delivered filter here: grouping sees every visible
+                // package, exactly as the human door's does, and the filter
+                // applies to whole cards below.
+                if !silence.is_some_and(|s| s.hides(hit.last_update, observation)) {
                     out.push(hit);
                 }
             }
@@ -805,7 +795,6 @@ impl SquelchServer {
         // Legacy tracked packages keep their carrier observations during cutover.
         for shipment in shipments {
             if represented.contains(&shipment.tracking_number)
-                || (!include_delivered && shipment.status == "delivered")
                 || silence.is_some_and(|s| s.hides(shipment.last_update, Some(&shipment)))
             {
                 continue;
@@ -813,7 +802,13 @@ impl SquelchServer {
             out.push(ShipmentHit::from_row(shipment));
         }
         out.sort_by(|a, b| b.last_update.cmp(&a.last_update));
-        Self::ok_json(group_hits(out))
+        // A card is delivered iff its representative is, which is only when
+        // every package on it has landed.
+        let cards: Vec<ShipmentHit> = group_hits(out)
+            .into_iter()
+            .filter(|hit| include_delivered || hit.status != "delivered")
+            .collect();
+        Self::ok_json(cards)
     }
 
     /// Create or update a local sender rule. Writes ONLY squelch's local store;
@@ -1204,7 +1199,12 @@ mod tests {
             "spaced canonical number receives compact-row carrier observations"
         );
         store
-            .clear_shipment(account, polling_row.id, Utc::now())
+            .clear_shipment(
+                account,
+                polling_row.id,
+                Utc::now(),
+                ShipmentListPolicy::default(),
+            )
             .unwrap();
         assert!(
             values(
@@ -1347,6 +1347,352 @@ mod tests {
             hit.get("row").is_none(),
             "the grouping handle is not served"
         );
+    }
+
+    /// Ingest one mail received at `at` and commit one delivery record for
+    /// it, the way production does. Returns the message id.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(
+        store: &SqliteStore,
+        account: i64,
+        thread: &str,
+        at: chrono::DateTime<Utc>,
+        restricted: bool,
+        number: &str,
+        status: &str,
+        merchant: Option<&str>,
+        refs: &[&str],
+    ) -> i64 {
+        use squelch_core::store::agent_triage::AgentCommitOutcome;
+        use squelch_core::sync::ingest::{RawFetched, ingest_with_rules};
+        use squelch_core::triage::decision::MessageDecision;
+        let raw = RawFetched {
+            account_id: account,
+            gmail_msg_id: format!("{thread}-{number}"),
+            gmail_thread_id: Some(thread.into()),
+            raw: format!(
+                "From: shop@example.com\r\nTo: me@localhost\r\nSubject: Update\r\nDate: {}\r\n\r\nUpdate",
+                at.to_rfc2822()
+            )
+            .into_bytes(),
+            internal_date: Some(at),
+            is_sent: false,
+            is_spam: false,
+            account_addr: "me@localhost".into(),
+        };
+        let message = ingest_with_rules(&raw, &Default::default(), at, &[], |_| false);
+        let id = store.ingest_message(&message).unwrap();
+        let mut decision = MessageDecision {
+            summary: "Shipment update".into(),
+            records: vec![RecordProposal::Delivery {
+                carrier: Some("ups".into()),
+                tracking_number: Some(number.into()),
+                status: status.into(),
+                item_name: None,
+                merchant: merchant.map(str::to_string),
+                order_refs: refs.iter().map(|r| r.to_string()).collect(),
+                evidence: vec![],
+            }],
+            ..Default::default()
+        };
+        decision.external_access.restricted = restricted;
+        while let Some(job) = store
+            .claim_agent_job(account, "triage", Utc::now(), 120)
+            .unwrap()
+        {
+            assert_eq!(job.message_id, id);
+            let context = store.load_agent_context(&job).unwrap();
+            assert_eq!(
+                store
+                    .commit_agent_decision(
+                        &job,
+                        &context,
+                        &decision,
+                        std::slice::from_ref(&context.message.source)
+                    )
+                    .unwrap(),
+                AgentCommitOutcome::Applied
+            );
+        }
+        id
+    }
+
+    async fn agent_hits(server: &SquelchServer, include_delivered: bool) -> serde_json::Value {
+        values(
+            &server
+                .get_shipments(Parameters(GetShipmentsParams {
+                    include_delivered: Some(include_delivered),
+                }))
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A DELIVERED BOX NEVER STANDS FOR ONE STILL COMING, on either door, and
+    /// both doors group the same packages whatever `include_delivered` says:
+    /// the newer box landed two days ago, the older is still in transit, and
+    /// both show one in-transit card carrying the delivered box as a leg.
+    #[tokio::test]
+    async fn both_doors_show_an_order_in_transit_while_any_box_is() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let days = |n| Utc::now() - chrono::Duration::days(n);
+        let (coming, landed) = ("1ZW061R3DG21045729", "1ZB8B2560323528551");
+        deliver(
+            &store,
+            account,
+            "a",
+            days(3),
+            false,
+            coming,
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        deliver(
+            &store,
+            account,
+            "b",
+            days(2),
+            false,
+            landed,
+            "delivered",
+            Some("Bean Co"),
+            &["5"],
+        );
+        for include_delivered in [true, false] {
+            let human = store
+                .list_shipments(account, include_delivered, policy)
+                .unwrap();
+            let agent = agent_hits(&server, include_delivered).await;
+            let agent = agent.as_array().unwrap();
+            assert_eq!((human.len(), agent.len()), (1, 1), "{include_delivered}");
+            assert_eq!(human[0].tracking_number, coming);
+            assert_eq!(human[0].status, "shipped");
+            assert_eq!(agent[0]["tracking_number"], coming);
+            assert_eq!(agent[0]["status"], "shipped");
+            assert_eq!(human[0].legs.len(), 1, "{include_delivered}");
+            assert_eq!(
+                agent[0]["legs"].as_array().unwrap().len(),
+                1,
+                "the agent door groups the same members ({include_delivered})"
+            );
+        }
+        // Every box landed: the card is delivered, and only a listing that
+        // asks for delivered packages shows it, on either door.
+        deliver(
+            &store,
+            account,
+            "c",
+            days(1),
+            false,
+            coming,
+            "delivered",
+            Some("Bean Co"),
+            &["5"],
+        );
+        for (include_delivered, want) in [(true, 1), (false, 0)] {
+            let human = store
+                .list_shipments(account, include_delivered, policy)
+                .unwrap();
+            let agent = agent_hits(&server, include_delivered).await;
+            assert_eq!(
+                (human.len(), agent.as_array().unwrap().len()),
+                (want, want),
+                "{include_delivered}"
+            );
+        }
+    }
+
+    /// CLEARING A GROUPED CARD CLEARS THE PURCHASE on both doors: the client
+    /// posts one id, and no package of that order comes back on either.
+    #[tokio::test]
+    async fn clearing_a_grouped_card_empties_both_doors() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let hours = |n| Utc::now() - chrono::Duration::hours(n);
+        deliver(
+            &store,
+            account,
+            "a",
+            hours(3),
+            false,
+            "1ZW061R3DG21045729",
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        deliver(
+            &store,
+            account,
+            "b",
+            hours(2),
+            false,
+            "1ZB8B2560323528551",
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        let card = store
+            .list_shipments(account, true, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(card.legs.len(), 1);
+        assert_eq!(agent_hits(&server, true).await.as_array().unwrap().len(), 1);
+        assert!(
+            store
+                .clear_shipment(account, card.id, Utc::now(), policy)
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_shipments(account, true, policy)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            agent_hits(&server, true)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "no leg of the cleared card is left on the agent door"
+        );
+    }
+
+    /// A RESTRICTED MAIL'S MERCHANT AND ORDER NUMBER NEVER REACH THE AGENT. A
+    /// pharmacy order mail (restricted) names the store and the order; a plain
+    /// carrier notice (allowed) about the same number is what the agent may
+    /// see. The package is served, without the pharmacy or the order, and the
+    /// hidden order cannot merge it with another box either. The human door
+    /// still shows all of it.
+    #[tokio::test]
+    async fn a_restricted_mails_merchant_and_ref_stay_off_the_agent_door() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let hours = |n| Utc::now() - chrono::Duration::hours(n);
+        let number = "1ZW061R3DG21045729";
+        deliver(
+            &store,
+            account,
+            "rx",
+            hours(3),
+            true,
+            number,
+            "shipped",
+            Some("X Pharmacy"),
+            &["RX-99"],
+        );
+        deliver(
+            &store,
+            account,
+            "ups",
+            hours(2),
+            false,
+            number,
+            "out_for_delivery",
+            None,
+            &[],
+        );
+        let agent = agent_hits(&server, true).await;
+        let agent = agent.as_array().unwrap();
+        assert_eq!(agent.len(), 1, "the package itself is servable");
+        assert_eq!(agent[0]["status"], "out_for_delivery");
+        assert!(agent[0]["merchant"].is_null(), "{}", agent[0]);
+        assert!(
+            agent[0]["orders"].as_array().unwrap().is_empty(),
+            "{}",
+            agent[0]
+        );
+        assert!(!agent[0].to_string().contains("Pharmacy"));
+        assert!(!agent[0].to_string().contains("RX"));
+        let human = store.list_shipments(account, true, policy).unwrap();
+        assert_eq!(human[0].merchant.as_deref(), Some("X Pharmacy"));
+        assert_eq!(human[0].orders.len(), 1);
+
+        // A second box whose own allowed mail names the same order groups with
+        // it for the human, and not for the agent: the link that would merge
+        // them came from the restricted mail.
+        deliver(
+            &store,
+            account,
+            "box2",
+            hours(1),
+            false,
+            "1ZB8B2560323528551",
+            "shipped",
+            Some("X Pharmacy"),
+            &["RX-99"],
+        );
+        assert_eq!(
+            store.list_shipments(account, true, policy).unwrap().len(),
+            1
+        );
+        let agent = agent_hits(&server, true).await;
+        let agent = agent.as_array().unwrap();
+        assert_eq!(agent.len(), 2, "no grouping on a link the agent cannot see");
+        assert!(
+            agent
+                .iter()
+                .all(|h| h["legs"].as_array().unwrap().is_empty())
+        );
+        let first = agent
+            .iter()
+            .find(|h| h["tracking_number"] == number)
+            .unwrap();
+        assert!(first["merchant"].is_null() && first["orders"].as_array().unwrap().is_empty());
+
+        // One box, the seller named by restricted mail and the order number by
+        // allowed mail: the link files the ref under the restricted seller, so
+        // it is withheld too.
+        let third = "1Z999AA10123456784";
+        deliver(
+            &store,
+            account,
+            "rx3",
+            hours(1),
+            true,
+            third,
+            "shipped",
+            Some("Y Pharmacy"),
+            &[],
+        );
+        deliver(
+            &store,
+            account,
+            "ups3",
+            Utc::now(),
+            false,
+            third,
+            "shipped",
+            None,
+            &["RX-7"],
+        );
+        let agent = agent_hits(&server, true).await;
+        let hit = agent
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["tracking_number"] == third)
+            .unwrap()
+            .clone();
+        assert!(!hit.to_string().contains("Pharmacy"), "{hit}");
+        assert!(hit["orders"].as_array().unwrap().is_empty(), "{hit}");
+        let human = store.list_shipments(account, true, policy).unwrap();
+        let row = human.iter().find(|c| c.tracking_number == third).unwrap();
+        assert_eq!(row.orders[0].merchant.as_deref(), Some("Y Pharmacy"));
     }
 
     /// TWO DOORS, ONE PACKAGE LIST. The agent door applies the human door's

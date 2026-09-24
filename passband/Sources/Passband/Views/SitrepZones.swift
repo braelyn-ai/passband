@@ -108,10 +108,12 @@ struct ShipmentsZone: View {
     /// user-visible change, so a parcel dropped at 11pm and seen by the small-hours
     /// poll wears tomorrow's stamp and would linger a whole extra day. Rows from a
     /// daemon older than the field keep the clock they have always been judged by.
+    ///
+    /// A GROUPED card stays while ANY of its packages is still coming, even if
+    /// the one standing for it has landed: one order's delivered first box must
+    /// not hide its second, still in transit.
     private var rows: [Shipment] {
-        shipments.filter {
-            $0.status != .delivered || Fmt.isToday($0.delivered_at ?? $0.last_update)
-        }
+        shipments.filter { $0.staysOnRail(isToday: Fmt.isToday) }
     }
 
     var body: some View {

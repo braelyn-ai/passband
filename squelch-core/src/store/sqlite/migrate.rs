@@ -316,6 +316,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // a row left NULL simply matches no future order mail, which is the safe
     // direction — a missed name donation, never a cross-merchant one.
     let added_order_merchant = add_column_if_missing(conn, "shipments", "order_merchant", "TEXT")?;
+    // `order_merchant_msg` — which MESSAGE named the current `order_merchant`,
+    // for the agent door's access check. NULL on every pre-existing row: the
+    // old extractor's domain merchant, judged by the row's own mail.
+    add_column_if_missing(conn, "shipments", "order_merchant_msg", "INTEGER")?;
     if tables_exist(conn, &["shipments"])? {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_shipments_order_merchant
@@ -627,68 +631,106 @@ pub(super) fn order_links_exist(conn: &Connection) -> Result<bool> {
 /// The AFTER DELETE trigger is how every path that deletes a shipment (the
 /// agent projection's retirement, the extractor's phantom reaping, anything
 /// added later) also deletes its links, without each remembering to.
-fn create_shipment_order_links(conn: &Connection) -> Result<()> {
+///
+/// ATOMIC, like [`rebuild_fts_if_stale`]: the table, its index, its trigger
+/// and the backfill commit together under `BEGIN IMMEDIATE`, and existence is
+/// re-checked INSIDE the transaction. Otherwise a backfill that failed halfway
+/// would leave a table whose mere existence tells every later open "already
+/// done", and the legacy links it never wrote would be lost for good; and two
+/// daemons opening one file could both see "absent" and both backfill.
+///
+/// On failure (a busy sibling, a row the backfill cannot read) it rolls back,
+/// says so, and returns Ok: the next open tries again, and every reader and
+/// writer of the table guards on [`order_links_exist`].
+pub(super) fn create_shipment_order_links(conn: &Connection) -> Result<()> {
     if !tables_exist(conn, &["shipments"])? {
         return Ok(());
     }
     if !order_links_exist(conn)? {
-        conn.execute_batch(
-            "CREATE TABLE shipment_order_links (
-                 account_id   INTEGER NOT NULL,
-                 shipment_id  INTEGER NOT NULL,
-                 -- lowercase alphanumerics of `merchant`; '' = unknown seller,
-                 -- which never groups (see triage::order_link).
-                 merchant_key TEXT NOT NULL,
-                 -- uppercase alphanumerics of the sanitized `order_ref`.
-                 order_key    TEXT NOT NULL,
-                 merchant     TEXT NOT NULL DEFAULT '',
-                 order_ref    TEXT NOT NULL,
-                 -- 'agent': rebuilt by reconcile from the retained delivery
-                 -- proposals. 'legacy': the backfill; reconcile never touches it.
-                 source       TEXT NOT NULL CHECK (source IN ('agent', 'legacy')),
-                 PRIMARY KEY (account_id, shipment_id, merchant_key, order_key)
-             );
-             CREATE INDEX IF NOT EXISTS idx_shipment_order_links_order
-                 ON shipment_order_links(account_id, merchant_key, order_key);",
-        )?;
-        if has_columns(conn, "shipments", &["order_ref", "order_merchant"])? {
-            let legacy: Vec<(i64, i64, String, String)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT account_id, id, order_merchant, order_ref FROM shipments
-                     WHERE TRIM(COALESCE(order_ref, '')) <> ''
-                       AND TRIM(COALESCE(order_merchant, '')) <> ''",
-                )?;
-                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?
-            };
-            for (account, id, merchant, raw_ref) in legacy {
-                use crate::triage::order_link::{merchant_key, order_key};
-                let Some(order_ref) =
-                    crate::triage::extract::shipments::sanitize_order_ref(Some(&raw_ref))
-                else {
-                    continue;
-                };
-                let (mkey, okey) = (merchant_key(&merchant), order_key(&order_ref));
-                if mkey.is_empty() || okey.is_empty() {
-                    continue;
-                }
-                conn.execute(
-                    "INSERT OR IGNORE INTO shipment_order_links
-                         (account_id, shipment_id, merchant_key, order_key, merchant, order_ref, source)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'legacy')",
-                    params![account, id, mkey, okey, merchant.trim(), order_ref],
-                )?;
+        let created = (|| -> Result<()> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            // Another handle may have created it between the check above and
+            // the write lock; its backfill already ran.
+            if !order_links_exist(conn)? {
+                create_and_backfill_order_links(conn)?;
             }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(e) = created {
+            eprintln!("squelch: could not create shipment order links ({e}); will retry next open");
+            let _ = conn.execute_batch("ROLLBACK");
+            return Ok(());
         }
     }
-    conn.execute(
-        "CREATE TRIGGER IF NOT EXISTS shipment_order_links_follow_shipment
+    // PROVENANCE, added after the table first shipped (a DB that ran the
+    // first version of this migration has the table without them). NULL on
+    // every pre-existing link, which is exactly "legacy, no message recorded".
+    add_column_if_missing(conn, "shipment_order_links", "message_id", "INTEGER")?;
+    add_column_if_missing(conn, "shipment_order_links", "merchant_msg", "INTEGER")?;
+    Ok(())
+}
+
+/// The body of [`create_shipment_order_links`]'s transaction.
+fn create_and_backfill_order_links(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE shipment_order_links (
+             account_id   INTEGER NOT NULL,
+             shipment_id  INTEGER NOT NULL,
+             -- lowercase alphanumerics of `merchant`; '' = unknown seller,
+             -- which never groups (see triage::order_link).
+             merchant_key TEXT NOT NULL,
+             -- uppercase alphanumerics of the sanitized `order_ref`.
+             order_key    TEXT NOT NULL,
+             merchant     TEXT NOT NULL DEFAULT '',
+             order_ref    TEXT NOT NULL,
+             -- 'agent': rebuilt by reconcile from the retained delivery
+             -- proposals. 'legacy': the backfill; reconcile never touches it.
+             source       TEXT NOT NULL CHECK (source IN ('agent', 'legacy')),
+             -- PROVENANCE, for the agent door's access check: the message that
+             -- printed `order_ref`, and the one that named `merchant`. NULL on
+             -- a legacy link and (merchant_msg) on a merchant-less one.
+             message_id   INTEGER,
+             merchant_msg INTEGER,
+             PRIMARY KEY (account_id, shipment_id, merchant_key, order_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_shipment_order_links_order
+             ON shipment_order_links(account_id, merchant_key, order_key);
+         CREATE TRIGGER IF NOT EXISTS shipment_order_links_follow_shipment
          AFTER DELETE ON shipments BEGIN
              DELETE FROM shipment_order_links
              WHERE account_id = OLD.account_id AND shipment_id = OLD.id;
-         END",
-        [],
+         END;",
     )?;
+    if !has_columns(conn, "shipments", &["order_ref", "order_merchant"])? {
+        return Ok(());
+    }
+    let legacy: Vec<(i64, i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT account_id, id, order_merchant, order_ref FROM shipments
+             WHERE TRIM(COALESCE(order_ref, '')) <> ''
+               AND TRIM(COALESCE(order_merchant, '')) <> ''",
+        )?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (account, id, merchant, raw_ref) in legacy {
+        use crate::triage::order_link::{merchant_key, order_key};
+        let Some(order_ref) = crate::triage::extract::shipments::sanitize_order_ref(Some(&raw_ref))
+        else {
+            continue;
+        };
+        let (mkey, okey) = (merchant_key(&merchant), order_key(&order_ref));
+        if mkey.is_empty() || okey.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO shipment_order_links
+                 (account_id, shipment_id, merchant_key, order_key, merchant, order_ref, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'legacy')",
+            params![account, id, mkey, okey, merchant.trim(), order_ref],
+        )?;
+    }
     Ok(())
 }
 

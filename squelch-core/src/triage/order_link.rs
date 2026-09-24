@@ -13,6 +13,7 @@
 //! different purchase at every shop that numbers its orders from 1000.
 use crate::triage::extract::shipments::{sanitize_item_name, sanitize_order_ref};
 use crate::types::{Shipment, ShipmentLeg, ShipmentOrder};
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
 /// The merchant half of an order's identity: lowercase alphanumerics, so
@@ -216,39 +217,96 @@ pub fn union_orders<'a>(
     out
 }
 
-/// Collapse visible listing rows that share an order into one card each. The
-/// representative is the newest package (`last_update`, then the higher id):
-/// its status, carrier, tracking, eta and thread are the card's. The name and
-/// merchant are the representative's when it has them, else the newest
-/// non-empty one in the group. The other members become `legs`.
-pub fn group_shipments(rows: Vec<Shipment>) -> Vec<Shipment> {
+/// Who stands for a group on its card: THE NEWEST PACKAGE STILL ON ITS WAY,
+/// and the newest overall only when every package has landed. "Newest" is
+/// `last_update`, then the higher row id.
+///
+/// Newest-overall alone is wrong: an order whose first box was delivered
+/// yesterday while its second is still in transit would put the delivered box
+/// on the card, and every surface that drops a delivered card (the client's
+/// "delivered today" rail, `include_delivered = false`) would hide a package
+/// that is still coming. Both doors pick with this one function.
+///
+/// Returns `members` reordered: the representative first, then the legs,
+/// newest first.
+pub fn representative_first<T>(
+    mut members: Vec<T>,
+    key: impl Fn(&T) -> (bool, DateTime<Utc>, i64),
+) -> Vec<T> {
+    // Legs newest first...
+    members.sort_by(|a, b| {
+        let (_, at_a, id_a) = key(a);
+        let (_, at_b, id_b) = key(b);
+        at_b.cmp(&at_a).then_with(|| id_b.cmp(&id_a))
+    });
+    // ...and the representative is the first one not delivered, else the first.
+    if let Some(at) = members.iter().position(|m| !key(m).0) {
+        let rep = members.remove(at);
+        members.insert(0, rep);
+    }
+    members
+}
+
+/// Fold items into purchase groups, representative first in each. The one
+/// grouping both doors run: `orders` reads an item's order links, `key` its
+/// `(delivered, last_update, row id)` for [`representative_first`].
+pub fn fold_groups<T>(
+    items: Vec<T>,
+    orders: impl Fn(&T) -> &[ShipmentOrder],
+    key: impl Fn(&T) -> (bool, DateTime<Utc>, i64) + Copy,
+) -> Vec<Vec<T>> {
     let groups = {
-        let orders: Vec<&[ShipmentOrder]> = rows.iter().map(|r| r.orders.as_slice()).collect();
-        order_groups(&orders)
+        let lists: Vec<&[ShipmentOrder]> = items.iter().map(&orders).collect();
+        order_groups(&lists)
     };
-    let mut slots: Vec<Option<Shipment>> = rows.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    groups
+        .into_iter()
+        .map(|group| {
+            let members: Vec<T> = group.into_iter().filter_map(|i| slots[i].take()).collect();
+            representative_first(members, key)
+        })
+        .filter(|members| !members.is_empty())
+        .collect()
+}
+
+/// The name and merchant a card shows: the representative's when it has
+/// them, else the newest non-empty one among the legs. `members` is in
+/// [`representative_first`] order.
+pub fn card_name_and_merchant<'a>(
+    members: impl Iterator<Item = (&'a str, Option<&'a str>)> + Clone,
+) -> (String, Option<String>) {
+    let name = members
+        .clone()
+        .map(|(n, _)| n.trim())
+        .find(|n| !n.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let merchant = members
+        .filter_map(|(_, m)| m.map(str::trim))
+        .find(|m| !m.is_empty())
+        .map(str::to_string);
+    (name, merchant)
+}
+
+/// Collapse listing rows that share an order into one card each (see
+/// [`fold_groups`] and [`representative_first`]). The representative's status,
+/// carrier, tracking, eta and thread are the card's; the other members become
+/// `legs`; the orders are the union.
+pub fn group_shipments(rows: Vec<Shipment>) -> Vec<Shipment> {
+    let groups = fold_groups(
+        rows,
+        |r| r.orders.as_slice(),
+        |r| (r.status == "delivered", r.last_update, r.id),
+    );
     let mut out = Vec::with_capacity(groups.len());
-    for group in groups {
-        let mut members: Vec<Shipment> =
-            group.into_iter().filter_map(|i| slots[i].take()).collect();
-        // Newest first: the representative, then the legs, newest first too.
-        members.sort_by(|a, b| {
-            b.last_update
-                .cmp(&a.last_update)
-                .then_with(|| b.id.cmp(&a.id))
-        });
+    for members in groups {
         let orders = union_orders(members.iter().map(|m| m.orders.as_slice()));
-        let item_name = members
-            .iter()
-            .map(|m| m.item_name.trim())
-            .find(|n| !n.is_empty())
-            .unwrap_or("")
-            .to_string();
-        let merchant = members
-            .iter()
-            .filter_map(|m| m.merchant.as_deref().map(str::trim))
-            .find(|m| !m.is_empty())
-            .map(str::to_string);
+        let (item_name, merchant) = card_name_and_merchant(
+            members
+                .iter()
+                .map(|m| (m.item_name.as_str(), m.merchant.as_deref())),
+        );
         let mut members = members.into_iter();
         let Some(mut card) = members.next() else {
             continue;
@@ -373,6 +431,29 @@ mod tests {
         assert_eq!(card.legs.len(), 1);
         assert_eq!(card.legs[0].id, 1);
         assert_eq!(card.orders.len(), 1);
+    }
+
+    /// A DELIVERED BOX NEVER STANDS FOR ONE STILL COMING. The newer box landed
+    /// two days ago; the older one is still in transit. The card is the one in
+    /// transit, or every surface that drops delivered cards hides it.
+    #[test]
+    fn an_undelivered_member_represents_over_a_newer_delivered_one() {
+        let mut landed = row(1, 48, "", vec![order(Some("Shop"), "5")]);
+        landed.status = "delivered".into();
+        landed.delivered_at = Some(landed.last_update);
+        let coming = row(2, 72, "", vec![order(Some("Shop"), "5")]);
+        let cards = group_shipments(vec![landed, coming]);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, 2, "the box still on its way represents");
+        assert_eq!(cards[0].status, "shipped");
+        assert_eq!(cards[0].legs[0].id, 1);
+
+        // Every box landed: the newest represents.
+        let mut a = row(1, 48, "", vec![order(Some("Shop"), "5")]);
+        let mut b = row(2, 72, "", vec![order(Some("Shop"), "5")]);
+        a.status = "delivered".into();
+        b.status = "delivered".into();
+        assert_eq!(group_shipments(vec![b, a])[0].id, 1);
     }
 
     #[test]

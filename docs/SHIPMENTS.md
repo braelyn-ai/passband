@@ -518,24 +518,39 @@ retained proposal that states them; a proposal that names nothing never erases a
 name, and retracting the last one that named it clears it. On a legacy row
 (written before the agent owned deliveries), the agent's name and merchant
 replace the old ones only when mail newer than the row lands, the same gate that
-revives a silent row. An agent name is stamped `item_name_source = 'agent'`
+revives a silent row. Once the agent has replaced a legacy row's name, the old
+name is gone and the name follows the agent's proposals like an owned row's: if
+the proposal that renamed it is retracted and no remaining proposal names the
+package, the row goes back to unnamed (`item_name = ''`, `item_name_source =
+'regex'`, `item_name_msg = NULL`); the legacy name cannot come back. The agent's
+merchant on a legacy row behaves the same way. An agent name is stamped `item_name_source = 'agent'`
 (alongside the older `'regex'` and `'llm'`) and `item_name_msg` points at the
 mail that named it, so the agent door's provenance guard
 (`external_shipment_allowed_conn`) judges the naming mail too. The merchant lands in
-`shipments.order_merchant`; rows the old extractor wrote hold the sender's
-registrable domain there ("amazon.com") instead.
+`shipments.order_merchant`, with `order_merchant_msg` pointing at the mail
+that named it; rows the old extractor wrote hold the sender's registrable domain
+there ("amazon.com") instead, with no `order_merchant_msg`.
 
 **Order links.** `shipment_order_links(account_id, shipment_id, merchant_key,
-order_key, merchant, order_ref, source)` records which orders each package
-carries, many-to-many. `merchant_key` is the merchant's lowercase alphanumerics
+order_key, merchant, order_ref, source, message_id, merchant_msg)` records which
+orders each package carries, many-to-many. `merchant_key` is the merchant's lowercase alphanumerics
 ("Bill's Exhausts" and "BILLS EXHAUSTS" are both `billsexhausts`); `order_key`
-is the ref's uppercase alphanumerics (`#21470` is `21470`). A proposal that names
-orders but no merchant borrows the package's merchant from its other proposals.
+is the ref's uppercase alphanumerics (`#21470` is `21470`). ONE MERCHANT PER BOX:
+every agent link of a package is filed under the package's single seller, the
+newest proposal that named one, whatever each proposal said; a proposal that
+names orders but no merchant borrows it the same way. One box is sold by one
+store, and filing its refs under two would let a single package chain two shops'
+orders into one card. `message_id` is the mail that printed the ref and
+`merchant_msg` the mail that named the seller; both are NULL on a legacy link.
 `source = 'agent'` rows are rebuilt by every reconcile from the retained
 proposals for that number, so a retraction removes them. `source = 'legacy'`
 rows were backfilled once, on the open that created the table, from rows the old
 extractor gave both an order ref and a merchant; reconcile never touches them.
-Deleting a shipment deletes its links (an `AFTER DELETE` trigger). It is not
+Deleting a shipment deletes its links (an `AFTER DELETE` trigger). The table,
+its index, the trigger and the backfill are created in one `BEGIN IMMEDIATE`
+transaction that re-checks existence inside it; a failure rolls all of it back
+and the next open retries, so a half-done backfill can never pass for a done
+one. It is not
 `shipment_orders`, which is the old extractor's staging table for orders with no
 tracking number yet.
 
@@ -543,10 +558,20 @@ tracking number yet.
 (silence, cleared): two visible rows are one card when they share an order with a
 non-empty merchant key, transitively, so a box carrying orders 1 and 2 and a box
 carrying 2 and 3 are one card. A ref with no merchant never groups, since "#1001"
-is a different purchase at every shop. The newest row (`last_update`, then the
-higher id) represents the card: its status, carrier, tracking, ETA and thread
-are the card's. The name and merchant are its own when it has them, else the
-newest non-empty one in the group. Rows gained:
+is a different purchase at every shop.
+
+The REPRESENTATIVE is the newest row NOT delivered (`last_update`, then the
+higher id), and the newest row overall only when every row on the card is
+delivered (`order_link::representative_first`). Its status, carrier, tracking,
+ETA and thread are the card's, so a card is "delivered" only when all of its
+packages are. Newest-overall would let a box delivered yesterday stand for one
+still in transit, and every surface that drops delivered cards would hide the
+package still coming. Grouping runs on every visible row, delivered or not, and
+`include_delivered = false` is then applied to whole cards; the agent door does
+the same, so both doors group the same members. The name and merchant are the
+representative's when it has them, else the newest non-empty one in the group.
+The client also keeps a card on the rail while any leg is undelivered. Rows
+gained:
 
 | Field | Meaning |
 |---|---|
@@ -559,6 +584,26 @@ agent door's `get_shipments` groups its merged list by the same rule and serves
 the same three fields; a record hit takes its row's reconciled name when the row
 has one, and the decision summary otherwise. The carrier poller is untouched:
 every tracking number is still its own row and still polled.
+
+**Clearing a card clears the order.** `POST /client/shipments/{id}/clear` takes
+the one id the client shows, but stamps `cleared_at` on every package of the
+card that id belongs to (the listing's own grouping, under the same list policy,
+whichever member's id is posted). Clearing one box would leave the order's
+other boxes to regroup into a card that comes straight back. Each package still
+revives on its own when its own `last_update` moves past the stamp, and the
+agent door, which judges clears per tracking number, hides every one of them.
+
+**The agent door sees only what readable mail said.** A merchant and an order
+ref are text lifted from one message each, and that message may be restricted
+while the package's own mail is not (a pharmacy's order mail, then a plain
+carrier notice for the same number). On `get_shipments` (built from
+`external_shipments`), the merchant is dropped unless `order_merchant_msg` passes
+the agent door's message check (`external_message_allowed_conn` plus the thread
+guard); an agent link is dropped unless both its `message_id` and its
+`merchant_msg` pass; a link or merchant with no provenance (legacy) is served
+only when the row's own creating and latest mail pass. The agent door groups on
+the links that survive, so a withheld ref can never merge two packages there
+either. The human door is unaffected.
 
 ### The detector, tightened
 

@@ -380,19 +380,34 @@ pub(super) fn external_shipment_allowed_conn(
         .into_iter()
         .flatten()
     {
-        if !external_message_allowed_conn(conn, account_id, id)? {
-            return Ok(false);
-        }
-        let thread: String = conn.query_row(
-            "SELECT thread_id FROM messages WHERE account_id=?1 AND id=?2",
-            params![account_id, id],
-            |r| r.get(0),
-        )?;
-        if thread_guard_and_subject(conn, account_id, &thread).is_err() {
+        if !external_contributor_allowed_conn(conn, account_id, id)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// May the agent door carry text that `message_id` contributed to a derived
+/// row? The message's own current assessment (and every source it consumed)
+/// must be allowed, and so must its thread. The per-field half of
+/// [`external_shipment_allowed_conn`]: the merchant and each order link are
+/// judged by the message that supplied them, one at a time, so a restricted
+/// mail's merchant drops off an otherwise servable package instead of riding
+/// along on it.
+pub(super) fn external_contributor_allowed_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+) -> Result<bool> {
+    if !external_message_allowed_conn(conn, account_id, message_id)? {
+        return Ok(false);
+    }
+    let thread: String = conn.query_row(
+        "SELECT thread_id FROM messages WHERE account_id=?1 AND id=?2",
+        params![account_id, message_id],
+        |r| r.get(0),
+    )?;
+    Ok(thread_guard_and_subject(conn, account_id, &thread).is_ok())
 }
 
 impl SqliteStore {

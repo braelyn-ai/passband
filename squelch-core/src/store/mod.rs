@@ -1246,11 +1246,18 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// There is no `unclear_shipment`, by design. Un-hiding is the comparison in
     /// the listing, and the events that should un-hide a package (a poll that
     /// moved it, an email that advanced it) already write `last_update`.
+    ///
+    /// A CARD IS CLEARED WHOLE. When the row is one package of a grouped card
+    /// (one order in several boxes, see [`crate::triage::order_link`]), every
+    /// package on that card is stamped, the group being the one
+    /// [`Store::list_shipments`] shows under the same `policy`. Each package
+    /// still revives on its own when its own `last_update` moves.
     fn clear_shipment(
         &self,
         account_id: AccountId,
         shipment_id: i64,
         at: DateTime<Utc>,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<bool>;
 
     /// ONE-SHOT REPAIR: re-run shipment detection over every shipment row's
