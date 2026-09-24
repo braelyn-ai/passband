@@ -260,7 +260,7 @@ private struct ShipmentCard: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 if RehearsalMode.isEnabled, shipment.thread_id == "practice-5" {
-                    RehearsalNewsletterLogo(brand: .exfed, size: 18)
+                    RehearsalNewsletterLogo(brand: .exfed, size: 18, tile: false)
                 } else if RehearsalMode.isEnabled,
                    shipment.thread_id == "practice-13" || shipment.thread_id == "practice-14" {
                     RehearsalNewsletterLogo(brand: .rainforest, size: 18)

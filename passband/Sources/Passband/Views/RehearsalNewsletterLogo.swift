@@ -34,12 +34,16 @@ enum RehearsalNewsletterBrand {
 struct RehearsalNewsletterLogo: View {
     let brand: RehearsalNewsletterBrand
     let size: CGFloat
+    /// False drops a WHITE backdrop so the mark sits straight on the card, the
+    /// way the real carrier badges do once their white square is cleared. A
+    /// coloured tile is the brand itself and stays either way.
+    var tile: Bool = true
 
     var body: some View {
         ZStack {
             switch brand {
             case .exfed:
-                Color.white
+                if tile { Color.white }
                 VStack(spacing: -size * 0.06) {
                     Text("Ex").foregroundStyle(Color(hex: 0x51258A))
                     Text("Fed").foregroundStyle(Color(hex: 0xF46A20))
@@ -96,8 +100,10 @@ struct RehearsalNewsletterLogo: View {
         .frame(width: size, height: size)
         .clipShape(RoundedRectangle(cornerRadius: size * 0.15, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: size * 0.15, style: .continuous)
-                .strokeBorder(.black.opacity(0.08), lineWidth: 0.5)
+            if tile {
+                RoundedRectangle(cornerRadius: size * 0.15, style: .continuous)
+                    .strokeBorder(.black.opacity(0.08), lineWidth: 0.5)
+            }
         }
         .accessibilityLabel("\(brand.name) logo")
     }
