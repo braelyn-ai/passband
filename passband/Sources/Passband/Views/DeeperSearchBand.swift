@@ -1,5 +1,5 @@
 // THE DEEPER SEARCH, WHERE THE READER CAN SEE IT (docs/SEARCH.md §6.4). A band
-// above the hits in the 460pt strip, the right-hand column beside them when the
+// above the hits in the 460pt strip, the left-hand column beside them when the
 // panel is expanded: same content either way, because it is the same
 // conversation and only the room it has changes.
 //
@@ -24,11 +24,6 @@ struct DeeperSearchBand: View {
 
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
-    /// Collapsed by the reader, for this panel session. Local state on purpose:
-    /// a band folded away while one search was running should not still be
-    /// folded away over tomorrow's.
-    @State private var collapsed = false
-
     private var session: AssistantSession { store.searchLane }
     private var search: SearchSession { store.search }
 
@@ -54,7 +49,7 @@ struct DeeperSearchBand: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
-            if !collapsed { content }
+            content
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -80,10 +75,9 @@ struct DeeperSearchBand: View {
             Image(systemName: "sparkles")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(Palette.accent)
-            Text("deeper search")
-                .font(Typo.sectionLabel)
+            Text("Deeper search")
+                .font(Typo.row)
                 .foregroundStyle(Palette.inkFaint)
-                .textCase(.uppercase)
             if let reason {
                 Text(reason)
                     .font(Typo.micro)
@@ -98,23 +92,7 @@ struct DeeperSearchBand: View {
                     .foregroundStyle(Palette.inkFaint)
                     .help("Held where it was. It picks up from there, nothing is lost.")
             }
-            if search.laneStarted {
-                // The conversation goes; the query and its verdict stay, so the
-                // band stays too and can be asked again without retyping.
-                Button("new") { store.resetSearchLane(keepingVerdict: true) }
-                    .buttonStyle(.textAction)
-                    .font(Typo.micro)
-                    .help("Forget this conversation and start the deeper search over")
-            }
-            Button {
-                collapsed.toggle()
-            } label: {
-                Image(systemName: collapsed ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(Palette.inkFaintest)
-            }
-            .buttonStyle(.plain)
-            .help(collapsed ? "Show what the deeper search found" : "Fold this away")
+
         }
     }
 

@@ -165,30 +165,14 @@ struct SearchView: View {
             // register later than this panel's and win only while it is up.
             if focused, let fragment = FromOperator.fragment(in: store.search.query) {
                 SenderSuggestions(query: $store.search.query, fragment: fragment)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
             }
 
-            // THE ORDER, beside the thing that produces it. A sort control is
-            // about the answer, so it belongs next to the question and not
-            // three screens away — the same preference is in Settings, and the
-            // two are one value, so flipping it here is what Settings will say
-            // next time it is opened.
-            //
-            // Shown even with an empty field: a control that only appears once
-            // you have results is a control you do not know you have.
             HStack {
                 SearchSortPicker()
                 Spacer(minLength: 8)
-                Button { prefs.searchIncludeRelated.toggle() } label: {
-                    Text("Include related")
-                        .font(.system(size: 11))
-                        .foregroundStyle(prefs.searchIncludeRelated ? Palette.ink : Palette.inkDim)
-                }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(prefs.searchIncludeRelated ? .isSelected : [])
-                    .accessibilityValue(prefs.searchIncludeRelated ? "On" : "Off")
-                    .help("Include mail matched by meaning. This can take longer.")
                 if expanded { askAgentButton }
             }
             .padding(.horizontal, 16)
@@ -204,7 +188,7 @@ struct SearchView: View {
             if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
             // THE STRIP IS TOO NARROW FOR TWO COLUMNS (460pt), so there the
-            // lane is a band ABOVE the hits; expanded, it becomes the right
+            // lane is a band ABOVE the hits; expanded, it becomes the left
             // column beside them and the results keep their reading width. Same
             // view either way — see DeeperSearchBand.
             //
@@ -229,23 +213,20 @@ struct SearchView: View {
                     queries: recents, armed: store.search.index,
                     onRun: { run($0) }, onClear: { clearRecents() }
                 )
-                // The hits' own column, for the same reason they have one: the
-                // field can be cleared while the panel is still expanded, and a
-                // 1300pt-wide row holding four words is a treadmill for the eyes.
-                .frame(maxWidth: expanded ? 780 : .infinity)
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, expanded ? 24 : 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
             }
             HStack(alignment: .top, spacing: 0) {
-                results(expanded: expanded)
                 if bandMounted && expanded {
                     ScrollView {
                         DeeperSearchBand(expanded: true)
-                            .padding(.horizontal, 16)
+                            .padding(.leading, 16)
+                            .padding(.top, 14)
                             .padding(.bottom, 14)
                     }
                     .frame(minWidth: 320, idealWidth: 380, maxWidth: 440)
                 }
+                results(expanded: expanded)
             }
         }
         .keyBindings(.modal, bindings)
@@ -343,11 +324,9 @@ struct SearchView: View {
                     // of the results, so the append announces itself.
                     if loadingMore { BandNote("loading more…") }
                 }
-                // Fullscreen keeps a reading-width column: match text in
-                // window-wide rows is a treadmill for the eyes.
-                .frame(maxWidth: expanded ? 1120 : .infinity)
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, expanded ? 24 : 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, expanded && bandMounted ? 8 : 16)
+                .padding(.trailing, 16)
                 .padding(.bottom, 14)
             }
             .onAppear {
@@ -718,10 +697,7 @@ private struct HitRow: View {
                        size: 26)
                     .padding(.top, 1)
                     .accessibilityHidden(true)
-                ViewThatFits(in: .horizontal) {
-                    if expanded { wideRow }
-                    narrowRow
-                }
+                columns
             }
             .padding(.vertical, 11)
             .padding(.leading, 16)
@@ -783,24 +759,19 @@ private struct HitRow: View {
             .multilineTextAlignment(.leading)
     }
 
-    private var narrowRow: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack { sender; Spacer(minLength: 8); date }
-            subject
-            preview.lineLimit(2)
-        }
-    }
-
-    private var wideRow: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 18) {
-            sender.frame(width: 160, alignment: .leading)
+    // Choose column widths from the panel mode, never from a row's text.
+    // Long subjects truncate instead of switching that row to a stacked layout.
+    private var columns: some View {
+        HStack(alignment: .firstTextBaseline, spacing: expanded ? 18 : 12) {
+            sender.frame(width: expanded ? 160 : 104, alignment: .leading)
             VStack(alignment: .leading, spacing: 3) {
                 subject
-                preview.lineLimit(1)
+                preview.lineLimit(expanded ? 1 : 2)
             }
-            .frame(minWidth: 300, maxWidth: .infinity, alignment: .leading)
-            date.frame(width: 80, alignment: .trailing)
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            date.frame(width: expanded ? 80 : 72, alignment: .trailing)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func highlight(_ text: String, matches: [String]) -> AttributedString {
