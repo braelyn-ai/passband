@@ -494,6 +494,8 @@ struct ComposePane: View {
             let full = (try? await APIClient.shared.group(group.id)) ?? group
             let members = (full.members ?? []).map(\.addr)
             patch { state in
+                // A new audience relocks send-anyway, same as typing one.
+                state.guardKinds = []
                 state.groupId = full.id
                 state.groupMode = full.mode
                 state.groupName = full.name
