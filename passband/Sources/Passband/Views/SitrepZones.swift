@@ -346,7 +346,7 @@ private struct CarrierBadge: View {
                 failed = true
                 return
             }
-            image = await FaviconLoader.shared.load(url: url, domain: domain)
+            image = await Self.knockedOut(FaviconLoader.shared.load(url: url, domain: domain), domain)
             failed = image == nil
         }
     }
@@ -359,6 +359,76 @@ private struct CarrierBadge: View {
 /// balance the extractor pulled).
 ///
 /// WINDOWED, not capped: the card shows the last 24 hours, or everything since
+
+    /// Per domain, so a rail of UPS cards pays for the flood fill once.
+    @MainActor private static var knockouts: [String: PlatformImage] = [:]
+
+    @MainActor private static func knockedOut(_ image: PlatformImage?, _ domain: String) -> PlatformImage? {
+        guard let image else { return nil }
+        if let done = knockouts[domain] { return done }
+        let clear = FaviconMatte.clearingBackdrop(image) ?? image
+        knockouts[domain] = clear
+        return clear
+    }
+}
+
+/// Carrier favicons come as a mark on a baked-in WHITE square (UPS, USPS), which
+/// reads as a sticker on the card's tint and a lit tile in dark mode. This clears
+/// the near-white pixels reachable from the border and nothing else, so white
+/// INSIDE the mark (the USPS eagle) survives. A coloured square (DHL's yellow) is
+/// the brand itself and is left alone, as is an icon that is already transparent.
+enum FaviconMatte {
+    /// How close to white a pixel must be to count as backdrop. Low enough to eat
+    /// JPEG-ish noise in the square, high enough to spare a pale brand colour.
+    private static let floor: UInt8 = 235
+
+    static func clearingBackdrop(_ image: PlatformImage) -> PlatformImage? {
+        #if os(macOS)
+            guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        #else
+            guard let cg = image.cgImage else { return nil }
+        #endif
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0,
+            let ctx = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+            let base = ctx.data?.assumingMemoryBound(to: UInt8.self)
+        else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let px = UnsafeMutableBufferPointer(start: base, count: w * h * 4)
+
+        func isBackdrop(_ i: Int) -> Bool {
+            let o = i * 4
+            return px[o + 3] == 255 && px[o] >= floor && px[o + 1] >= floor && px[o + 2] >= floor
+        }
+        var seen = [Bool](repeating: false, count: w * h)
+        var stack: [Int] = []
+        for x in 0..<w { stack.append(x); stack.append((h - 1) * w + x) }
+        for y in 0..<h { stack.append(y * w); stack.append(y * w + w - 1) }
+        var cleared = 0
+        while let i = stack.popLast() {
+            guard !seen[i] else { continue }
+            seen[i] = true
+            guard isBackdrop(i) else { continue }
+            for c in 0..<4 { px[i * 4 + c] = 0 }
+            cleared += 1
+            let x = i % w, y = i / w
+            if x > 0 { stack.append(i - 1) }
+            if x < w - 1 { stack.append(i + 1) }
+            if y > 0 { stack.append(i - w) }
+            if y < h - 1 { stack.append(i + w) }
+        }
+        // Nothing white on the rim: the icon was already transparent or its
+        // square is a brand colour. Hand back the original untouched.
+        guard cleared > 0, let out = ctx.makeImage() else { return nil }
+        #if os(macOS)
+            return NSImage(cgImage: out, size: image.size)
+        #else
+            return UIImage(cgImage: out, scale: image.scale, orientation: image.imageOrientation)
+        #endif
+    }
 /// this zone was last SEEN, whichever reaches further back (SitrepWindow). The
 /// old fixed "latest 8" held week-old rows forever — issue #82.
 struct BankingZone: View {
