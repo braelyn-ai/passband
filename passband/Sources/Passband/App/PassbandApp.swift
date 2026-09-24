@@ -17,14 +17,23 @@ struct PassbandApp: App {
 
     var body: some Scene {
         Window("Passband", id: "main") {
-            RootView()
-                .environment(store)
-                .environment(prefs)
+            ZoomedWindowContent(zoom: prefs.zoom) {
+                RootView()
+                    .environment(store)
+                    .environment(prefs)
+            }
                 .preferredColorScheme(prefs.theme.colorScheme)
-                .frame(minWidth: 980, minHeight: 640)
+                // The layout's floor, in window points: a zoomed shell needs a
+                // proportionally bigger window to hold the same page.
+                .frame(minWidth: Zoom.minLogicalSize.width * prefs.zoom,
+                       minHeight: Zoom.minLogicalSize.height * prefs.zoom)
+                // The traffic lights sit on the top bar's centre line, and the
+                // bar's height on screen is a zoomed one.
+                .onChange(of: prefs.zoom) { WindowConfigurator.realignTrafficLights() }
                 .background(WindowBackdrop().ignoresSafeArea())
                 .background(WindowConfigurator())
                 .onAppear {
+                    KeyMonitor.shared.onZoomIn = { Zoom.zoomIn() }
                     KeyMonitor.shared.install()
                     // The tester's panel beside the window, never for a
                     // customer: the flag is a launch argument only a
@@ -242,6 +251,21 @@ struct PassbandCommands: Commands {
         }
 
         CommandGroup(after: .toolbar) {
+            // Live everywhere, including a re-triage run: it changes how the
+            // screen is drawn, never what is on it.
+            // ⌘= is the key under "+", and the chord most people press for
+            // zoom in. ⌘+ proper (⇧=) is caught in KeyMonitor, since a menu
+            // item has room for one chord.
+            Button("Zoom In") { Zoom.zoomIn() }
+                .keyboardShortcut("=", modifiers: [.command])
+                .disabled(!Zoom.canZoomIn)
+            Button("Zoom Out") { Zoom.zoomOut() }
+                .keyboardShortcut("-", modifiers: [.command])
+                .disabled(!Zoom.canZoomOut)
+            Button("Actual Size") { Zoom.reset() }
+                .keyboardShortcut("0", modifiers: [.command])
+                .disabled(prefs.zoom == 1)
+            Divider()
             // Deliberately NO keyboardShortcut: a menu shortcut with no
             // modifier fires even while a text field has focus, so `\` is bound
             // in the key registry instead, behind its input guard.

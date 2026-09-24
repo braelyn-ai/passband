@@ -524,11 +524,17 @@ extension ButtonStyle where Self == TextActionStyle {
                 // depth measured against ITS top is a depth into the window. Its
                 // coordinates are bottom-up, hence the subtraction both ways.
                 let depth = container.bounds.maxY - button.frame.midY
-                let drop = TopBar.height / 2 - depth
+                let drop = TopBar.height * Prefs.shared.zoom / 2 - depth
                 guard abs(drop) > 0.5 else { continue }
                 button.setFrameOrigin(
                     NSPoint(x: button.frame.minX, y: button.frame.minY - drop))
             }
+        }
+
+        /// After a zoom: the bar the buttons centre on changed height.
+        @MainActor
+        static func realignTrafficLights() {
+            for window in NSApp.windows { alignTrafficLights(in: window) }
         }
 
         /// Re-walk every window. NOTHING IS CAPTURED, deliberately: these closures

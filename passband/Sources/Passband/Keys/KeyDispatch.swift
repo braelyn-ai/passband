@@ -277,6 +277,9 @@ final class KeyRegistry {
     final class KeyMonitor {
         static let shared = KeyMonitor()
         private var monitor: Any?
+        /// What ⌘+ does. Handed in by the app (App/Zoom.swift) rather than
+        /// named here, so this file still compiles alone for its test suite.
+        var onZoomIn: () -> Void = {}
 
         private init() {}
 
@@ -289,6 +292,13 @@ final class KeyRegistry {
                 // thread binding that consumed one would leave the human with
                 // no way out of a window this app did not draw.
                 if event.window is QLPreviewPanel { return event }
+                // ⌘+ as typed (⇧= on most layouts, or the keypad's +). The View
+                // menu's Zoom In owns ⌘=, and a menu item has room for one chord.
+                let chord = event.modifierFlags.intersection([.command, .option, .control])
+                if chord == .command, event.characters == "+" {
+                    self.onZoomIn()
+                    return nil
+                }
                 guard let like = KeyNames.eventLike(event) else { return event }
                 // The input guard: typing into a text field suppresses single-letter
                 // bindings unless the binding opts in.
