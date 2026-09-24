@@ -14,6 +14,7 @@ struct SquelchSceneView: View {
     let engaged: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
 
     /// Compiled lazily on first ask. nil means no usable Metal device (or the
     /// shader failed to build), and callers fall back to the static intro.
@@ -21,7 +22,8 @@ struct SquelchSceneView: View {
 
     var body: some View {
         if let renderer = Self.renderer {
-            SquelchMetalView(renderer: renderer, engaged: engaged, reduceMotion: reduceMotion)
+            SquelchMetalView(renderer: renderer, engaged: engaged, light: colorScheme == .light,
+                             reduceMotion: reduceMotion)
                 .accessibilityElement()
                 .accessibilityLabel(engaged
                     ? "Radio noise stops at a glowing gate. Only a narrow band of clear signal passes through."
@@ -35,6 +37,7 @@ struct SquelchSceneView: View {
 final class SquelchCoordinator: NSObject, MTKViewDelegate {
     let renderer: SquelchRenderer
     var engaged = false
+    var light = false
     var reduceMotion = false
     private var state = SquelchSceneState()
     private var last: CFTimeInterval?
@@ -52,6 +55,7 @@ final class SquelchCoordinator: NSObject, MTKViewDelegate {
         state.camera = engaged ? 1 : 0
         state.filterLo = 0
         state.filterHi = engaged ? SquelchSceneState.xMax + 4 : 0
+        state.light = light ? 1 : 0
     }
 
     nonisolated func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -66,7 +70,7 @@ final class SquelchCoordinator: NSObject, MTKViewDelegate {
             // Clamp so a stall (window hidden, app napped) resumes smoothly
             // rather than fast-forwarding the fronts across the whole stream.
             let dt = Float(min(now - (last ?? now), 1.0 / 20))
-            state.step(dt: dt, engaged: engaged)
+            state.step(dt: dt, engaged: engaged, light: light)
         }
         last = now
         guard let drawable = view.currentDrawable,
@@ -88,9 +92,12 @@ private func configure(_ view: MTKView, _ renderer: SquelchRenderer, _ coordinat
 }
 
 @MainActor
-private func apply(_ view: MTKView, _ coordinator: SquelchCoordinator, engaged: Bool, reduceMotion: Bool) {
-    let changed = coordinator.engaged != engaged || coordinator.reduceMotion != reduceMotion
+private func apply(_ view: MTKView, _ coordinator: SquelchCoordinator,
+                   engaged: Bool, light: Bool, reduceMotion: Bool) {
+    let changed = coordinator.engaged != engaged || coordinator.light != light
+        || coordinator.reduceMotion != reduceMotion
     coordinator.engaged = engaged
+    coordinator.light = light
     coordinator.reduceMotion = reduceMotion
     view.isPaused = reduceMotion
     view.enableSetNeedsDisplay = reduceMotion
@@ -108,6 +115,7 @@ private func apply(_ view: MTKView, _ coordinator: SquelchCoordinator, engaged: 
 private struct SquelchMetalView: NSViewRepresentable {
     let renderer: SquelchRenderer
     let engaged: Bool
+    let light: Bool
     let reduceMotion: Bool
 
     func makeCoordinator() -> SquelchCoordinator { SquelchCoordinator(renderer: renderer) }
@@ -116,18 +124,21 @@ private struct SquelchMetalView: NSViewRepresentable {
         let view = MTKView()
         configure(view, renderer, context.coordinator)
         context.coordinator.engaged = !engaged  // force the first apply to settle
-        apply(view, context.coordinator, engaged: engaged, reduceMotion: reduceMotion)
+        context.coordinator.light = light
+        context.coordinator.settle()             // open in the right theme, no fade
+        apply(view, context.coordinator, engaged: engaged, light: light, reduceMotion: reduceMotion)
         return view
     }
 
     func updateNSView(_ view: MTKView, context: Context) {
-        apply(view, context.coordinator, engaged: engaged, reduceMotion: reduceMotion)
+        apply(view, context.coordinator, engaged: engaged, light: light, reduceMotion: reduceMotion)
     }
 }
 #else
 private struct SquelchMetalView: UIViewRepresentable {
     let renderer: SquelchRenderer
     let engaged: Bool
+    let light: Bool
     let reduceMotion: Bool
 
     func makeCoordinator() -> SquelchCoordinator { SquelchCoordinator(renderer: renderer) }
@@ -136,12 +147,14 @@ private struct SquelchMetalView: UIViewRepresentable {
         let view = MTKView()
         configure(view, renderer, context.coordinator)
         context.coordinator.engaged = !engaged  // force the first apply to settle
-        apply(view, context.coordinator, engaged: engaged, reduceMotion: reduceMotion)
+        context.coordinator.light = light
+        context.coordinator.settle()             // open in the right theme, no fade
+        apply(view, context.coordinator, engaged: engaged, light: light, reduceMotion: reduceMotion)
         return view
     }
 
     func updateUIView(_ view: MTKView, context: Context) {
-        apply(view, context.coordinator, engaged: engaged, reduceMotion: reduceMotion)
+        apply(view, context.coordinator, engaged: engaged, light: light, reduceMotion: reduceMotion)
     }
 }
 #endif

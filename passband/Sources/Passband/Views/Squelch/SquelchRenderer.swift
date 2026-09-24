@@ -26,13 +26,17 @@ struct SquelchSceneState {
     var filterHi: Float = 0
     /// 0 = close in on the noise, 1 = pulled back to see the passband exit.
     var camera: Float = 0
+    /// 0 = night (additive glow), 1 = paper (ink). Eased, so a theme change
+    /// crossfades instead of cutting.
+    var light: Float = 0
 
     static let waveSpeed: Float = 2.4
     static let xMax: Float = 13
 
     /// Advance the fronts. `engaged` is the switch; everything else follows.
-    mutating func step(dt: Float, engaged: Bool) {
+    mutating func step(dt: Float, engaged: Bool, light isLight: Bool) {
         time += dt
+        light += ((isLight ? 1 : 0) - light) * (1 - exp(-dt * 5))
         let c = Self.waveSpeed
         let ease = 1 - exp(-dt * 2.6)
         engage += ((engaged ? 1 : 0) - engage) * ease
@@ -87,7 +91,10 @@ final class SquelchRenderer {
                 a.rgbBlendOperation = .add
                 a.alphaBlendOperation = .add
                 a.sourceRGBBlendFactor = .one
-                a.destinationRGBBlendFactor = .one
+                // Premultiplied over. A fragment with alpha 0 is purely
+                // additive, so night glow and paper ink share one state and
+                // the theme can crossfade between them.
+                a.destinationRGBBlendFactor = .oneMinusSourceAlpha
                 a.sourceAlphaBlendFactor = .zero
                 a.destinationAlphaBlendFactor = .one
             }
@@ -182,7 +189,7 @@ final class SquelchRenderer {
             eye: SIMD4<Float>(eye, s.time),
             frame: SIMD4<Float>(width, height, s.filterLo, s.filterHi),
             field: SIMD4<Float>(Float(Self.bands), Float(Self.segments), -17, SquelchSceneState.xMax),
-            filter: SIMD4<Float>(s.engage, SquelchSceneState.waveSpeed, 0, 0))
+            filter: SIMD4<Float>(s.engage, SquelchSceneState.waveSpeed, s.light, 0))
     }
 }
 
@@ -192,7 +199,7 @@ private struct SquelchUniforms {
     var eye: SIMD4<Float>     // xyz camera, w time
     var frame: SIMD4<Float>   // viewport px w/h, filter lo/hi
     var field: SIMD4<Float>   // bands, segments, x min, x max
-    var filter: SIMD4<Float>  // engage, wave speed
+    var filter: SIMD4<Float>  // engage, wave speed, light
 }
 
 private func mix(_ a: SIMD3<Float>, _ b: SIMD3<Float>, t: Float) -> SIMD3<Float> { a + (b - a) * t }
@@ -259,9 +266,26 @@ float fbm(float2 p) {
 
 float bandZ(float i, constant U& u) { return (i / (u.field.x - 1.0) - 0.5) * BAND_SPAN; }
 
-// The passband's magnitude response: an 8th-order Butterworth over band index.
-float gain(float i, constant U& u) {
-    float c = (u.field.x - 1.0) * 0.5;
+// Where the passband is tuned at time tau, in [-1, 1]. Hold, then glide to a
+// new target, on a warped clock so the pace never settles into a rhythm: it
+// should read as a decision being made, not a metronome.
+float passOffset(float tau) {
+    float w = tau * 0.30 + 0.45 * sin(tau * 0.23);   // monotonic: 0.30 > 0.45 * 0.23
+    float k = floor(w), f = fract(w);
+    float a = h11(k * 7.31 + 1.7) * 2.0 - 1.0;
+    float b = h11((k + 1.0) * 7.31 + 1.7) * 2.0 - 1.0;
+    float e = saturate((f - 0.5) / 0.5);
+    e = e * e * e * (e * (e * 6.0 - 15.0) + 10.0);
+    return mix(a, b, e) + 0.06 * sin(tau * 1.7) * sin(tau * 0.61);
+}
+
+// The passband's magnitude response: an 8th-order Butterworth over band index,
+// centered wherever it was tuned when this stretch of wave crossed the gate.
+// Evaluating the tuning at the retarded time -s/c is what makes the filtered
+// stream downstream meander: it is the tuning's own history, carried out.
+float gain(float i, float s, constant U& u) {
+    float tau = -s / u.filter.y;
+    float c = (u.field.x - 1.0) * (0.5 + 0.17 * passOffset(tau));
     float r = (i - c) / 4.2;
     return 1.0 / sqrt(1.0 + pow(r * r, 8.0));
 }
@@ -295,12 +319,13 @@ float filtered(float x, constant U& u) {
     return saturate((hi - x) / 0.9) * saturate((x - lo) / 0.9) * smoothstep(-0.2, 0.35, x);
 }
 
-struct Sample { float3 p; float3 color; };
+// glow: night color, added. ink + alpha: paper color, composited over.
+struct Sample { float3 p; float3 glow; float3 ink; float alpha; };
 
 Sample field(float i, float x, constant U& u) {
     float t = u.eye.w;
     float s = x - u.filter.y * t;
-    float g = gain(i, u);
+    float g = gain(i, s, u);
     float m = filtered(x, u);
     float noise = noiseY(i, s, u);
     float sig = signalY(i, s);
@@ -309,34 +334,45 @@ Sample field(float i, float x, constant U& u) {
     float y = mix(raw, clean, m);
 
     float n = i / (u.field.x - 1.0);
-    // Noise: a muted spectrum, warm lows to cool highs.
-    float3 lowC = float3(0.55, 0.34, 0.62), highC = float3(0.22, 0.52, 0.66);
-    float3 noiseC = mix(lowC, highC, n) * (0.42 + 0.4 * abs(noise));
-    float3 blue = float3(0.30, 0.62, 1.00);
-    float env = packetEnv(i, s);
-    float3 passC = blue * (0.9 + 0.5 * g) + float3(1.0, 0.86, 0.62) * env * 2.2 * g;
-    float3 quietC = float3(0.16, 0.22, 0.32) * 0.5;
-    float3 after = mix(quietC, passC, g);
-    float3 color = mix(noiseC, after, m);
+    float env = packetEnv(i, s) * g;
+    float busy = abs(noise);
+
+    // Night: a muted spectrum, warm lows to cool highs; the passband in
+    // passband blue with the packets running hot.
+    float3 noiseG = mix(float3(0.55, 0.34, 0.62), float3(0.22, 0.52, 0.66), n) * (0.42 + 0.4 * busy);
+    float3 passG = float3(0.30, 0.62, 1.00) * (0.9 + 0.5 * g) + float3(1.0, 0.86, 0.62) * env * 2.2;
+    float3 glow = mix(noiseG, mix(float3(0.08, 0.11, 0.16), passG, g), m);
+
+    // Paper: the same spectrum as ink, the passband in accent blue deepening
+    // to navy through each packet.
+    float3 noiseI = mix(float3(0.40, 0.27, 0.60), float3(0.12, 0.40, 0.56), n);
+    float noiseA = 0.55 + 0.45 * busy;
+    float3 passI = mix(float3(0.17, 0.50, 0.83), float3(0.05, 0.22, 0.52), saturate(env * 1.4));
+    float3 ink = mix(noiseI, mix(float3(0.50, 0.58, 0.70), passI, g), m);
+    float alpha = mix(noiseA, mix(0.16, 0.95, g), m);
 
     // Energy dumped at the gate: out-of-band lines flare where they die.
-    float engage = u.filter.x;
-    color += float3(0.55, 0.75, 1.0) * exp(-x * x / 0.06) * engage * (1.0 - g) * (0.5 + abs(noise));
+    float flare = exp(-x * x / 0.06) * u.filter.x * (1.0 - g) * (0.5 + busy);
+    glow += float3(0.55, 0.75, 1.0) * flare;
+    ink = mix(ink, float3(0.17, 0.50, 0.83), saturate(flare));
+    alpha = saturate(alpha + flare * 0.5);
 
     // Fade the stream in and out at its ends, and the outermost bands.
     float fade = smoothstep(u.field.z, u.field.z + 6.0, x) * smoothstep(u.field.w, u.field.w - 4.0, x);
     fade *= smoothstep(0.0, 0.08, n) * smoothstep(1.0, 0.92, n);
-    color *= fade;
-    return { float3(x, y, bandZ(i, u)), color };
+    return { float3(x, y, bandZ(i, u)), glow * fade, ink, alpha * fade };
 }
 
-float3 backdrop(float2 uv) {
-    // uv 0..1, y down. Deep navy with a faint bloom toward the gate side.
-    float3 top = float3(0.035, 0.05, 0.085), bottom = float3(0.012, 0.016, 0.03);
-    float3 c = mix(top, bottom, uv.y);
+// Night and paper, t = 0..1 between them.
+float3 backdrop(float2 uv, float t) {
+    // uv 0..1, y down. A faint bloom toward the gate side.
     float r = length((uv - float2(0.62, 0.45)) * float2(1.0, 1.4));
-    c += float3(0.05, 0.09, 0.16) * exp(-r * r * 3.0);
-    return c;
+    float bloom = exp(-r * r * 3.0);
+    float3 night = mix(float3(0.035, 0.05, 0.085), float3(0.012, 0.016, 0.03), uv.y)
+        + float3(0.05, 0.09, 0.16) * bloom;
+    float3 paper = mix(float3(0.965, 0.975, 0.99), float3(0.925, 0.945, 0.972), uv.y)
+        - float3(0.05, 0.03, 0.0) * bloom;
+    return mix(night, paper, t);
 }
 
 // MARK: background
@@ -352,7 +388,7 @@ vertex BgOut bg_vertex(uint vid [[vertex_id]]) {
 }
 
 fragment float4 bg_fragment(BgOut in [[stage_in]], constant U& u [[buffer(0)]]) {
-    return float4(backdrop(in.uv), 1.0);
+    return float4(backdrop(in.uv, u.filter.z), 1.0);
 }
 
 // MARK: curtains (occluders)
@@ -373,12 +409,12 @@ vertex CurtainOut curtain_vertex(uint vid [[vertex_id]], uint iid [[instance_id]
 }
 
 fragment float4 curtain_fragment(CurtainOut in [[stage_in]], constant U& u [[buffer(0)]]) {
-    return float4(backdrop(in.pos.xy / u.frame.xy), 1.0);
+    return float4(backdrop(in.pos.xy / u.frame.xy, u.filter.z), 1.0);
 }
 
 // MARK: lines
 
-struct LineOut { float4 pos [[position]]; float3 color; float across; };
+struct LineOut { float4 pos [[position]]; float3 glow; float3 ink; float alpha; float across; };
 
 vertex LineOut line_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
                            constant U& u [[buffer(0)]]) {
@@ -399,16 +435,22 @@ vertex LineOut line_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     LineOut o;
     o.pos = ca;
     o.pos.xy += nrm * side * px * 2.0 / u.frame.xy * ca.w;
-    o.color = a.color;
+    o.glow = a.glow;
+    o.ink = a.ink;
+    o.alpha = a.alpha;
     o.across = side;
     return o;
 }
 
-fragment float4 line_fragment(LineOut in [[stage_in]]) {
+fragment float4 line_fragment(LineOut in [[stage_in]], constant U& u [[buffer(0)]]) {
     float d = abs(in.across);
     float core = exp(-d * d * 18.0);
     float halo = exp(-d * d * 3.0) * 0.35;
-    return float4(in.color * (core * 1.3 + halo), 1.0);
+    float t = u.filter.z;
+    float3 night = in.glow * (core * 1.3 + halo);
+    // Ink has no glow to spend, so it gets a crisper core and a thin halo.
+    float a = saturate(in.alpha * (core * 1.35 + halo * 0.45));
+    return float4(mix(night, in.ink * a, t), a * t);
 }
 
 // MARK: gate
@@ -435,12 +477,15 @@ fragment float4 gate_fragment(GateOut in [[stage_in]], constant U& u [[buffer(0)
     // The aperture: the passband's own response curve, drawn as a lit slot.
     float z = (q.x - 0.5) * size.x;
     float i = (z / BAND_SPAN + 0.5) * (u.field.x - 1.0);
-    float g = gain(i, u);
+    float g = gain(i, -u.filter.y * u.eye.w, u);
     float slotEdge = exp(-pow((g - 0.5) * 7.0, 2.0));
     float slot = g * 0.10 * (1.0 - q.y) + slotEdge * 0.55;
     float scan = 0.5 + 0.5 * sin(q.y * 160.0 - u.eye.w * 4.0);
     float glass = (0.018 + 0.012 * scan) * (1.0 - q.y * 0.7);
-    float3 c = float3(0.35, 0.62, 1.0) * (frame + glass) + float3(0.62, 0.82, 1.0) * slot;
-    return float4(c * (0.1 + 0.9 * e), 1.0);
+    float lit = 0.1 + 0.9 * e;
+    float3 night = (float3(0.35, 0.62, 1.0) * (frame + glass) + float3(0.62, 0.82, 1.0) * slot) * lit;
+    float a = saturate((frame * 0.9 + glass * 2.5 + slot * 0.8) * lit);
+    float t = u.filter.z;
+    return float4(mix(night, float3(0.17, 0.50, 0.83) * a, t), a * t);
 }
 """#

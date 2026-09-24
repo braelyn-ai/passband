@@ -23,7 +23,7 @@ struct OnboardingIntroView: View {
 
     /// The radio beats: raw noise pours through a dormant gate, then the
     /// continue button closes the squelch and only the passband comes out.
-    /// Always dark; glowing lines are the whole picture.
+    /// Night draws the waves as glow, day as ink on paper.
     private var squelchLayout: some View {
         GeometryReader { geometry in
             let wide = geometry.size.width >= 820
@@ -58,7 +58,6 @@ struct OnboardingIntroView: View {
                 .padding(wide ? 44 : 24)
             }
         }
-        .environment(\.colorScheme, .dark)
     }
 
     /// The fallback when Metal is unavailable: illustrated example mail.
@@ -238,10 +237,10 @@ struct OnboardingIntroView: View {
     }
 }
 
-/// The scene's own backdrop color (the shader's top gradient stop), so the
-/// scrim behind the copy melts into it rather than tinting it.
+/// The scene's own backdrop color (the shader's top gradient stop, night and
+/// paper), so the scrim behind the copy melts into it rather than tinting it.
 private enum IntroNight {
-    static let backdrop = Color(red: 0.035, green: 0.05, blue: 0.085)
+    static let backdrop = Color(light: 0xF6F9FC, dark: 0x090D16)
 }
 
 /// A single quiet entrance per view identity. No timers or repeating motion;
