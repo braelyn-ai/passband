@@ -9,8 +9,7 @@ import SwiftUI
 struct SidePanel: View {
     @Environment(AppStore.self) private var store
 
-    /// Fullscreen search takeover (Enter in the bar). Only search expands;
-    /// browse is always the strip.
+    /// Search opens wide; browse remains a sidebar.
     private var expanded: Bool {
         store.sideView == .search && store.search.expanded
     }
@@ -54,29 +53,20 @@ struct SidePanel: View {
         }
         .animation(.smooth(duration: 0.22), value: expanded)
         .keyContext(.modal)
-        // Esc unwinds one layer at a time: fullscreen search collapses back to
-        // the strip first, a second Esc closes the panel.
+        // Wide search is the default, so Escape closes it in one step.
+        // The sidebar layout is retained for search beside an open email.
         .keyBindings(.modal, [
-            KeyBinding("Escape", "back") {
-                if expanded {
-                    store.search.expanded = false
-                } else {
-                    store.closeSide()
-                }
-            }
+            KeyBinding("Escape", "close search") { store.closeSide() }
         ])
     }
 }
 
 // MARK: - search
 
-/// Search: debounced GET /client/search, j/k selection, click or Enter opens a
-/// hit in the reader beside the results. Enter with NO row armed (index -1)
-/// instead expands the panel fullscreen with larger previews — ArrowDown arms
-/// a row, so bar-Enter and row-Enter are different verbs. Pages in as you reach
-/// the bottom row — there is no "more" button, the strip is too narrow to spend
-/// one. Every durable piece of state lives in `store.search`; only the two
-/// in-flight flags, which die with the panel, are local.
+/// Debounced search with wide results by default. Enter opens the selected
+/// result, or the first settled result when none is selected; in the sidebar,
+/// an unarmed Enter expands. Opening mail retains the sidebar beside the reader.
+/// Query and result state live in the store so closing search can resume it.
 struct SearchView: View {
     @Environment(AppStore.self) private var store
     @Environment(Prefs.self) private var prefs
@@ -90,7 +80,7 @@ struct SearchView: View {
     /// can be mid-edit, and highlighting it would mark text the server never
     /// matched.
     private var terms: [String] {
-        (store.search.fetchedQuery ?? "").split(separator: " ").map(String.init)
+        store.search.diagnostics?.terms.map(\.text) ?? []
     }
 
     /// The remembered queries, newest first. Read through the store rather than
@@ -131,6 +121,8 @@ struct SearchView: View {
     private var answered: Bool {
         store.search.fetchedQuery == store.search.query.trimmed
             && store.search.fetchedSort == prefs.searchSort
+            && store.search.fetchedRelated == prefs.searchIncludeRelated
+            && store.search.fetchedRevision == store.search.revision
     }
 
     var body: some View {
@@ -173,30 +165,30 @@ struct SearchView: View {
             // register later than this panel's and win only while it is up.
             if focused, let fragment = FromOperator.fragment(in: store.search.query) {
                 SenderSuggestions(query: $store.search.query, fragment: fragment)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
                     .padding(.bottom, 8)
             }
 
-            // THE ORDER, beside the thing that produces it. A sort control is
-            // about the answer, so it belongs next to the question and not
-            // three screens away — the same preference is in Settings, and the
-            // two are one value, so flipping it here is what Settings will say
-            // next time it is opened.
-            //
-            // Shown even with an empty field: a control that only appears once
-            // you have results is a control you do not know you have.
             HStack {
                 SearchSortPicker()
-                Spacer(minLength: 0)
+                Spacer(minLength: 8)
+                if expanded { askAgentButton }
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
+
+            if !expanded {
+                HStack { Spacer(); askAgentButton }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 10)
+            }
 
             if let error = store.search.error { BandNote(error) }
             if answered && store.search.hits.isEmpty { BandNote("no matches.") }
 
             // THE STRIP IS TOO NARROW FOR TWO COLUMNS (460pt), so there the
-            // lane is a band ABOVE the hits; expanded, it becomes the right
+            // lane is a band ABOVE the hits; expanded, it becomes the left
             // column beside them and the results keep their reading width. Same
             // view either way — see DeeperSearchBand.
             //
@@ -221,33 +213,36 @@ struct SearchView: View {
                     queries: recents, armed: store.search.index,
                     onRun: { run($0) }, onClear: { clearRecents() }
                 )
-                // The hits' own column, for the same reason they have one: the
-                // field can be cleared while the panel is still expanded, and a
-                // 1300pt-wide row holding four words is a treadmill for the eyes.
-                .frame(maxWidth: expanded ? 780 : .infinity)
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, expanded ? 24 : 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
             }
             HStack(alignment: .top, spacing: 0) {
-                results(expanded: expanded)
                 if bandMounted && expanded {
                     ScrollView {
                         DeeperSearchBand(expanded: true)
-                            .padding(.horizontal, 16)
+                            .padding(.leading, 16)
+                            .padding(.top, 14)
                             .padding(.bottom, 14)
                     }
                     .frame(minWidth: 320, idealWidth: 380, maxWidth: 440)
                 }
+                results(expanded: expanded)
             }
         }
         .keyBindings(.modal, bindings)
         .onAppear { focused = true }
+        .onChange(of: store.search.query) { _, _ in
+            store.search.index = -1
+        }
         // The reader steals focus while it is up. When it closes and this
         // panel is the surface again, typing must just work — without this the
         // arrows still move the selection but the keyboard is otherwise dead
         // until a mouse click, which reads as the panel being broken.
         .onChange(of: store.threadId) { _, threadId in
-            if threadId == nil { focused = true }
+            if threadId == nil {
+                focused = true
+                store.search.expanded = true
+            }
         }
         // The remembered query lands selected, so `/` serves both callers: arrow
         // down into the old results, or type to replace it.
@@ -264,7 +259,28 @@ struct SearchView: View {
         // KEYED ON THE SORT TOO, or flipping the order leaves the old ranking on
         // screen until the reader edits their query. An array because tuples do
         // not conform to Equatable and `task(id:)` needs one value.
-        .task(id: [store.search.query, prefs.searchSort.rawValue]) { await runSearch() }
+        .task(id: [store.search.query, prefs.searchSort.rawValue,
+                   String(prefs.searchIncludeRelated), String(store.search.revision)]) {
+            await runSearch()
+        }
+    }
+
+    private var askAgentButton: some View {
+        Button { store.requestDeeperSearch() } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "sparkles")
+                Text((store.searchLane.running || store.preparingSearchEvidence) ? "Searching…" : "Ask agent")
+                if store.search.expanded { Kbd("⌘↩") }
+            }
+            .font(.system(size: 12, weight: .medium))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Palette.accentInk)
+        .disabled(!DeeperSearchPolicy.canRequest(query: store.search.query,
+            choice: prefs.deeperSearch, running: store.searchLane.running || store.preparingSearchEvidence))
+        .help(prefs.deeperSearch == .off
+            ? "Enable deeper search in Settings to use the agent."
+            : "Ask the agent to search and read your mail. ⌘Return")
     }
 
     /// The hits themselves, extracted so the strip (band above) and the
@@ -272,13 +288,24 @@ struct SearchView: View {
     private func results(expanded: Bool) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(spacing: expanded ? 10 : 6) {
+                LazyVStack(spacing: 0) {
                     ForEach(Array(store.search.hits.enumerated()), id: \.element.id) { i, hit in
+                        if i == 0 || hit.is_done != store.search.hits[i - 1].is_done {
+                            Text(hit.is_done.map { $0 ? "Done" : "Not done" } ?? "Results")
+                                .font(.system(size: 10, weight: .medium))
+                                .textCase(.uppercase)
+                                .tracking(1)
+                                .foregroundStyle(Palette.inkDim)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.top, 14)
+                                .padding(.bottom, 6)
+                        }
                         // One click opens: the reader sits beside this list,
                         // so opening a hit costs the results nothing.
                         HitRow(
-                            hit: hit, terms: terms, selected: i == store.search.index,
-                            expanded: expanded
+                            hit: hit, terms: terms,
+                            selected: i == store.search.index, expanded: expanded
                         ) {
                             store.search.index = i
                             open()
@@ -297,12 +324,20 @@ struct SearchView: View {
                     // of the results, so the append announces itself.
                     if loadingMore { BandNote("loading more…") }
                 }
-                // Fullscreen keeps a reading-width column: match text in
-                // window-wide rows is a treadmill for the eyes.
-                .frame(maxWidth: expanded ? 780 : .infinity)
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, expanded ? 24 : 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, expanded && bandMounted ? 8 : 16)
+                .padding(.trailing, 16)
                 .padding(.bottom, 14)
+            }
+            .onAppear {
+                if let hit = store.search.hits[safe: store.search.index] {
+                    proxy.scrollTo(hit.id, anchor: .center)
+                }
+            }
+            .onChange(of: expanded) { _, _ in
+                if let hit = store.search.hits[safe: store.search.index] {
+                    proxy.scrollTo(hit.id, anchor: .center)
+                }
             }
             .onChange(of: store.search.index) { _, i in
                 guard let hit = store.search.hits[safe: i] else { return }
@@ -347,6 +382,9 @@ struct SearchView: View {
 
     private var bindings: [KeyBinding] {
         [
+            KeyBinding("Enter", "ask agent", meta: true, allowInInput: true) {
+                store.requestDeeperSearch()
+            },
             KeyBinding("ArrowDown", "next hit", allowInInput: true) { move(1) },
             KeyBinding("ArrowUp", "prev hit", allowInInput: true) { move(-1) },
             // Enter is three verbs, and which one it is follows what the row
@@ -357,6 +395,9 @@ struct SearchView: View {
                 if showingRecents, let query = recents[safe: store.search.index] {
                     run(query)
                 } else if store.search.index >= 0 {
+                    open()
+                } else if store.search.expanded, answered, !store.search.hits.isEmpty {
+                    store.search.index = 0
                     open()
                 } else if canExpand {
                     // Expanding is acting on the results: the reader asked for
@@ -372,21 +413,9 @@ struct SearchView: View {
         ]
     }
 
-    /// WHETHER THERE IS ANYTHING TO EXPAND INTO. Fullscreen is bigger previews
-    /// of the hits, so it wants hits — or at least the possibility of them: a
-    /// fetch still in flight expands, because gating on results LANDING is what
-    /// would make Enter-right-after-typing (inside the 220ms debounce) silently
-    /// do nothing.
-    ///
-    /// The two states it refuses are the ones where the panel KNOWS it has
-    /// nothing bigger to draw: the recents list is up, so no search has been
-    /// asked at all, and a query that came back with no matches. Both used to
-    /// throw the reader into a fullscreen empty panel that then took TWO Escs
-    /// to leave (the first only collapses it), which reads exactly like Esc
-    /// being broken — and the recents list is what made it easy to reach, since
-    /// Enter is the key that list is teaching.
+    /// The retained sidebar can expand once there is a query to inspect.
     private var canExpand: Bool {
-        if showingRecents { return false }
+        if showingRecents || store.search.expanded { return false }
         return !(answered && store.search.hits.isEmpty)
     }
 
@@ -395,6 +424,7 @@ struct SearchView: View {
     /// at -1, so an unarmed empty state falls through to the expand test.
     private var enterDescription: String {
         if store.search.index >= 0 { return showingRecents ? "search this" : "open thread" }
+        if store.search.expanded, answered, !store.search.hits.isEmpty { return "open first result" }
         return canExpand ? "expand previews" : "nothing to open"
     }
 
@@ -453,6 +483,11 @@ struct SearchView: View {
         // Read at fetch time, not captured on mount: the panel is often built
         // before a trip to Settings and rebuilt after one.
         let sort = prefs.searchSort
+        let related = prefs.searchIncludeRelated
+        let revision = store.search.revision
+        let sameRanking = term == store.search.fetchedQuery && sort == store.search.fetchedSort
+            && related == store.search.fetchedRelated
+        let selectedID = sameRanking ? store.search.hits[safe: store.search.index]?.id : nil
         // A bare operator (`from:` with the menu opening under it) is not a
         // search yet: the daemon would drop the valueless token and 400 the
         // empty query, and that refusal is not something to show a reader who
@@ -482,7 +517,8 @@ struct SearchView: View {
         // predecessor used to rely on someone else covering (backspace inside
         // the debounce window lands here). The CURRENT task owns the flag now;
         // see the cancelled exits below.
-        guard term != store.search.fetchedQuery || sort != store.search.fetchedSort else {
+        guard term != store.search.fetchedQuery || sort != store.search.fetchedSort
+            || related != store.search.fetchedRelated || revision != store.search.fetchedRevision else {
             loading = false
             return
         }
@@ -502,7 +538,8 @@ struct SearchView: View {
             // the trailing token is matched as a prefix, so "wif" finds "wifi"
             // instead of nothing. The agent's own searches never ask for it.
             let page = try await APIClient.shared.search(
-                term, limit: 50, sort: sort, partial: true)
+                term, limit: 50, mode: related ? .hybrid : .keyword, sort: sort,
+                partial: true, unfinishedFirst: true)
             // AND AGAIN AFTER THE AWAIT, which the iOS twin has always done
             // (`MobileSearchView`). A response landing in the window between
             // `task(id:)` cancelling this task and URLSession noticing resolves
@@ -511,16 +548,23 @@ struct SearchView: View {
             // not. It would start a paid conversation about words the reader
             // deleted 200ms ago, and the next fetch would then hand the live
             // words to it as a "refinement".
-            guard !Task.isCancelled, term == store.search.query.trimmed else { return }
-            store.search.hits = page.items
+            guard !Task.isCancelled, term == store.search.query.trimmed,
+                  revision == store.search.revision, related == prefs.searchIncludeRelated else { return }
+            store.search.hits = page.items.map { hit in
+                var hit = hit
+                hit.displaySnippet = SearchPreview.clean(hit.snippet)
+                return hit
+            }
             store.search.diagnostics = page.diagnostics
             store.search.nextCursor = page.next_cursor
             // Fresh results land un-armed: Enter straight from the bar means
             // "show me more", not "open whatever floated to the top".
-            store.search.index = -1
+            store.search.index = selectedID.flatMap { id in page.items.firstIndex { $0.id == id } } ?? -1
             store.search.error = nil
             store.search.fetchedQuery = term
             store.search.fetchedSort = sort
+            store.search.fetchedRelated = related
+            store.search.fetchedRevision = revision
             // Warm the head of the page only. Search rows are read and chosen
             // from, not swept, so the rest can wait for a real click — and the
             // whole 50 would be a stampede for one open.
@@ -597,7 +641,7 @@ struct SearchView: View {
     /// a query that turned over in flight would otherwise splice two different
     /// searches into one list.
     private func loadMore() async {
-        guard !loading, !loadingMore, let cursor = store.search.nextCursor else { return }
+        guard answered, !loading, !loadingMore, let cursor = store.search.nextCursor else { return }
         let term = store.search.query.trimmed
         guard !term.isEmpty, term == store.search.fetchedQuery else { return }
         // The cursor is an OFFSET INTO ONE RANKING, so the page after it has to
@@ -606,12 +650,18 @@ struct SearchView: View {
         // re-ranks from the top through `runSearch`, which is the only honest
         // way to serve it.
         let sort = store.search.fetchedSort
+        let related = store.search.fetchedRelated ?? false
+        let revision = store.search.revision
         loadingMore = true
         defer { loadingMore = false }
         do {
             let page = try await APIClient.shared.search(
-                term, limit: 50, cursor: cursor, sort: sort, partial: true)
-            guard term == store.search.fetchedQuery, store.search.nextCursor == cursor else {
+                term, limit: 50, cursor: cursor, mode: related ? .hybrid : .keyword, sort: sort,
+                partial: true, unfinishedFirst: true)
+            guard term == store.search.fetchedQuery, store.search.nextCursor == cursor,
+                  sort == store.search.fetchedSort, sort == prefs.searchSort,
+                  related == store.search.fetchedRelated, related == prefs.searchIncludeRelated,
+                  revision == store.search.revision else {
                 return
             }
             // Deduped because the cursor is an OFFSET: mail arriving between
@@ -620,6 +670,8 @@ struct SearchView: View {
             // break the ForEach.
             var seen = Set(store.search.hits.map(\.id))
             for hit in page.items where seen.insert(hit.id).inserted {
+                var hit = hit
+                hit.displaySnippet = SearchPreview.clean(hit.snippet)
                 store.search.hits.append(hit)
             }
             store.search.nextCursor = page.next_cursor
@@ -640,51 +692,96 @@ private struct HitRow: View {
 
     var body: some View {
         Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: expanded ? 5 : 3) {
-                HStack {
-                    Text(highlight(hit.from_name ?? hit.from_addr))
-                        .font(.system(size: expanded ? 13 : 11, weight: .semibold))
-                        .foregroundStyle(Palette.ink)
-                        .lineLimit(1)
-                    Spacer(minLength: 6)
-                    Text(Fmt.dateTime(hit.received_at))
-                        .font(Typo.num(expanded ? 11 : 10))
-                        .foregroundStyle(Palette.inkFaintest)
-                }
-                Text(highlight(hit.subject))
-                    .font(expanded ? .system(size: 13) : Typo.rowSub)
-                    .foregroundStyle(Palette.inkDim)
-                    .lineLimit(expanded ? 2 : 1)
-                    .multilineTextAlignment(.leading)
-                Text(highlight(hit.snippet))
-                    .font(expanded ? .system(size: 12) : Typo.micro)
-                    .foregroundStyle(Palette.inkFaintest)
-                    .lineLimit(expanded ? 6 : 2)
-                    .multilineTextAlignment(.leading)
+            HStack(alignment: .top, spacing: 10) {
+                Avatar(sender: hit.from_name.map { "\($0) <\(hit.from_addr)>" } ?? hit.from_addr,
+                       size: 26)
+                    .padding(.top, 1)
+                    .accessibilityHidden(true)
+                columns
             }
-            .padding(expanded ? 16 : 10)
+            .padding(.vertical, 11)
+            .padding(.leading, 16)
+            .padding(.trailing, 12)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(selected ? Palette.accentSoft : Palette.hairline.opacity(0.35))
-        )
+        .background(selected ? Palette.accentSoft : Color.clear)
+        .overlay(alignment: .leading) {
+            if hit.is_done == false {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(Palette.accentInk)
+                    .frame(width: 2)
+                    .padding(.vertical, 14)
+                    .padding(.leading, 4)
+            }
+        }
+        .overlay(alignment: .bottom) { Rectangle().fill(Palette.hairline).frame(height: 0.5) }
+        .overlay {
+            if selected { Rectangle().strokeBorder(Palette.accent.opacity(0.6), lineWidth: 1) }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(hit.is_done.map { $0 ? "Done" : "Not done" } ?? "")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
-    /// Paint every case-insensitive occurrence of each query term. Best effort
-    /// by design: the stored snippet is the message HEAD, so a body-deep match
-    /// can produce a legitimately unpainted row.
-    private func highlight(_ text: String) -> AttributedString {
+    private var sender: some View {
+        Text(hit.from_name ?? hit.from_addr)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Palette.ink)
+            .lineLimit(1)
+    }
+
+    private var date: some View {
+        HStack(spacing: 5) {
+            if hit.is_done == true {
+                Image(systemName: "checkmark").font(.system(size: 10))
+            }
+            Text(Fmt.shortDate(hit.received_at)).font(.system(size: 11))
+        }
+        .foregroundStyle(Palette.inkDim)
+        .fixedSize()
+        .help(Fmt.dateTime(hit.received_at))
+    }
+
+    private var subject: some View {
+        Text(highlight(hit.subject, matches: hit.subject_matches ?? terms))
+            .font(.system(size: 13))
+            .foregroundStyle(Palette.ink)
+            .lineLimit(1)
+    }
+
+    private var preview: some View {
+        Text(highlight(hit.displaySnippet ?? hit.snippet,
+                       matches: hit.snippet_matches ?? terms))
+            .font(.system(size: 12))
+            .foregroundStyle(Palette.inkDim)
+            .multilineTextAlignment(.leading)
+    }
+
+    // Choose column widths from the panel mode, never from a row's text.
+    // Long subjects truncate instead of switching that row to a stacked layout.
+    private var columns: some View {
+        HStack(alignment: .firstTextBaseline, spacing: expanded ? 18 : 12) {
+            sender.frame(width: expanded ? 160 : 104, alignment: .leading)
+            VStack(alignment: .leading, spacing: 3) {
+                subject
+                preview.lineLimit(expanded ? 1 : 2)
+            }
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            date.frame(width: expanded ? 80 : 72, alignment: .trailing)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func highlight(_ text: String, matches: [String]) -> AttributedString {
         var attr = AttributedString(text)
-        for term in terms {
+        for term in matches where !term.isEmpty {
             var from = attr.startIndex
             while from < attr.endIndex,
-                let range = attr[from...].range(of: term, options: .caseInsensitive)
-            {
-                attr[range].backgroundColor = Palette.accentSoft
-                attr[range].foregroundColor = Palette.accentInk
+                let range = attr[from...].range(of: term, options: .caseInsensitive) {
+                attr[range].backgroundColor = Palette.searchMatch
+                attr[range].foregroundColor = Palette.searchMatchInk
                 from = range.upperBound
             }
         }

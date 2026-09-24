@@ -73,6 +73,14 @@ impl SearchSort {
 /// exactly the first of January.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilter {
+    /// Presentation policy, not a user query constraint.
+    pub unfinished_first: bool,
+    /// Already delivered recall hits, excluded before snippet generation.
+    pub exclude_ids: Vec<i64>,
+    /// The desktop fast path searches the same sent/inbound corpus as hybrid.
+    pub include_sent: bool,
+    /// Internal status constraint for exact unfinished-first pagination.
+    pub done: Option<bool>,
     /// Substring to look for in the sender's address OR display name,
     /// case-insensitive. Not an exact address match: `from:jane` finds
     /// `jane@example.com` and `Jane Doe` alike.
@@ -86,7 +94,13 @@ pub struct SearchFilter {
 impl SearchFilter {
     /// No constraint at all — the caller can take the unfiltered fast path.
     pub fn is_empty(&self) -> bool {
-        self.from.is_none() && self.after.is_none() && self.before.is_none()
+        self.done.is_none() && self.from.is_none() && self.after.is_none() && self.before.is_none()
+    }
+
+    pub fn order_hits<T>(&self, hits: &mut [T], done: impl Fn(&T) -> bool) {
+        if self.unfinished_first {
+            hits.sort_by_key(done);
+        }
     }
 
     /// Does this hit satisfy every constraint? The post-hoc twin of the SQL
@@ -97,6 +111,12 @@ impl SearchFilter {
     /// `LIKE`, which is itself ASCII-only, or the same query would mean two
     /// different things depending on the mode.
     pub fn matches(&self, hit: &SearchHit) -> bool {
+        if self.exclude_ids.contains(&hit.id) {
+            return false;
+        }
+        if self.done.is_some_and(|done| done != hit.is_done) {
+            return false;
+        }
         if let Some(from) = &self.from {
             let needle = from.to_ascii_lowercase();
             let addr = hit.from_addr.to_ascii_lowercase();
@@ -952,6 +972,9 @@ mod tests {
             subject: "s".into(),
             received_at: day(2026, 5, 5),
             snippet: "".into(),
+            is_done: false,
+            subject_matches: Vec::new(),
+            snippet_matches: Vec::new(),
         };
         let (_, f) = parse_search_query("from:JANE@example");
         assert!(f.matches(&hit), "address match, case-folded");
@@ -971,6 +994,9 @@ mod tests {
             subject: "s".into(),
             received_at: day(2026, 5, 5),
             snippet: "".into(),
+            is_done: false,
+            subject_matches: Vec::new(),
+            snippet_matches: Vec::new(),
         };
         let (_, f) = parse_search_query("after:2026-05-05");
         assert!(f.matches(&hit), "midnight of the after: day is IN range");

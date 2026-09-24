@@ -9304,6 +9304,111 @@ async fn a_query_of_pure_punctuation_lists_nothing_in_any_mode() {
     );
 }
 
+#[tokio::test]
+async fn search_unfinished_first_is_global_across_keyword_pages() {
+    use squelch_core::types::AttentionStatus;
+    let Harness { app, .. } = harness(|store, acct| {
+        for (id, subject, done) in [
+            ("done-strict", "anjuna tickets", true),
+            ("open-partial", "tickets", false),
+            ("open-strict", "anjuna tickets", false),
+            ("done-partial", "tickets", true),
+        ] {
+            let id = store
+                .upsert_message(&msg(acct, id, id, subject, "Save your tickets below"))
+                .unwrap();
+            store
+                .set_triage(
+                    id,
+                    acct,
+                    50,
+                    Tier::Signal,
+                    Sensitivity::Normal,
+                    None,
+                    "",
+                    "",
+                    None,
+                )
+                .unwrap();
+            if done {
+                store
+                    .set_attention_status(acct, id, AttentionStatus::Done)
+                    .unwrap();
+            }
+        }
+    });
+    for sort in ["recent", "best_match"] {
+        let mut cursor = String::new();
+        let mut threads = Vec::new();
+        loop {
+            let uri = format!(
+                "/client/search?q=anjuna%20tickets&mode=keyword&unfinished_first=true&sort={sort}&limit=1{cursor}"
+            );
+            let response = app.clone().oneshot(authed("GET", &uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body_json(response).await;
+            for hit in json["items"].as_array().unwrap() {
+                let thread = hit["thread_id"].as_str().unwrap();
+                assert_eq!(hit["is_done"], thread.starts_with("done"));
+                assert_eq!(hit["snippet_matches"], serde_json::json!(["tickets"]));
+                threads.push(thread.to_string());
+            }
+            match json["next_cursor"].as_str() {
+                Some(c) => cursor = format!("&cursor={c}"),
+                None => break,
+            }
+            assert!(threads.len() <= 4);
+        }
+        assert_eq!(
+            threads,
+            ["open-strict", "open-partial", "done-strict", "done-partial"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_fast_path_keeps_sent_mail_and_matching_diagnostics() {
+    let Harness { app, .. } = harness(|store, acct| {
+        let mut sent = msg(
+            acct,
+            "sent-ticket",
+            "sent-ticket",
+            "tickets",
+            "Here are the tickets",
+        );
+        sent.is_sent = true;
+        store.upsert_message(&sent).unwrap();
+    });
+    for q in ["tickets", "from:alice"] {
+        let response = app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/client/search?q={q}&mode=keyword&unfinished_first=true"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["items"][0]["thread_id"], "sent-ticket");
+        assert_eq!(json["items"][0]["is_done"], false);
+        if q == "tickets" {
+            assert_eq!(json["diagnostics"]["strict_hits"], 1);
+        }
+    }
+    let response = app
+        .oneshot(authed("GET", "/client/search?q=tickets&mode=keyword"))
+        .await
+        .unwrap();
+    assert!(
+        body_json(response).await["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "other keyword callers retain their existing inbound-only scope"
+    );
+}
+
 // ---- compose attachments ----------------------------------------------------
 
 /// An authed upload: the bytes as the body, the metadata in the query and the
@@ -9960,4 +10065,97 @@ async fn the_guard_reads_an_attached_message_too() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(handle.await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn grouped_recall_expands_without_repeating_hits_or_returning_done_early() {
+    use squelch_core::embed::StubEmbedder;
+    use squelch_core::types::AttentionStatus;
+    let store = SqliteStore::open_in_memory()
+        .unwrap()
+        .with_embedder(Arc::new(StubEmbedder::new(384)))
+        .unwrap();
+    let acct = store.ensure_account("me@example.com").unwrap();
+    for i in 0..27 {
+        let key = format!("recall-{i}");
+        let id = store
+            .upsert_message(&msg(
+                acct,
+                &key,
+                &key,
+                "anjuna tickets",
+                "save tickets below",
+            ))
+            .unwrap();
+        store
+            .set_triage(
+                id,
+                acct,
+                50,
+                Tier::Signal,
+                Sensitivity::Normal,
+                None,
+                "",
+                "",
+                None,
+            )
+            .unwrap();
+        if i % 3 == 0 {
+            store
+                .set_attention_status(acct, id, AttentionStatus::Done)
+                .unwrap();
+        }
+        let vector = store
+            .embedder()
+            .unwrap()
+            .embed("anjuna tickets save tickets below")
+            .unwrap();
+        store.upsert_message_vector(acct, id, &vector).unwrap();
+    }
+    let app = router(ApiState::new(Arc::new(store), acct, TOKEN));
+    for mode in ["hybrid", "semantic"] {
+        let mut cursor = String::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut saw_done = false;
+        for _ in 0..12 {
+            let uri = format!(
+                "/client/search?q=anjuna%20tickets&mode={mode}&unfinished_first=true&limit=5{cursor}"
+            );
+            let response = app.clone().oneshot(authed("GET", &uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let page = body_json(response).await;
+            if seen.is_empty() {
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+                let cursor = page["next_cursor"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("recall:")
+                    .unwrap();
+                let resume: Value =
+                    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(cursor).unwrap()).unwrap();
+                assert!(
+                    resume["k"].as_u64().unwrap() < 600,
+                    "small searches must not pin recall to 600"
+                );
+            }
+            for item in page["items"].as_array().unwrap() {
+                assert!(
+                    seen.insert(item["id"].as_i64().unwrap()),
+                    "repeated hit: {page}"
+                );
+                let done = item["is_done"].as_bool().unwrap();
+                assert!(!saw_done || done, "unfinished hit after done group: {page}");
+                saw_done |= done;
+            }
+            match page["next_cursor"].as_str() {
+                Some(next) => cursor = format!("&cursor={next}"),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            27,
+            "every recalled hit should be served in {mode}"
+        );
+    }
 }

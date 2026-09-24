@@ -352,6 +352,12 @@ run_suite recent-search-ring \
   Sources/Passband/Lib/RecentSearchRing.swift \
   Tests/RecentSearchRingTests.swift
 
+run_suite search-preview \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/SearchPreview.swift \
+  Tests/SearchPreviewTests.swift
+
 # Field-scoped corrections must preserve overlapping destinations and keep
 # authentication kinds separate from external access restrictions.
 run_suite triage-targets \

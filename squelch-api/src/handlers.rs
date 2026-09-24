@@ -1084,6 +1084,9 @@ async fn discard_sent_attachments(state: &ApiState, ids: Vec<i64>) {
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
+    /// Human search's status grouping; omitted by agent callers.
+    #[serde(default)]
+    unfinished_first: bool,
     /// The raw query, operators included (`invoice from:jane after:2026-01-01`).
     /// Parsed exactly once, here, then threaded into the store as
     /// `(text, filter)`.
@@ -1226,6 +1229,40 @@ struct SearchItem {
     legs: Vec<&'static str>,
 }
 
+/// Recall grows on demand. Remember delivered IDs because expanding RRF's
+/// candidate pool can change ranks; an offset alone would repeat or skip mail.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SearchResume {
+    seen: Vec<i64>,
+    k: usize,
+    done: bool,
+}
+
+impl SearchResume {
+    fn decode(raw: &str) -> Result<Self, ApiError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        if raw.len() > 16_384 {
+            return Err(ApiError::bad_request("invalid search cursor"));
+        }
+        let bytes = URL_SAFE_NO_PAD
+            .decode(raw)
+            .map_err(|_| ApiError::bad_request("invalid search cursor"))?;
+        let state: Self = serde_json::from_slice(&bytes)
+            .map_err(|_| ApiError::bad_request("invalid search cursor"))?;
+        if state.seen.len() > 600 || state.k > 600 {
+            return Err(ApiError::bad_request("invalid search cursor"));
+        }
+        Ok(state)
+    }
+    fn encode(&self) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!(
+            "recall:{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).expect("search cursor"))
+        )
+    }
+}
+
 /// The recall window semantic/hybrid rank before the page is cut out of it.
 ///
 /// With no filter it is exactly the page. With one, the filter is applied
@@ -1262,7 +1299,20 @@ pub async fn search(
     if term.is_empty() && filter.is_empty() {
         return Err(ApiError::bad_request("q must not be empty"));
     }
-    let (limit, offset) = paginate(query.limit, query.cursor.as_deref())?;
+    let resume = query
+        .cursor
+        .as_deref()
+        .and_then(|c| c.strip_prefix("recall:"))
+        .map(SearchResume::decode)
+        .transpose()?;
+    let (limit, offset) = paginate(
+        query.limit,
+        if resume.is_some() {
+            None
+        } else {
+            query.cursor.as_deref()
+        },
+    )?;
 
     // Unknown values 400 rather than falling back to the default: a client that
     // sends `sort=newest` and silently gets `recent` has a bug it cannot see.
@@ -1302,6 +1352,13 @@ pub async fn search(
         }
     };
 
+    let unfinished_first = query.unfinished_first;
+    let grouped_recall = unfinished_first && effective != SearchMode::Keyword;
+    if resume.is_some() && !grouped_recall {
+        return Err(ApiError::bad_request(
+            "recall cursor requires grouped recall",
+        ));
+    }
     let k = recall_k(limit, offset, &filter);
     let partial = parse_partial(query.partial.as_deref())?;
 
@@ -1333,108 +1390,142 @@ pub async fn search(
         }));
     }
 
-    // Keyword paginates and filters in SQL; semantic/hybrid rank a top-k window,
-    // filter the hydrated hits, and offset the fused slice. EVERY leg excludes
-    // sealed rows in SQL. The bool is the recall legs' WINDOW FULL signal (see
-    // below); the keyword leg paginates exactly, so it never needs one.
-    //
-    // The diagnostics are counted in the SAME store call, and told which leg
-    // ran: the keyword leg excludes the reader's own sent mail and the recall
-    // legs include it, so counts taken under the other rule would contradict
-    // the list they sit beside. They are counted AFTER the page, because the
-    // keyword page has already counted the strict set to place its own seam and
-    // hands that number over rather than have it walked a second time. NOT
-    // under the same LOCK, though: the page takes the store mutex and gives it
-    // back before the counts take it again, so an ingest landing between the
-    // two leaves the counts describing a mailbox one message newer than the
-    // page. Harmless, and written down because "the same store call" is easy to
-    // misread as "atomically".
-    let (items, window_full, diagnostics) = store_call(&state, move |store, account_id| {
-        let include_sent = effective != SearchMode::Keyword;
+    // Human retrieval and diagnostics share the corpus policy below. A keyword
+    // page holds one lock across both status groups; diagnostics run afterward
+    // and may reflect newer mailbox state. Recall uses a bounded candidate pool.
+    let queued_at = std::time::Instant::now();
+    let (items, window_full, diagnostics, recall_next) = store_call(&state, move |store, account_id| {
+        let started = std::time::Instant::now();
+        let queue_ms = queued_at.elapsed().as_millis();
+        let mut filter = filter;
+        filter.include_sent = effective != SearchMode::Keyword || unfinished_first;
+        filter.unfinished_first = unfinished_first;
+        let mut resume = resume.unwrap_or_default();
+        if grouped_recall {
+            filter.exclude_ids = resume.seen.clone();
+            if resume.done { filter.done = Some(true); }
+        }
+        let mut current_k = k.max(resume.k).max(resume.seen.len().saturating_add(limit as usize)).min(600);
         // The strict count worth sharing, and only when it answers the same
         // question the diagnostics ask: no operator predicates. With a `from:`
         // or a date bound the page counted a narrower set, and the two deserve
         // their own counts.
+        let page_limit = if grouped_recall { limit.min(600 - resume.seen.len() as u32) } else { limit };
         let mut counted_strict = None;
-        let (items, window_full): (Vec<SearchItem>, bool) = match effective {
-            SearchMode::Keyword => {
-                let (hits, strict) = store.search_filtered_counted(
-                    account_id, &term, &filter, sort, partial, limit, offset,
-                )?;
-                if filter.is_empty() {
-                    counted_strict = strict;
+        let (items, window_full): (Vec<SearchItem>, bool) = loop {
+            let (items, window_full): (Vec<SearchItem>, bool) = match effective {
+                SearchMode::Keyword => {
+                    let (hits, strict) = if unfinished_first {
+                        (
+                            store.search_unfinished_first(
+                                account_id, &term, &filter, sort, partial, limit, offset,
+                            )?,
+                            None,
+                        )
+                    } else {
+                        store.search_filtered_counted(
+                            account_id, &term, &filter, sort, partial, limit, offset,
+                        )?
+                    };
+                    if filter.is_empty() {
+                        counted_strict = strict;
+                    }
+                    // A filter-only listing retrieved nothing: no MATCH ran, no
+                    // ranking happened, and the rows are simply this account's
+                    // newest mail. `legs` is provenance, so it is empty.
+                    let legs: Vec<&'static str> = if ranks_on_text {
+                        vec!["keyword"]
+                    } else {
+                        Vec::new()
+                    };
+                    (
+                        hits.into_iter()
+                            .map(|hit| SearchItem {
+                                hit,
+                                legs: legs.clone(),
+                            })
+                            .collect(),
+                        false,
+                    )
                 }
-                // A filter-only listing retrieved nothing: no MATCH ran, no
-                // ranking happened, and the rows are simply this account's
-                // newest mail. `legs` is provenance, so it is empty.
-                let legs: Vec<&'static str> = if ranks_on_text {
-                    vec!["keyword"]
-                } else {
-                    Vec::new()
-                };
-                (
-                    hits.into_iter()
+                SearchMode::Semantic => {
+                    let (mut hits, window_full) =
+                        store.semantic_search_hits(account_id, &term, &filter, sort, partial, current_k)?;
+                    let page: Vec<SearchItem> = hits
+                        .drain(..)
+                        .skip(offset as usize)
+                        .take(page_limit as usize)
                         .map(|hit| SearchItem {
                             hit,
-                            legs: legs.clone(),
+                            legs: vec!["vector"],
                         })
-                        .collect(),
-                    false,
-                )
+                        .collect();
+                    (page, window_full)
+                }
+                SearchMode::Hybrid => {
+                    // The range is counted after filtering, exactly like the page
+                    // below. Only rows the client receives need match snippets.
+                    let start = offset as usize;
+                    let (mut hits, window_full) = store.hybrid_search_legs_ordered(
+                        account_id,
+                        &term,
+                        &filter,
+                        sort,
+                        partial,
+                        start..start.saturating_add(page_limit as usize),
+                        current_k,
+                    )?;
+                    let page: Vec<SearchItem> = hits
+                        .drain(..)
+                        .skip(offset as usize)
+                        .take(page_limit as usize)
+                        .map(|h| {
+                            let mut legs = Vec::with_capacity(2);
+                            if h.keyword {
+                                legs.push("keyword");
+                            }
+                            if h.vector {
+                                legs.push("vector");
+                            }
+                            SearchItem { hit: h.hit, legs }
+                        })
+                        .collect();
+                    (page, window_full)
+                }
+            };
+            // A first page containing enough unfinished hits needs no larger pool.
+            // Before crossing into done mail, exhaust the bounded recall window.
+            let unfinished = items.iter().filter(|item| !item.hit.is_done).count();
+            if grouped_recall && window_full && current_k < 600
+                && (items.len() < limit as usize || (!resume.done && unfinished < limit as usize)) {
+                current_k = (current_k * 2).max(current_k + limit as usize).min(600);
+                continue;
             }
-            SearchMode::Semantic => {
-                let (mut hits, window_full) =
-                    store.semantic_search_hits(account_id, &term, &filter, sort, partial, k)?;
-                let page: Vec<SearchItem> = hits
-                    .drain(..)
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .map(|hit| SearchItem {
-                        hit,
-                        legs: vec!["vector"],
-                    })
-                    .collect();
-                (page, window_full)
-            }
-            SearchMode::Hybrid => {
-                // The range is counted after filtering, exactly like the page
-                // below. Only rows the client receives need match snippets.
-                let start = offset as usize;
-                let (mut hits, window_full) = store.hybrid_search_legs_windowed(
-                    account_id,
-                    &term,
-                    &filter,
-                    sort,
-                    partial,
-                    start..start.saturating_add(limit as usize),
-                    k,
-                )?;
-                let page: Vec<SearchItem> = hits
-                    .drain(..)
-                    .skip(offset as usize)
-                    .take(limit as usize)
-                    .map(|h| {
-                        let mut legs = Vec::with_capacity(2);
-                        if h.keyword {
-                            legs.push("keyword");
-                        }
-                        if h.vector {
-                            legs.push("vector");
-                        }
-                        SearchItem { hit: h.hit, legs }
-                    })
-                    .collect();
-                (page, window_full)
-            }
+            break (items, window_full);
         };
+        let recall_next = if grouped_recall && !items.is_empty() {
+            resume.k = current_k;
+            resume.done |= items.iter().any(|item| item.hit.is_done);
+            resume.seen.extend(items.iter().map(|item| item.hit.id));
+            if resume.seen.len() < 600 && (items.len() == limit as usize || window_full) {
+                Some(resume.encode())
+            } else { None }
+        } else { None };
+        let retrieval_ms = started.elapsed().as_millis();
+        let diagnostics_started = std::time::Instant::now();
         let diagnostics = store.search_diagnostics_with(
             account_id,
             &term,
             partial,
-            include_sent,
+            filter.include_sent,
             counted_strict,
         )?;
-        Ok((items, window_full, diagnostics))
+        if queued_at.elapsed().as_millis() >= 250 {
+            eprintln!("squelch: slow search mode={} queue_ms={queue_ms} retrieval_ms={retrieval_ms} diagnostics_ms={} total_ms={} items={}",
+                effective.as_str(), diagnostics_started.elapsed().as_millis(),
+                queued_at.elapsed().as_millis(), items.len());
+        }
+        Ok((items, window_full, diagnostics, recall_next))
     })
     .await?;
 
@@ -1445,12 +1536,16 @@ pub async fn search(
     // sequence, and ranking is deterministic). A short page that served
     // NOTHING ends the walk even window-full: the same offset would rebuild
     // the same window and hand the client the same empty page forever.
-    let next = match next_cursor(items.len(), limit, offset) {
-        Some(cursor) => Some(cursor),
-        None if window_full && !items.is_empty() => {
-            Some(cursor::encode_offset(offset + items.len() as u32))
+    let next = if grouped_recall {
+        recall_next
+    } else {
+        match next_cursor(items.len(), limit, offset) {
+            Some(cursor) => Some(cursor),
+            None if window_full && !items.is_empty() => {
+                Some(cursor::encode_offset(offset + items.len() as u32))
+            }
+            None => None,
         }
-        None => None,
     };
     Ok(Json(SearchPage {
         items,

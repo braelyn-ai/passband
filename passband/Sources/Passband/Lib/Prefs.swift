@@ -23,7 +23,7 @@ enum SearchSortChoice: String, CaseIterable, Sendable {
 
     var label: String {
         switch self {
-        case .recent: "Recent"
+        case .recent: "Relevance + recency"
         case .bestMatch: "Best match"
         }
     }
@@ -129,6 +129,7 @@ final class Prefs {
         static let lastSeenReleaseNotes = "passband.pref.lastSeenReleaseNotes"
         static let theme = "passband.pref.theme"
         static let threadStyle = "passband.pref.threadStyle"
+        static let searchIncludeRelated = "passband.pref.searchIncludeRelated"
         static let searchSort = "passband.pref.searchSort"
         static let notificationSound = "passband.pref.notificationSound"
         static let userName = "passband.name"
@@ -149,6 +150,7 @@ final class Prefs {
             Key.tourCompleted: false,
             Key.theme: ThemeChoice.system.rawValue,
             Key.threadStyle: ThreadStyleDefault.auto.rawValue,
+            Key.searchIncludeRelated: false,
             Key.searchSort: SearchSortChoice.recent.rawValue,
             Key.notificationSound: NotificationSound.system.rawValue,
             Key.telemetry: TelemetryLevel.full.rawValue,
@@ -164,6 +166,7 @@ final class Prefs {
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
         _threadStyle =
             ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto
+        _searchIncludeRelated = defaults.bool(forKey: Key.searchIncludeRelated)
         _searchSort =
             SearchSortChoice(rawValue: defaults.string(forKey: Key.searchSort) ?? "") ?? .recent
         _notificationSound =
@@ -225,6 +228,15 @@ final class Prefs {
     /// How search orders its results. Read at FETCH time rather than captured
     /// when a panel opens, so changing it in Settings is in force on the very
     /// next search without anything having to observe anything.
+    private var _searchIncludeRelated: Bool
+    var searchIncludeRelated: Bool {
+        get { _searchIncludeRelated }
+        set {
+            _searchIncludeRelated = newValue
+            defaults.set(newValue, forKey: Key.searchIncludeRelated)
+        }
+    }
+
     private var _searchSort: SearchSortChoice
     var searchSort: SearchSortChoice {
         get { _searchSort }

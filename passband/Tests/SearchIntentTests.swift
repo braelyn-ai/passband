@@ -28,6 +28,7 @@ struct SearchIntentTests {
         noDiagnosticsMeansTheShapeAlone()
         strictHitsSettleAPlainPhrase()
         reasonsReadLikeSentences()
+        explicitRequests()
         digitsAreNotFirstPerson()
         punctuationAloneIsNotAQuestion()
         // what the setting lets a verdict do
@@ -163,6 +164,23 @@ struct SearchIntentTests {
                 query: "abstract conference wifi", diagnostics: diagnostics(strict: 2))
                 == .lookup,
             "three words that co-occur somewhere are a lookup")
+    }
+
+    static func explicitRequests() {
+        for choice in [DeeperSearchChoice.automatic, .onRequest] {
+            expect(DeeperSearchPolicy.canRequest(query: "tickets", choice: choice, running: false),
+                "plain lookup can explicitly ask the agent without a classifier verdict")
+            expect(!DeeperSearchPolicy.canRequest(query: "  \n ", choice: choice, running: false),
+                "blank searches cannot spend a model call")
+            expect(!DeeperSearchPolicy.canRequest(query: "tickets", choice: choice, running: true),
+                "repeated requests cannot restart an in-flight model call")
+        }
+        expect(!DeeperSearchPolicy.canRequest(query: "tickets", choice: .off, running: false),
+            "off still prevents explicit agent search")
+        expect(SearchIntent.reason(.requested, query: "tickets") == "you asked the agent",
+            "explicit request has an honest explanation")
+        expect(SearchIntent.Trigger.requested.analyticsValue == "requested",
+            "explicit request has its own telemetry category")
     }
 
     static func reasonsReadLikeSentences() {

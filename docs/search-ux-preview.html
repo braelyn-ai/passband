@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search layout study · Passband</title>
+<style>
+  :root { color-scheme: dark; --bg:#172331; --row:#1d2c3d; --ink:#edf2f8; --secondary:#bbc7d6; --line:#334255; --blue:#83bbf5; --match:#594b29; --match-ink:#fff0bd; }
+  * { box-sizing:border-box } body { margin:0; padding:40px 24px; background:#0f1823; color:var(--ink); font:14px/1.5 system-ui,sans-serif }
+  main { max-width:1160px; margin:auto } h1 { font-size:20px; margin:0 0 8px } p { color:var(--secondary); margin:0 0 24px }
+  .toolbar { display:flex; align-items:center; gap:12px; margin-bottom:18px; flex-wrap:wrap } button { font:inherit; color:var(--ink); background:var(--row); border:1px solid var(--line); border-radius:6px; padding:6px 12px; cursor:pointer } button[aria-pressed=true] { border-color:var(--blue) }
+  .panel { background:var(--bg); border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:auto; container-type:inline-size } .panel.narrow { max-width:460px }
+  .query { font-size:20px; padding:20px 24px 12px } .meta { padding:0 24px 18px; color:var(--secondary); font-size:12px } .group { margin:0; padding:12px 24px 8px; color:var(--secondary); font-size:11px; text-transform:uppercase; letter-spacing:.09em; border-top:1px solid var(--line) }
+  .hit { display:grid; grid-template-columns:170px minmax(0,1fr) 72px; gap:18px; padding:13px 24px; position:relative; border-bottom:1px solid #ffffff08; align-items:baseline } .hit.open::before { content:''; position:absolute; left:10px; top:16px; bottom:16px; width:2px; border-radius:2px; background:var(--blue) }
+  .sender { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px } .subject { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:14px } .preview { color:var(--secondary); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:3px } .date { color:var(--secondary); font-size:12px; text-align:right; white-space:nowrap } .check { color:var(--secondary); margin-right:6px }
+  mark { color:var(--match-ink); background:var(--match); border-radius:2px; padding:0 1px } .hit:hover { background:var(--row) }
+  @container (max-width:600px) { .hit { grid-template-columns:minmax(0,1fr) auto; gap:3px 12px; padding:12px 20px 13px 24px } .content { grid-column:1 / -1; grid-row:2 } .date { grid-column:2; grid-row:1 } .preview { white-space:normal; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden } }
+  body.light { color-scheme:light; background:#e8edf3; --bg:#fff; --row:#f0f5fb; --ink:#202c3a; --secondary:#506071; --line:#d9e0e8; --blue:#2b70b6; --match:#faedc3; --match-ink:#493b0d }
+  .note { font-size:12px; margin-top:18px }
+</style>
+<main>
+  <h1>Search layout study</h1>
+  <p>A continuous list, readable match context, and unfinished mail first.</p>
+  <div class="toolbar"><button id="width" aria-pressed="false">Narrow panel</button><button id="theme" aria-pressed="false">Light appearance</button></div>
+  <section class="panel" aria-label="Illustrative search results">
+    <div class="query">anjuna tickets</div>
+    <div class="meta">Not done first · Relevance + recency</div>
+    <h2 class="group">Not done</h2>
+    <article class="hit open" aria-label="Not done: Set times for Anjunadeep Malta">
+      <div class="sender">Anjunadeep</div><div class="content"><div class="subject">Set times for <mark>Anjuna</mark>deep Malta 🇲🇹</div><div class="preview">… Final weekend <mark>tickets</mark> are on sale now. …</div></div><div class="date">Sep 16</div>
+    </article>
+    <article class="hit open" aria-label="Not done: Six weeks until Anjunadeep Malta">
+      <div class="sender">Anjunadeep</div><div class="content"><div class="subject">Six weeks until <mark>Anjuna</mark>deep Malta 🇲🇹</div><div class="preview">… final <mark>tickets</mark> are on sale now, with €60 deposits available. …</div></div><div class="date">Aug 26</div>
+    </article>
+    <article class="hit open" aria-label="Not done: Your Above and Beyond Digital Tickets">
+      <div class="sender">Above and Beyond</div><div class="content"><div class="subject">Your Above and Beyond Digital <mark>Tickets</mark></div><div class="preview">… Save your <mark>tickets</mark> to your phone below or present the attached digital…</div></div><div class="date">Sep 7</div>
+    </article>
+    <h2 class="group">Done</h2>
+    <article class="hit" aria-label="Done: Two weeks until ABGT700">
+      <div class="sender">Anjunabeats</div><div class="content"><div class="subject">Two weeks until ABGT700…</div><div class="preview">… <mark>Tickets</mark> are on sale now. Buy <mark>tickets</mark>. …</div></div><div class="date"><span class="check">✓</span>Aug 28</div>
+    </article>
+    <article class="hit" aria-label="Done: Anjunadeep Malta day splits are here">
+      <div class="sender">Anjunadeep</div><div class="content"><div class="subject"><mark>Anjuna</mark>deep Malta day splits are here 🇲🇹</div><div class="preview">… secure your spot. Our €60 deposit plan will increase as the festival approaches. <mark>Tickets</mark> …</div></div><div class="date"><span class="check">✓</span>Aug 6</div>
+    </article>
+  </section>
+  <p class="note">Layout proposal only. Status assignments and excerpt selection are illustrative. Sender highlights are intentionally restrained to make subject/body evidence easier to scan.</p>
+</main>
+<script>
+  for (const [id, target, cls] of [['width', document.querySelector('.panel'), 'narrow'], ['theme', document.body, 'light']]) {
+    document.getElementById(id).addEventListener('click', event => {
+      const active = target.classList.toggle(cls);
+      event.currentTarget.setAttribute('aria-pressed', String(active));
+    });
+  }
+</script>
+</html>

@@ -494,6 +494,13 @@ final class AssistantSession {
         start(text, openEmail: openEmail, hits: Self.promptHits(hits))
     }
 
+    /// Only pass results freshly obtained through /client/agent/search here.
+    func sendAuthorizedSearch(_ text: String, hits: [SearchHit]) {
+        start(text, openEmail: nil, hits: hits.map {
+            SearchLanePrompt.Hit(threadId: $0.thread_id, subject: $0.subject)
+        })
+    }
+
     /// The one door every question goes through, first or refined, with the
     /// local hits already reduced to what the prompt states.
     private func start(_ text: String, openEmail: OpenEmailContext?, hits: [SearchLanePrompt.Hit])
