@@ -581,8 +581,9 @@ impl Store for SqliteStore {
         account_id: AccountId,
         shipment_id: i64,
         at: DateTime<Utc>,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<bool> {
-        self.clear_shipment(account_id, shipment_id, at)
+        self.clear_shipment(account_id, shipment_id, at, policy)
     }
 
     fn shipments_redetect_cleanup(&self, account_id: AccountId) -> Result<u64> {

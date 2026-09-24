@@ -36,6 +36,23 @@ struct CalendarVisibilityTests {
                                    now: tomorrow.addingTimeInterval(-1), calendar: calendar))
         precondition(!window.admits(account: "b", item: 1, start: day, allDay: true,
                                     now: tomorrow, calendar: calendar))
-        print("Calendar visibility: 11 checks passed")
+        let zone = "America/Los_Angeles"
+        let instant = CalendarVisibility.startDate("2026-09-15T22:05:00Z", timezone: nil)!
+        precondition(CalendarVisibility.startDate("2026-09-15T15:05:00", timezone: zone) == instant)
+        precondition(CalendarVisibility.startDate("2026-09-15T15:05:00", timezone: nil, calendar: calendar) == instant)
+        precondition(CalendarVisibility.startDate("2026-09-15T22:05:00Z", timezone: zone) == instant)
+        precondition(CalendarVisibility.startDate("2026-09-15T15:05:00-07:00", timezone: "UTC") == instant)
+        precondition(CalendarVisibility.startDate("2026-02-30", timezone: zone) == nil)
+        precondition(CalendarVisibility.startDate("unknown", timezone: zone) == nil)
+        precondition(!window.admits(account: "c", item: 1, startValue: "2026-09-15T15:05:00",
+                                    timezone: zone, now: instant.addingTimeInterval(1)))
+        precondition(window.admits(account: "c", item: 1, startValue: "2026-09-15T15:05:00",
+                                   timezone: zone, now: instant.addingTimeInterval(-1)))
+        let midnight = CalendarVisibility.startDate("2026-09-16T07:00:00Z", timezone: nil)!
+        precondition(window.admits(account: "c", item: 1, startValue: "2026-09-15",
+                                   timezone: zone, now: midnight.addingTimeInterval(-1)))
+        precondition(!window.admits(account: "c", item: 1, startValue: "2026-09-15",
+                                    timezone: zone, now: midnight))
+        print("Calendar visibility: 21 checks passed")
     }
 }

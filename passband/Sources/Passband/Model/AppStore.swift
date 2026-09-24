@@ -2060,11 +2060,8 @@ final class AppStore {
     }
 
     /// What a cleared shipment is CALLED in its toast: the card's own title rule
-    /// (item name, else the carrier), kept short enough to sit in one.
-    private static func shipmentLabel(_ s: Shipment) -> String {
-        let name = s.displayItem
-        return name.isEmpty ? s.carrier.label : name
-    }
+    /// (item name, else the merchant, else "Package").
+    private static func shipmentLabel(_ s: Shipment) -> String { s.displayTitle }
 
     // MARK: - dev re-triage
 

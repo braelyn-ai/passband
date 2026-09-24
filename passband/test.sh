@@ -52,6 +52,14 @@ run_suite rehearsal-api \
   Sources/Passband/Model/RehearsalAPI.swift \
   Tests/RehearsalAPITests.swift
 
+# The shipment row with and without the order-linking fields, and the card's
+# title and order line built from it.
+run_suite shipment-wire \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Model/APIError.swift \
+  Tests/ShipmentWireTests.swift
+
 # Credential validation must never succeed against the fixture transport.
 run_suite credential-probe \
   Sources/Passband/Model/SubjectText.swift \

@@ -19,8 +19,8 @@ struct CalendarZone: View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             let rows = store.zones.calendar.filter {
                 CalendarVisibility.shared.admits(
-                    account: accountScope, item: $0.id, start: Fmt.date($0.starts_at),
-                    allDay: $0.starts_at?.count == 10, now: context.date)
+                    account: accountScope, item: $0.id, startValue: $0.starts_at,
+                    timezone: $0.start_timezone, now: context.date)
             }
             ZoneCard(
                 symbol: "calendar", title: "Calendar", count: rows.count, tint: Palette.accent
@@ -108,10 +108,12 @@ struct ShipmentsZone: View {
     /// user-visible change, so a parcel dropped at 11pm and seen by the small-hours
     /// poll wears tomorrow's stamp and would linger a whole extra day. Rows from a
     /// daemon older than the field keep the clock they have always been judged by.
+    ///
+    /// A GROUPED card stays while ANY of its packages is still coming, even if
+    /// the one standing for it has landed: one order's delivered first box must
+    /// not hide its second, still in transit.
     private var rows: [Shipment] {
-        shipments.filter {
-            $0.status != .delivered || Fmt.isToday($0.delivered_at ?? $0.last_update)
-        }
+        shipments.filter { $0.staysOnRail(isToday: Fmt.isToday) }
     }
 
     var body: some View {
@@ -136,10 +138,7 @@ private struct ShipmentCard: View {
 
     @State private var hovering = false
 
-    private var title: String {
-        let name = shipment.displayItem
-        return name.isEmpty ? "Package via \(shipment.carrier.label)" : name
-    }
+    private var title: String { shipment.displayTitle }
 
     /// Status → tone: out_for_delivery is the loud one, delivered fades back.
     private var tone: Color {
@@ -261,19 +260,31 @@ private struct ShipmentCard: View {
         VStack(alignment: .leading, spacing: 7) {
             HStack(spacing: 7) {
                 if RehearsalMode.isEnabled, shipment.thread_id == "practice-5" {
-                    RehearsalNewsletterLogo(brand: .exfed, size: 18)
+                    RehearsalNewsletterLogo(brand: .exfed, size: 18, tile: false)
                 } else if RehearsalMode.isEnabled,
                    shipment.thread_id == "practice-13" || shipment.thread_id == "practice-14" {
                     RehearsalNewsletterLogo(brand: .rainforest, size: 18)
                 } else {
                     CarrierBadge(carrier: shipment.carrier)
                 }
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Palette.ink)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(titleHelp)
+                // The order line sits UNDER the title in the same column, so
+                // the badge and chip stay beside the name rather than floating
+                // over a separate row.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Palette.ink)
+                        .lineLimit(2)
+                        .help(titleHelp)
+                    if let orderLine = shipment.orderLine {
+                        Text(orderLine)
+                            .font(Typo.micro)
+                            .foregroundStyle(Palette.inkFaint)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 Chip(
                     text: statusText, tone: tone,
                     symbol: shipment.status == .delivered ? "checkmark.circle.fill" : nil,
@@ -346,9 +357,79 @@ private struct CarrierBadge: View {
                 failed = true
                 return
             }
-            image = await FaviconLoader.shared.load(url: url, domain: domain)
+            image = await Self.knockedOut(FaviconLoader.shared.load(url: url, domain: domain), domain)
             failed = image == nil
         }
+    }
+
+    /// Per domain, so a rail of UPS cards pays for the flood fill once.
+    @MainActor private static var knockouts: [String: PlatformImage] = [:]
+
+    @MainActor private static func knockedOut(_ image: PlatformImage?, _ domain: String) -> PlatformImage? {
+        guard let image else { return nil }
+        if let done = knockouts[domain] { return done }
+        let clear = FaviconMatte.clearingBackdrop(image) ?? image
+        knockouts[domain] = clear
+        return clear
+    }
+}
+
+/// Carrier favicons come as a mark on a baked-in WHITE square (UPS, USPS), which
+/// reads as a sticker on the card's tint and a lit tile in dark mode. This clears
+/// the near-white pixels reachable from the border and nothing else, so white
+/// INSIDE the mark (the USPS eagle) survives. A coloured square (DHL's yellow) is
+/// the brand itself and is left alone, as is an icon that is already transparent.
+enum FaviconMatte {
+    /// How close to white a pixel must be to count as backdrop. Low enough to eat
+    /// JPEG-ish noise in the square, high enough to spare a pale brand colour.
+    private static let floor: UInt8 = 235
+
+    static func clearingBackdrop(_ image: PlatformImage) -> PlatformImage? {
+        #if os(macOS)
+            guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        #else
+            guard let cg = image.cgImage else { return nil }
+        #endif
+        let w = cg.width, h = cg.height
+        guard w > 0, h > 0,
+            let ctx = CGContext(
+                data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+            let base = ctx.data?.assumingMemoryBound(to: UInt8.self)
+        else { return nil }
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        let px = UnsafeMutableBufferPointer(start: base, count: w * h * 4)
+
+        func isBackdrop(_ i: Int) -> Bool {
+            let o = i * 4
+            return px[o + 3] == 255 && px[o] >= floor && px[o + 1] >= floor && px[o + 2] >= floor
+        }
+        var seen = [Bool](repeating: false, count: w * h)
+        var stack: [Int] = []
+        for x in 0..<w { stack.append(x); stack.append((h - 1) * w + x) }
+        for y in 0..<h { stack.append(y * w); stack.append(y * w + w - 1) }
+        var cleared = 0
+        while let i = stack.popLast() {
+            guard !seen[i] else { continue }
+            seen[i] = true
+            guard isBackdrop(i) else { continue }
+            for c in 0..<4 { px[i * 4 + c] = 0 }
+            cleared += 1
+            let x = i % w, y = i / w
+            if x > 0 { stack.append(i - 1) }
+            if x < w - 1 { stack.append(i + 1) }
+            if y > 0 { stack.append(i - w) }
+            if y < h - 1 { stack.append(i + w) }
+        }
+        // Nothing white on the rim: the icon was already transparent or its
+        // square is a brand colour. Hand back the original untouched.
+        guard cleared > 0, let out = ctx.makeImage() else { return nil }
+        #if os(macOS)
+            return NSImage(cgImage: out, size: image.size)
+        #else
+            return UIImage(cgImage: out, scale: image.scale, orientation: image.imageOrientation)
+        #endif
     }
 }
 

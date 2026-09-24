@@ -1593,7 +1593,9 @@ fn a_clear_still_hides_a_row_the_window_would_show() {
     let (store, acct) = store();
     let sid = aged_shipment(&store, acct, "1Z999AA10123456784", 2);
     assert_eq!(listed_ids(&store, acct, 10), vec![sid]);
-    store.clear_shipment(acct, sid, Utc::now()).unwrap();
+    store
+        .clear_shipment(acct, sid, Utc::now(), KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert!(listed_ids(&store, acct, 10).is_empty());
 }
 
@@ -1639,7 +1641,11 @@ fn a_cleared_shipment_hides_until_a_poll_actually_moves_it() {
         .unwrap();
 
     let cleared_at = t0 + chrono::Duration::hours(2);
-    assert!(store.clear_shipment(acct, sid, cleared_at).unwrap());
+    assert!(
+        store
+            .clear_shipment(acct, sid, cleared_at, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+    );
     assert!(
         store
             .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
@@ -1716,7 +1722,9 @@ fn a_new_accepted_email_revives_a_cleared_shipment() {
             t0,
         )
         .unwrap();
-    store.clear_shipment(acct, sid, t0).unwrap();
+    store
+        .clear_shipment(acct, sid, t0, KEEP_ALL_SHIPMENTS)
+        .unwrap();
     assert!(
         store
             .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)
@@ -1761,13 +1769,21 @@ fn clearing_is_idempotent_restamps_and_reports_an_unknown_id() {
         )
         .unwrap();
 
-    assert!(store.clear_shipment(acct, sid, t0).unwrap());
     assert!(
-        store.clear_shipment(acct, sid, t0).unwrap(),
+        store
+            .clear_shipment(acct, sid, t0, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+    );
+    assert!(
+        store
+            .clear_shipment(acct, sid, t0, KEEP_ALL_SHIPMENTS)
+            .unwrap(),
         "clearing twice is a no-op success, not an error"
     );
     assert!(
-        !store.clear_shipment(acct, sid + 999, Utc::now()).unwrap(),
+        !store
+            .clear_shipment(acct, sid + 999, Utc::now(), KEEP_ALL_SHIPMENTS)
+            .unwrap(),
         "an unknown id is false, never an error — the door turns this into a 404"
     );
 
@@ -1793,7 +1809,11 @@ fn clearing_is_idempotent_restamps_and_reports_an_unknown_id() {
             .len(),
         1
     );
-    assert!(store.clear_shipment(acct, sid, moved).unwrap());
+    assert!(
+        store
+            .clear_shipment(acct, sid, moved, KEEP_ALL_SHIPMENTS)
+            .unwrap()
+    );
     assert!(
         store
             .list_shipments(acct, false, KEEP_ALL_SHIPMENTS)

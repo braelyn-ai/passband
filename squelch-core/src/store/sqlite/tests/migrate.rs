@@ -1,7 +1,8 @@
 //! Migration + init upgrade-path tests.
 
 use super::super::migrate::{
-    canonical_fts_create, migrate, normalize_fts_sql, rebuild_fts_if_stale,
+    canonical_fts_create, create_shipment_order_links, migrate, normalize_fts_sql,
+    rebuild_fts_if_stale,
 };
 use super::super::*;
 use super::support::*;
@@ -704,6 +705,34 @@ fn migrate_adds_shipment_provenance_and_backfills_it_from_the_pointer() {
         (Some(7), None, None),
         "no name and no order reference means nothing to attribute"
     );
+
+    // ORDER LINKS: the open that creates the table backfills a 'legacy' link
+    // for every row with both an order reference and a merchant, and no other.
+    let links = |conn: &Connection| -> Vec<(i64, String, String, String)> {
+        conn.prepare(
+            "SELECT shipment_id, merchant_key, order_key, source FROM shipment_order_links",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap()
+    };
+    let want = vec![(1, "shopacom".into(), "1042".into(), "legacy".into())];
+    assert_eq!(links(&conn), want);
+    // ONE-SHOT: a later open must not pair an agent-written merchant with the
+    // extractor's stale order_ref.
+    conn.execute(
+        "UPDATE shipments SET order_merchant = 'Shop A', order_ref = '1042' WHERE id = 2",
+        [],
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(links(&conn), want, "the backfill never runs again");
+    // Deleting a shipment deletes its links, whichever path deletes it.
+    conn.execute("DELETE FROM shipments WHERE id = 1", [])
+        .unwrap();
+    assert!(links(&conn).is_empty(), "links follow their shipment out");
 }
 
 #[test]
@@ -1631,6 +1660,127 @@ fn event_auth_flag_migration_defaults_legacy_rows_without_inferring_urgency() {
         !is_auth,
         "legacy urgency alone does not prove authentication"
     );
+}
+
+/// THE ORDER-LINKS BACKFILL SKIPS JUNK AND IS ALL-OR-NOTHING ON A REAL ERROR.
+///
+/// A legacy row it cannot read (a merchant stored as a number, a reference
+/// stored as a blob or as bytes that are not UTF-8) is skipped, and every other
+/// row still gets its link: one bad row must not fail the backfill on every
+/// open forever.
+///
+/// A real SQL failure must leave NO table behind: the table's existence is
+/// what tells every later open the backfill already ran, so a half-done one
+/// would lose the legacy links for good. Here a temp view shadowing
+/// `shipments` fails the migration after the table was created; the next
+/// open, with the fault gone, does the whole job.
+#[test]
+fn order_links_migration_is_all_or_nothing() {
+    let exists = |conn: &Connection| -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'shipment_order_links'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    };
+    let links = |conn: &Connection| -> Vec<(i64, String)> {
+        conn.prepare("SELECT shipment_id, order_ref FROM shipment_order_links ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    };
+
+    // JUNK IS SKIPPED: rows 2-4 cannot be read as text, rows 1 and 5 backfill.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             order_ref, order_merchant);
+         INSERT INTO shipments VALUES
+             (1, 1, '1042', 'Shop A'),
+             (2, 1, '77', 42),
+             (3, 1, x'0102', 'Shop C'),
+             (4, 1, '88', CAST(x'ff' AS TEXT)),
+             (5, 1, '1043', 'Shop E');",
+    )
+    .unwrap();
+    create_shipment_order_links(&conn).unwrap();
+    assert!(exists(&conn), "junk rows do not fail the backfill");
+    assert_eq!(
+        links(&conn),
+        vec![(1, "1042".to_string()), (5, "1043".to_string())],
+        "every readable row is linked, the junk ones skipped"
+    );
+
+    // A REAL SQL ERROR ROLLS EVERYTHING BACK. A temp view shadowing
+    // `shipments` makes the migration's AFTER DELETE trigger fail to create,
+    // after the table and its index already have, inside the transaction.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE shipments (
+             id INTEGER PRIMARY KEY, account_id INTEGER NOT NULL,
+             order_ref TEXT, order_merchant TEXT);
+         INSERT INTO shipments VALUES (1, 1, '1042', 'Shop A'), (2, 1, '77', 'Shop B');
+         CREATE TEMP VIEW shipments AS SELECT * FROM main.shipments;",
+    )
+    .unwrap();
+    create_shipment_order_links(&conn).expect("a failed backfill is not a failed open");
+    assert!(
+        !exists(&conn),
+        "rolled back: no table claims the backfill ran"
+    );
+    assert!(
+        conn.is_autocommit(),
+        "the transaction is closed, not left open"
+    );
+    conn.execute_batch("DROP VIEW temp.shipments").unwrap();
+    create_shipment_order_links(&conn).unwrap();
+    assert!(exists(&conn));
+    assert_eq!(
+        links(&conn).len(),
+        2,
+        "the retry backfills every legacy row"
+    );
+}
+
+/// A DB that already ran the first version of the order-links migration (the
+/// user's live one) has the table WITHOUT the provenance columns, and shipments
+/// without `order_merchant_msg`. The next open adds them, and reconcile then
+/// writes through them.
+#[test]
+fn order_link_provenance_columns_reach_a_db_that_already_has_the_table() {
+    let store = SqliteStore::open_in_memory().unwrap();
+    {
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "DROP TABLE shipment_order_links;
+             CREATE TABLE shipment_order_links (
+                 account_id INTEGER NOT NULL, shipment_id INTEGER NOT NULL,
+                 merchant_key TEXT NOT NULL, order_key TEXT NOT NULL,
+                 merchant TEXT NOT NULL DEFAULT '', order_ref TEXT NOT NULL,
+                 source TEXT NOT NULL CHECK (source IN ('agent', 'legacy')),
+                 PRIMARY KEY (account_id, shipment_id, merchant_key, order_key));
+             ALTER TABLE shipments DROP COLUMN order_merchant_msg;",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let columns = |table: &str| -> Vec<String> {
+            conn.prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        let links = columns("shipment_order_links");
+        assert!(links.contains(&"message_id".to_string()), "{links:?}");
+        assert!(links.contains(&"merchant_msg".to_string()), "{links:?}");
+        assert!(columns("shipments").contains(&"order_merchant_msg".to_string()));
+    }
 }
 
 #[test]

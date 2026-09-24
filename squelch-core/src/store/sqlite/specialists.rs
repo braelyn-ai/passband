@@ -2,6 +2,7 @@
 //! marketing. Record writes never decide attention or complete user actions.
 
 use super::*;
+use std::collections::HashMap;
 
 /// The `SELECT id` every `(account_id, message_id)`-keyed upsert below needs to
 /// report the row it just wrote — UPSERT gives no usable `last_insert_rowid` on
@@ -497,7 +498,7 @@ fn shipments_by_order_ref(
 const SHIPMENT_COLUMNS: &str = "s.id, s.account_id, s.tracking_number, s.carrier,
             s.item_name, s.status, s.tracking_url, s.first_seen, s.last_update,
             m.thread_id, s.carrier_status_raw, s.eta, s.delivered_at, s.last_polled_at,
-            s.poll_failures, s.last_answered_at";
+            s.poll_failures, s.last_answered_at, NULLIF(TRIM(s.order_merchant), '')";
 
 /// The tables [`SHIPMENT_COLUMNS`] is read from, split out so the listing can
 /// append its own column (`cleared_at`, which the wire type deliberately does
@@ -523,7 +524,263 @@ fn shipment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::types::Shipmen
         last_polled_at: dt_opt(r, 13)?,
         poll_failures: r.get(14)?,
         last_answered_at: dt_opt(r, 15)?,
+        merchant: r.get(16)?,
+        // Filled by `attach_orders` where a listing wants them.
+        orders: Vec::new(),
+        legs: Vec::new(),
     })
+}
+
+/// Which door a listing serves, for the provenance rule in [`attach_orders`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Door {
+    /// The user's own client: every link and merchant, whatever mail said it.
+    Human,
+    /// The agent door: only what mail it may read supplied.
+    Agent,
+}
+
+/// The mail behind one row's fields, read with the listing so the agent door's
+/// access checks ask no per-row query of their own.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Provenance {
+    pub(super) created: Option<i64>,
+    pub(super) last: Option<i64>,
+    pub(super) merchant_msg: Option<i64>,
+    pub(super) name_msg: Option<i64>,
+}
+
+/// Per-listing cache of [`super::messages::external_contributor_allowed_conn`]:
+/// one answer per message per listing, however many rows and links cite it.
+pub(super) type AccessCache = HashMap<i64, bool>;
+
+/// Fill each row's `orders` from `shipment_order_links`. The table's key
+/// already dedupes a row's orders, so for the human door this is a plain read.
+///
+/// THE AGENT DOOR SEES ONLY WHAT READABLE MAIL SAID. A merchant and an order
+/// reference are text lifted from one message each, and that message may be
+/// restricted even when the package's own mail is not (a pharmacy's order
+/// confirmation, then a plain carrier notice for the same number). So on the
+/// agent door:
+///
+/// * the row's merchant is dropped unless `order_merchant_msg` is allowed;
+/// * an agent link is dropped unless its `message_id` (the mail that printed
+///   the ref) and its `merchant_msg` (the mail that named the seller) are;
+/// * a link or merchant with NO provenance (the legacy backfill, the old
+///   extractor's domain) is served only when the row's own creating and latest
+///   mail are allowed, the same bar the row itself clears.
+///
+/// Grouping reads `orders`, so a dropped link can never merge two packages on
+/// the agent door either.
+///
+/// ONLY THE LISTED ROWS' LINKS ARE READ, by id in bounded chunks, never the
+/// account's whole link history.
+fn attach_orders(
+    conn: &Connection,
+    account_id: AccountId,
+    rows: &mut [(crate::types::Shipment, Provenance)],
+    door: Door,
+    seen: &mut AccessCache,
+) -> Result<()> {
+    if door == Door::Agent {
+        for (row, prov) in rows.iter_mut() {
+            if !agent_merchant_allowed(conn, account_id, prov, seen)? {
+                row.merchant = None;
+            }
+        }
+    }
+    if rows.is_empty() || !super::migrate::order_links_exist(conn)? {
+        return Ok(());
+    }
+    type Link = (i64, crate::types::ShipmentOrder, Option<i64>, Option<i64>);
+    let mut links: Vec<Link> = Vec::new();
+    // Well under SQLite's bound-parameter limit (32766 on the bundled build,
+    // 999 on old ones), with one slot for the account.
+    const CHUNK: usize = 500;
+    for chunk in rows.chunks(CHUNK) {
+        let marks = (0..chunk.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT shipment_id, NULLIF(merchant, ''), order_ref, message_id, merchant_msg
+             FROM shipment_order_links
+             WHERE account_id = ?1 AND shipment_id IN ({marks})
+             ORDER BY shipment_id, source, merchant_key, order_key"
+        ))?;
+        let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 1);
+        binds.push(&account_id);
+        binds.extend(chunk.iter().map(|(row, _)| &row.id as &dyn rusqlite::ToSql));
+        let read = stmt
+            .query_map(binds.as_slice(), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    crate::types::ShipmentOrder {
+                        merchant: r.get(1)?,
+                        order_ref: r.get(2)?,
+                    },
+                    r.get(3)?,
+                    r.get(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<Link>, _>>()?;
+        #[cfg(test)]
+        SHIPMENT_LINKS_READ.with(|n| n.set(n.get() + read.len()));
+        links.extend(read);
+    }
+    type Sourced = (crate::types::ShipmentOrder, Option<i64>, Option<i64>);
+    let mut by_row: HashMap<i64, Vec<Sourced>> = HashMap::new();
+    for (id, order, message, merchant_msg) in links {
+        by_row
+            .entry(id)
+            .or_default()
+            .push((order, message, merchant_msg));
+    }
+    for (row, prov) in rows {
+        let Some(links) = by_row.remove(&row.id) else {
+            continue;
+        };
+        let mut orders = Vec::with_capacity(links.len());
+        for (order, message, merchant_msg) in links {
+            let keep = match door {
+                Door::Human => true,
+                Door::Agent => match message {
+                    Some(message) => {
+                        allowed_cached(conn, account_id, message, seen)?
+                            && match merchant_msg {
+                                Some(m) => allowed_cached(conn, account_id, m, seen)?,
+                                None => true,
+                            }
+                    }
+                    None => row_mail_allowed(conn, account_id, prov, seen)?,
+                },
+            };
+            if keep {
+                orders.push(order);
+            }
+        }
+        row.orders = orders;
+    }
+    Ok(())
+}
+
+/// [`super::messages::external_contributor_allowed_conn`], asked once per
+/// message per listing.
+fn allowed_cached(
+    conn: &Connection,
+    account_id: AccountId,
+    message: i64,
+    seen: &mut AccessCache,
+) -> Result<bool> {
+    if let Some(&known) = seen.get(&message) {
+        return Ok(known);
+    }
+    let allowed = super::messages::external_contributor_allowed_conn(conn, account_id, message)?;
+    seen.insert(message, allowed);
+    Ok(allowed)
+}
+
+/// Are the row's creating AND latest mail both allowed? The bar for
+/// provenance-less text on the agent door.
+fn row_mail_allowed(
+    conn: &Connection,
+    account_id: AccountId,
+    prov: &Provenance,
+    seen: &mut AccessCache,
+) -> Result<bool> {
+    let (Some(created), Some(last)) = (prov.created, prov.last) else {
+        return Ok(false);
+    };
+    Ok(allowed_cached(conn, account_id, created, seen)?
+        && allowed_cached(conn, account_id, last, seen)?)
+}
+
+/// May the agent door see this row's merchant? By the mail that named it
+/// (`order_merchant_msg`), or, with none recorded, by the row's own mail.
+fn agent_merchant_allowed(
+    conn: &Connection,
+    account_id: AccountId,
+    prov: &Provenance,
+    seen: &mut AccessCache,
+) -> Result<bool> {
+    match prov.merchant_msg {
+        Some(message) => allowed_cached(conn, account_id, message, seen),
+        None => row_mail_allowed(conn, account_id, prov, seen),
+    }
+}
+
+/// May the agent door serve this row at all? THE rule behind
+/// [`super::messages::external_shipment_allowed_conn`], here so the listing
+/// can apply it to rows it already read, through its own cache: the creating
+/// and latest mail must be allowed, and so must the mail that named it (a name
+/// with no recorded source is legacy text the agent does not get).
+pub(super) fn agent_row_allowed(
+    conn: &Connection,
+    account_id: AccountId,
+    item_name: &str,
+    prov: &Provenance,
+    seen: &mut AccessCache,
+) -> Result<bool> {
+    if !item_name.trim().is_empty() && prov.name_msg.is_none() {
+        return Ok(false);
+    }
+    if !row_mail_allowed(conn, account_id, prov, seen)? {
+        return Ok(false);
+    }
+    match prov.name_msg {
+        Some(message) => allowed_cached(conn, account_id, message, seen),
+        None => Ok(true),
+    }
+}
+
+/// THE SQL HALF OF THE SILENCE RULE: rows [`Silence::hides`] is CERTAIN to
+/// hide, so the listing never reads them. Without it every listing (and every
+/// clear, which runs one under the store mutex) loaded the account's entire
+/// delivered history into Rust just to throw it away.
+///
+/// A SUBSET OF THE RUST RULE, NEVER MORE. It binds `?2` to the cutoff minus
+/// [`SILENCE_SQL_MARGIN`] and `?3` to the retirement cap: a row goes only when
+/// its `last_update` is before that earlier instant AND no carrier answer
+/// since then could vouch for it. Anything within the margin, and anything
+/// whose timestamps SQLite cannot parse (`julianday` is NULL), is kept and
+/// judged by the exact rule in Rust. The margin is what makes a float
+/// `julianday` and a stored offset other than UTC harmless: they can only move
+/// a row across an instant a day away from the one that matters.
+///
+/// Status is no part of it, and it needs none: a hidden row is hidden whatever
+/// its status, and hidden rows never group, so no visible card can be missing
+/// a member this drops. With the window off (`stale_after_days = 0`) nothing is
+/// dropped, because then any row can be visible.
+///
+/// The agent door's per-number check ([`SqliteStore::agent_shipment_is_hidden`])
+/// uses the same text, so a delivery record whose row this drops is dropped
+/// with it rather than served off the record alone.
+pub(super) const SILENT_FOR_CERTAIN: &str = "(IFNULL(julianday(s.last_update) < julianday(?2), 0)
+     AND NOT (s.last_answered_at IS NOT NULL
+              AND IFNULL(julianday(s.last_answered_at) >= julianday(?2), 1)
+              AND s.poll_failures < ?3))";
+
+/// See [`SILENT_FOR_CERTAIN`].
+const SILENCE_SQL_MARGIN: chrono::Duration = chrono::Duration::days(1);
+
+/// `?2` and `?3` for [`SILENT_FOR_CERTAIN`].
+pub(super) fn silence_binds(silence: &crate::config::Silence) -> (String, u32) {
+    let before = silence
+        .cutoff
+        .checked_sub_signed(SILENCE_SQL_MARGIN)
+        .unwrap_or(silence.cutoff);
+    (before.to_rfc3339(), silence.retired_at_failures)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Rows the shipment listing read from SQL, for the tests that prove a
+    /// long delivered history is never loaded.
+    pub(super) static SHIPMENT_ROWS_READ: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Order links the listing read, likewise.
+    pub(super) static SHIPMENT_LINKS_READ: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn list_shipments_conn(
@@ -531,37 +788,96 @@ fn list_shipments_conn(
     account_id: AccountId,
     include_delivered: bool,
     silence: Option<crate::config::Silence>,
+    door: Door,
 ) -> Result<Vec<crate::types::Shipment>> {
     // This is a human record listing; external access is enforced separately.
     // `cleared_at` rides along as an extra column: the read-side policy below
-    // needs it, and the wire type deliberately does not carry it.
-    let mut sql =
-        format!("SELECT {SHIPMENT_COLUMNS}, s.cleared_at {SHIPMENT_FROM} WHERE s.account_id=?1");
+    // needs it, and the wire type deliberately does not carry it. So does the
+    // row's provenance, for the agent door's checks.
+    let mut sql = format!(
+        "SELECT {SHIPMENT_COLUMNS}, s.cleared_at, s.created_by_message_id,
+                s.last_message_id, s.order_merchant_msg, s.item_name_msg
+         {SHIPMENT_FROM} WHERE s.account_id=?1"
+    );
     if !include_delivered {
         sql.push_str(" AND s.status != 'delivered'");
     }
+    let binds = silence.as_ref().map(silence_binds);
+    if binds.is_some() {
+        sql.push_str(&format!(" AND NOT {SILENT_FOR_CERTAIN}"));
+    }
     sql.push_str(" ORDER BY s.last_update DESC");
     let mut stmt = conn.prepare(&sql)?;
-    let out = stmt
-        .query_map(params![account_id], |r| {
-            Ok((shipment_row(r)?, dt_opt(r, 16)?))
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let read = |r: &rusqlite::Row<'_>| {
+        Ok((
+            shipment_row(r)?,
+            dt_opt(r, 17)?,
+            Provenance {
+                created: r.get(18)?,
+                last: r.get(19)?,
+                merchant_msg: r.get(20)?,
+                name_msg: r.get(21)?,
+            },
+        ))
+    };
+    let out = match &binds {
+        Some((before, cap)) => stmt.query_map(params![account_id, before, cap], read)?,
+        None => stmt.query_map(params![account_id], read)?,
+    }
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+    #[cfg(test)]
+    SHIPMENT_ROWS_READ.with(|n| n.set(n.get() + out.len()));
     // BOTH HIDES ARE READ-SIDE and both reverse themselves: the rows stay live,
     // keep being polled (`list_pollable_shipments` filters on none of this), and
     // come back the moment `last_update` moves.
-    Ok(out
+    let mut seen = AccessCache::new();
+    let mut visible = Vec::with_capacity(out.len());
+    for (shipment, cleared_at, prov) in out {
+        // CLEARED. The comparison IS the revival: hide only while the row
+        // has not moved since the user cleared it.
+        let cleared = cleared_at.is_some_and(|at| shipment.last_update <= at);
+        // SILENT. The rule is `Silence::hides`, because the agent door
+        // applies the same one to its merged list.
+        let silent = silence.is_some_and(|s| s.hides(shipment.last_update, Some(&shipment)));
+        if cleared || silent {
+            continue;
+        }
+        // The agent door serves only rows every contributing mail allows,
+        // judged through the same cache the merchant and link checks use.
+        if door == Door::Agent
+            && !agent_row_allowed(conn, account_id, &shipment.item_name, &prov, &mut seen)?
+        {
+            continue;
+        }
+        visible.push((shipment, prov));
+    }
+    attach_orders(conn, account_id, &mut visible, door, &mut seen)?;
+    Ok(visible.into_iter().map(|(s, _)| s).collect())
+}
+
+/// The human door's cards: every visible row, grouped, THEN the delivered
+/// filter applied to whole cards. Grouping first is what keeps the doors
+/// agreeing: a delivered leg still belongs to its order's card, and a card is
+/// "delivered" only when its representative is, which
+/// [`representative_first`](crate::triage::order_link::representative_first)
+/// makes true only when every leg has landed. The silence window bounds what
+/// "every visible row" costs (see [`SILENT_FOR_CERTAIN`]).
+fn shipment_cards_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    include_delivered: bool,
+    silence: Option<crate::config::Silence>,
+) -> Result<Vec<crate::types::Shipment>> {
+    let cards = crate::triage::order_link::group_shipments(list_shipments_conn(
+        conn,
+        account_id,
+        true,
+        silence,
+        Door::Human,
+    )?);
+    Ok(cards
         .into_iter()
-        .filter(|(shipment, cleared_at)| {
-            // CLEARED. The comparison IS the revival: hide only while the row
-            // has not moved since the user cleared it.
-            let cleared = cleared_at.is_some_and(|at| shipment.last_update <= at);
-            // SILENT. The rule is `Silence::hides`, because the agent door
-            // applies the same one to its merged list.
-            let silent = silence.is_some_and(|s| s.hides(shipment.last_update, Some(shipment)));
-            !(cleared || silent)
-        })
-        .map(|(s, _)| s)
+        .filter(|card| include_delivered || card.status != "delivered")
         .collect())
 }
 
@@ -778,45 +1094,81 @@ impl SqliteStore {
     ) -> Result<Vec<crate::types::Shipment>> {
         let silence = policy.silence(Utc::now());
         let conn = self.lock()?;
-        list_shipments_conn(&conn, account_id, include_delivered, silence)
+        // One purchase, one card. Grouped AFTER the hides, so only rows the
+        // user would see anyway can merge, and a hidden leg never drags its
+        // order onto a visible one. `external_shipments` stays ungrouped: it is
+        // the raw observation feed the agent door groups for itself.
+        shipment_cards_conn(&conn, account_id, include_delivered, silence)
     }
 
     /// Read carrier facts and validate all contributing messages under one lock.
+    /// UNWINDOWED: every row the agent may read, silent ones included.
     pub fn external_shipments(
         &self,
         account_id: AccountId,
         include_delivered: bool,
     ) -> Result<Vec<crate::types::Shipment>> {
         let conn = self.lock()?;
-        let mut allowed = Vec::new();
-        // UNWINDOWED ON PURPOSE: this is the raw observation feed. The agent
-        // door decorates its own delivery records with these rows and THEN
-        // applies the same `Silence::hides` to the merged list, so a silent
-        // row's carrier data must still be here to be judged by.
-        for shipment in list_shipments_conn(&conn, account_id, include_delivered, None)? {
-            if super::messages::external_shipment_allowed_conn(&conn, account_id, shipment.id)? {
-                allowed.push(shipment);
-            }
-        }
-        Ok(allowed)
+        list_shipments_conn(&conn, account_id, include_delivered, None, Door::Agent)
     }
 
-    /// Stamp the user's "stop showing me this" on one shipment. Unconditional so
-    /// a re-clear RESTAMPS (a row revived by an update and cleared again must
-    /// hide against the LATER stamp), which also makes it idempotent. `false`
-    /// means no such row for this account.
+    /// The agent door's feed for `get_shipments`: [`Self::external_shipments`]
+    /// (delivered included) under the listing's `silence`, so the rows it
+    /// leaves out are exactly the ones the listing hides. A delivery record
+    /// whose row is left out here is hidden too; the agent door asks
+    /// [`AgentTriageStore::agent_shipment_is_hidden`](crate::store::agent_triage::AgentTriageStore::agent_shipment_is_hidden)
+    /// with the same `silence` before serving one off the record alone.
+    ///
+    /// Door::Agent: rows, merchants and order links whose mail the agent may
+    /// not read are dropped here, before the agent door groups on them.
+    pub fn external_shipments_within(
+        &self,
+        account_id: AccountId,
+        silence: Option<crate::config::Silence>,
+    ) -> Result<Vec<crate::types::Shipment>> {
+        let conn = self.lock()?;
+        list_shipments_conn(&conn, account_id, true, silence, Door::Agent)
+    }
+
+    /// Stamp the user's "stop showing me this" on one shipment AND EVERY
+    /// PACKAGE ITS CARD CARRIES. The user cleared a card, and a card is a
+    /// purchase: clearing only the id they tapped would leave the order's other
+    /// boxes to regroup into a card that comes straight back. The group is the
+    /// listing's own (visible rows, grouped by [`shipment_cards_conn`] under
+    /// the same `policy`), so exactly the packages the card showed are cleared.
+    /// A row the listing does not show (already cleared, silent) clears alone.
+    ///
+    /// Unconditional so a re-clear RESTAMPS (a row revived by an update and
+    /// cleared again must hide against the LATER stamp), which also makes it
+    /// idempotent. `false` means no such row for this account.
     pub(super) fn clear_shipment(
         &self,
         account_id: AccountId,
         shipment_id: i64,
         at: DateTime<Utc>,
+        policy: crate::config::ShipmentListPolicy,
     ) -> Result<bool> {
-        let conn = self.lock()?;
-        let n = conn.execute(
-            "UPDATE shipments SET cleared_at = ?3 WHERE account_id = ?1 AND id = ?2",
-            params![account_id, shipment_id, at.to_rfc3339()],
-        )?;
-        Ok(n > 0)
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let silence = policy.silence(Utc::now());
+        let mut ids = vec![shipment_id];
+        for card in shipment_cards_conn(&tx, account_id, true, silence)? {
+            if card.id == shipment_id || card.legs.iter().any(|l| l.id == shipment_id) {
+                ids.extend(card.legs.iter().map(|l| l.id));
+                ids.push(card.id);
+                break;
+            }
+        }
+        let mut stmt =
+            tx.prepare("UPDATE shipments SET cleared_at = ?3 WHERE account_id = ?1 AND id = ?2")?;
+        let mut tapped = false;
+        for id in ids {
+            let n = stmt.execute(params![account_id, id, at.to_rfc3339()])?;
+            tapped |= id == shipment_id && n > 0;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(tapped)
     }
 
     /// Kept for older maintenance callers. Re-triage schedules the agent; it

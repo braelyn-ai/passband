@@ -1098,10 +1098,35 @@ impl AgentTriageStore for SqliteStore {
         items.truncate(limit);
         Ok(items)
     }
-    fn agent_shipment_is_cleared(&self, account: AccountId, tracking_number: &str) -> Result<bool> {
+    fn agent_shipment_is_hidden(
+        &self,
+        account: AccountId,
+        tracking_number: &str,
+        silence: Option<crate::config::Silence>,
+    ) -> Result<bool> {
         let conn = self.lock()?;
-        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM shipments WHERE account_id=?1 AND tracking_number=?2 AND cleared_at IS NOT NULL AND last_update<=cleared_at)",
-            params![account,tracking_number], |row|row.get(0))?)
+        let cleared = "s.cleared_at IS NOT NULL AND s.last_update<=s.cleared_at";
+        Ok(
+            match silence.as_ref().map(super::specialists::silence_binds) {
+                Some((before, cap)) => conn.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM shipments s WHERE s.account_id=?1
+                     AND s.tracking_number=?4 AND (({cleared}) OR {}))",
+                        super::specialists::SILENT_FOR_CERTAIN
+                    ),
+                    params![account, before, cap, tracking_number],
+                    |row| row.get(0),
+                )?,
+                None => conn.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM shipments s WHERE s.account_id=?1
+                     AND s.tracking_number=?2 AND ({cleared}))"
+                    ),
+                    params![account, tracking_number],
+                    |row| row.get(0),
+                )?,
+            },
+        )
     }
     fn correct_agent_triage(
         &self,
@@ -3807,6 +3832,9 @@ mod tests {
             carrier: Some("ups".into()),
             tracking_number: Some("1Z999AA10123456784".into()),
             status: "shipped".into(),
+            item_name: None,
+            merchant: None,
+            order_refs: vec![],
             evidence: vec![],
         });
         store
@@ -3888,6 +3916,9 @@ mod tests {
                     carrier: Some("ups".into()),
                     tracking_number: Some("1Z999AA10123456784".into()),
                     status: status.into(),
+                    item_name: None,
+                    merchant: None,
+                    order_refs: vec![],
                     evidence: vec![],
                 });
             }

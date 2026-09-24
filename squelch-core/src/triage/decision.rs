@@ -151,10 +151,21 @@ pub enum RecordProposal {
         currency: Option<String>,
         evidence: Vec<EvidenceRef>,
     },
+    /// `item_name`, `merchant` and `order_refs` arrived after decisions were
+    /// already being stored, so each defaults: reconcile re-reads EVERY stored
+    /// decision_json, and one that cannot deserialize fails the whole pass.
+    /// Many-to-many on purpose: one box can carry several orders, and one order
+    /// can ship in several boxes (several records, often several emails).
     Delivery {
         carrier: Option<String>,
         tracking_number: Option<String>,
         status: String,
+        #[serde(default)]
+        item_name: Option<String>,
+        #[serde(default)]
+        merchant: Option<String>,
+        #[serde(default)]
+        order_refs: Vec<String>,
         evidence: Vec<EvidenceRef>,
     },
     Event {
