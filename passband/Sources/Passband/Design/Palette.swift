@@ -26,6 +26,10 @@ enum Palette {
     /// A stronger tint for surfaces that must read as "passband's own".
     static let glassTintStrong = Color(hex: 0x2B7FD4).opacity(0.18)
 
+    /// Search evidence is distinct from blue selection and unfinished status.
+    static let searchMatch = Color(light: Color(hex: 0xFAEDC3), dark: Color(hex: 0x594B29))
+    static let searchMatchInk = Color(light: Color(hex: 0x493B0D), dark: Color(hex: 0xFFF0BD))
+
     // MARK: - tier semantics
 
     /// past_due / overdue.

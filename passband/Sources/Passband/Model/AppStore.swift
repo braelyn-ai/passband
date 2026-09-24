@@ -189,13 +189,15 @@ struct SitrepZoneCache: Sendable {
 /// `@State` on unmount, and parking it here is what makes `/` resumable — same
 /// query, same hits, same selection, no refetch and no empty flash.
 struct SearchSession: Sendable, Equatable {
+    var fetchedRelated: Bool? = nil
+    var revision = 0
+    var fetchedRevision: Int? = nil
     var query = ""
     var hits: [SearchHit] = []
     /// The armed row. -1 = nothing armed, focus semantically in the bar: Enter
     /// expands the panel instead of opening a hit. ArrowDown arms row 0.
     var index = -1
-    /// Fullscreen results with larger previews (Enter in the bar). Collapses
-    /// when a hit opens so the results stay in the strip beside the reader.
+    /// Search opens wide and collapses beside the reader when a hit opens.
     var expanded = false
     var error: String?
     /// The term `hits` actually came from, so reopening on an unchanged query
@@ -675,6 +677,21 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
+    var readingMail = false
+    var readingStack: Bool {
+        guard readingMail, let first = threadQueue.first else { return false }
+        return threadQueue.dropFirst().contains { $0.thread_id != first.thread_id }
+    }
+
+    /// Shared by the preview and advance action so resolved siblings never peek.
+    var nextQueuedThread: AttentionUpdate? {
+        guard let threadId,
+            let current = threadQueue.firstIndex(where: { $0.thread_id == threadId })
+        else { return nil }
+        return threadQueue.dropFirst(current + 1).first {
+            $0.thread_id != threadId && !resolvedIds.contains($0.id)
+        }
+    }
     /// WHERE THE READER IS IN ITS FLIGHT. `settled` is where it lives and is the
     /// default, because opening an email is navigation: a surface people enter
     /// and leave all day should just BE there. The other two are the done+next
@@ -694,6 +711,7 @@ final class AppStore {
         case settled
         /// Lifted out through the top: the email you just finished.
         case departing
+        case departingDown
         /// Parked one window outside the frame, waiting to be walked in.
         case entering(ThreadEdge)
     }
@@ -1558,7 +1576,7 @@ final class AppStore {
         // here would finish a search of the old mailbox into the new one's
         // panel, cards and all — it holds thread ids that mean something else
         // under the account that just went away.
-        searchLane.clear()
+        resetSearchLane()
         search = SearchSession()
         resolvedIds = []
         selectedId = nil
@@ -1574,6 +1592,7 @@ final class AppStore {
         // been told about says nothing about this one's.
         arrivals.reset(to: nil)
         threadQueue = []
+        readingMail = false
         pendingReplyMessageId = nil
         focusedMessageId = nil
         focusedMessageView = nil
@@ -1779,7 +1798,7 @@ final class AppStore {
     /// id the reader should open its inline composer on once the thread loads.
     func openThread(
         _ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil,
-        entering edge: ThreadEdge? = nil, focusMessage: Int? = nil
+        entering edge: ThreadEdge? = nil, focusMessage: Int? = nil, readingMail: Bool = false
     ) {
         // from_noise: an open from below the squelch line — someone digging for
         // mail the triage muted, which is the false-negative signal.
@@ -1804,6 +1823,7 @@ final class AppStore {
         // REOPEN of the same one — see ThreadArrivals.reset.
         arrivals.reset(to: threadId)
         self.threadQueue = queue
+        self.readingMail = readingMail
         // An ordinary open puts the reader straight in the window — opening an
         // email is a jump. Only done+next passes an edge, and it walks the
         // reader home itself a frame later.
@@ -1829,6 +1849,7 @@ final class AppStore {
         threadId = nil
         arrivals.reset(to: nil)
         threadQueue = []
+        readingMail = false
         // The flight is deliberately left where it is: the last email of a queue
         // is mid-departure when this runs, and there is nothing left to put back
         // in the window. `openThread` resets it for whatever comes next.
@@ -2569,6 +2590,7 @@ final class AppStore {
     /// transcript and cards until the panel is opened again. A pause on an idle
     /// session is a no-op, so this is safe to call unconditionally.
     func closeSide() {
+        if preparingSearchEvidence { resetSearchLane(keepingVerdict: true) }
         searchLane.pause()
         sideView = .none
     }
@@ -2576,6 +2598,8 @@ final class AppStore {
     /// Open search. By default it RESUMES the last one; `seed` forces a fresh
     /// term (`f` on a row or in the reader, seeding `from:<address>`).
     func openSearch(seed: String? = nil) {
+        // Give wide search the window; closing the reader saves its draft.
+        if threadId != nil { closeThread() }
         // A seed matching what is ALREADY fetched keeps the session: the hits
         // on screen are authoritative for exactly that term, and nilling
         // `fetchedQuery` here would not refetch anyway (the panel's task is
@@ -2583,6 +2607,7 @@ final class AppStore {
         // highlights and kill the cursor under live results.
         if let seed, seed != search.fetchedQuery {
             search.query = seed
+            search.index = -1
             // Nil BOTH: the fetched term is what gates the refetch, and a cursor
             // from the old term would page a search that is no longer on screen.
             search.fetchedQuery = nil
@@ -2602,14 +2627,20 @@ final class AppStore {
             // was holding at.
             searchLane.resume()
         }
-        // Always reopen as the strip: resuming the query is a convenience,
-        // resuming a fullscreen takeover is a mode trap.
-        search.expanded = false
-        // And always reopen DISARMED. The hits and query persist, but a row
-        // armed in some earlier session would silently repurpose bar-Enter
-        // from "expand results" to "open that stale row".
-        search.index = -1
+        // Search starts wide; the strip remains available beside an open email.
+        search.expanded = true
         sideView = .search
+    }
+
+    private var searchEvidenceTask: Task<Void, Never>?
+    var preparingSearchEvidence: Bool { searchEvidenceTask != nil }
+
+    /// Run the words currently in the field, even before keyword results arrive.
+    func requestDeeperSearch() {
+        guard DeeperSearchPolicy.canRequest(query: search.query,
+            choice: Prefs.shared.deeperSearch, running: searchLane.running || preparingSearchEvidence) else { return }
+        resetSearchLane(keepingVerdict: true)
+        startDeeperSearch(trigger: .requested)
     }
 
     /// START THE DEEPER SEARCH on the query the panel has just answered, with
@@ -2621,14 +2652,45 @@ final class AppStore {
     /// query is the reader's own words about their own mail, and no part of it,
     /// nor of what the search found, goes near telemetry.
     func startDeeperSearch(trigger: SearchIntent.Trigger) {
-        let query = search.fetchedQuery ?? search.query.trimmed
-        guard !query.isEmpty, !search.laneStarted else { return }
+        let query = trigger == .requested ? search.query.trimmed : (search.fetchedQuery ?? search.query.trimmed)
+        guard Prefs.shared.deeperSearch != .off, !query.isEmpty, !search.laneStarted else { return }
         search.laneStarted = true
         search.laneTrigger = trigger
         search.laneQuery = query
         search.refinementCount = 0
         captureLaneStart(trigger)
-        searchLane.send(query, openEmail: nil, hits: search.hits)
+        // Both entry points await authorized keyword evidence. Human panel hits
+        // may include restricted mail and cannot be forwarded to the agent.
+        let evidenceEpoch = epoch
+        searchEvidenceTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                var term = query
+                while !Task.isCancelled {
+                    let page = try await APIClient.shared.search(term, limit: 50,
+                        mode: .keyword, partial: true, forAgent: true)
+                    try Task.checkCancellation()
+                    guard self.epoch == evidenceEpoch else { return }
+                    let current = self.search.query.trimmed
+                    guard !current.isEmpty, Prefs.shared.deeperSearch != .off else {
+                        self.resetSearchLane(keepingVerdict: true)
+                        return
+                    }
+                    if term != current { term = current; continue }
+                    self.search.laneQuery = term
+                    self.searchLane.sendAuthorizedSearch(term, hits: page.items)
+                    self.searchEvidenceTask = nil
+                    return
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, self.epoch == evidenceEpoch else { return }
+                self.searchEvidenceTask = nil
+                self.search.laneStarted = false
+                self.search.error = "Could not load search evidence: \(error.localizedDescription)"
+            }
+        }
     }
 
     /// ONE CONVERSATION, ONE EVENT, from the two places a conversation begins:
@@ -2656,7 +2718,7 @@ final class AppStore {
     /// called for every settled query once the lane is going, and the session
     /// decides whether it lands at a boundary or as the next turn.
     func refineDeeperSearch() {
-        guard search.laneStarted else { return }
+        guard search.laneStarted, searchEvidenceTask == nil else { return }
         let query = search.fetchedQuery ?? search.query.trimmed
         guard !query.isEmpty else { return }
         // The session says which of the three things it did, because from out
@@ -2699,6 +2761,8 @@ final class AppStore {
     /// (`f` asks "what else is from this person"), so its verdict goes too and
     /// the band unmounts until the new query has been judged.
     func resetSearchLane(keepingVerdict: Bool = false) {
+        searchEvidenceTask?.cancel()
+        searchEvidenceTask = nil
         searchLane.clear()
         search.laneStarted = false
         search.laneTrigger = nil

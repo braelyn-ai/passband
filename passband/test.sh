@@ -23,6 +23,12 @@ run_suite() {
   "$BUILD/$name"
 }
 
+# The hero, peek and fire-and-forget preload must share one request.
+run_suite thread-prefetch \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Model/ThreadPrefetch.swift \
+  Tests/ThreadPrefetchTests.swift
+
 run_suite calendar-visibility \
   Sources/Passband/Lib/CalendarVisibility.swift \
   Tests/CalendarVisibilityTests.swift
@@ -351,6 +357,12 @@ run_suite tour-controller \
 run_suite recent-search-ring \
   Sources/Passband/Lib/RecentSearchRing.swift \
   Tests/RecentSearchRingTests.swift
+
+run_suite search-preview \
+  Sources/Passband/Model/SubjectText.swift \
+  Sources/Passband/Model/WireTypes.swift \
+  Sources/Passband/Lib/SearchPreview.swift \
+  Tests/SearchPreviewTests.swift
 
 # Field-scoped corrections must preserve overlapping destinations and keep
 # authentication kinds separate from external access restrictions.

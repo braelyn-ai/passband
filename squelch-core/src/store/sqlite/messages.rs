@@ -698,11 +698,69 @@ impl SqliteStore {
     }
 
     pub(super) fn ingest_message(&self, triaged: &TriagedMessage) -> Result<i64> {
+        self.ingest_message_inner(triaged, None)
+            .map(|id| id.expect("a plain ingest never refuses"))
+    }
+
+    /// See [`crate::store::Store::ingest_message_fresh`].
+    pub(super) fn ingest_message_fresh(
+        &self,
+        triaged: &TriagedMessage,
+        scope: HealScope,
+    ) -> Result<Option<i64>> {
+        self.ingest_message_inner(triaged, Some(scope))
+    }
+
+    /// The one ingest write. `heal` is the blank-body heal's flavour: refuse
+    /// anything but a live, normal, non-spam row the store already holds, drop
+    /// the stale vector, leave the unsubscribe ledger alone, and queue the
+    /// agent job the scope asks for rather than the one the sync origin would.
+    /// Everything else — the body replacement, the content-revision bump and
+    /// the access reset that follows it — is what a re-ingest already does.
+    fn ingest_message_inner(
+        &self,
+        triaged: &TriagedMessage,
+        heal: Option<HealScope>,
+    ) -> Result<Option<i64>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
+        // 0. HEAL PRE-CHECK, on the LIVE row inside the transaction. The sweep
+        //    snapshotted its candidates minutes or hours ago; the on-demand spam
+        //    walk or a human seal may have ruled on the row since, and either
+        //    outranks a re-read. `is_spam` is sticky-to-zero in the upsert
+        //    below (a sighting outside SPAM clears it), so a fabricated
+        //    `is_spam: false` from the sweep would otherwise flip a real
+        //    verdict back — and put a spam body in front of a model.
+        if heal.is_some() {
+            let live: Option<(i64, i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT m.id, m.is_spam, t.sensitivity
+                     FROM messages m
+                     LEFT JOIN triage t ON t.message_id = m.id
+                     WHERE m.account_id = ?1 AND m.gmail_msg_id = ?2",
+                    params![triaged.message.account_id, triaged.message.gmail_msg_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            match live {
+                Some((_, 0, Some(sens))) if sens == "normal" => {}
+                _ => return Ok(None),
+            }
+        }
+
         // 1. Upsert the message row (+ FTS).
         let id = upsert_message_conn(&tx, &triaged.message)?;
+
+        // 1a. HEAL: the vector was computed from the text the row had, which
+        //     was the subject alone; drop it so the vector backfill re-embeds
+        //     from the real text, batched and throttled, off this path.
+        if heal.is_some() {
+            tx.execute(
+                "DELETE FROM message_vecs WHERE message_id = ?1",
+                params![id],
+            )?;
+        }
 
         // 1b. Contacts from Sent-mail To/Cc, in the SAME transaction.
         seed_contacts_conn(
@@ -732,7 +790,9 @@ impl SqliteStore {
         //     unsubscribed from, past the 72h grace, bumps that sender's
         //     violation_count — in the SAME transaction as the message insert, so
         //     the ledger cannot drift from the mail that drives it.
-        if !triaged.message.is_sent {
+        //     NOT on a heal: the message was counted when it arrived, and the
+        //     bump is a blind `+ 1` with no idempotency key.
+        if !triaged.message.is_sent && heal.is_none() {
             bump_unsub_violation_conn(
                 &tx,
                 triaged.message.account_id,
@@ -990,20 +1050,29 @@ impl SqliteStore {
         //    guards sealed parents. Replaces prior rows so re-ingest is
         //    idempotent; over-cap parts store a NULL blob.
         insert_attachments_conn(&tx, triaged.message.account_id, id, &triaged.attachments)?;
+        // 8. THE AGENT'S BOOKKEEPING, last, over the row as it now stands: it
+        //    re-reads the message, and a changed content snapshot is what
+        //    advances the revision and queues the work. The trigger names the
+        //    reason. A heal is neither an arrival nor a backfill: `heal` queues
+        //    a background investigation of the re-read row, and the text-only
+        //    scope queues an access reassessment alone (`source_access` is the
+        //    trigger the store already resolves to an `access` job).
+        let trigger = match heal {
+            None if triaged.foreground_triage => "ingest",
+            None => "backfill",
+            Some(HealScope::TextAndTriage) => "heal",
+            Some(HealScope::Text) => "source_access",
+        };
         super::agent_triage::enqueue_agent_triage_conn(
             &tx,
             triaged.message.account_id,
             id,
-            if triaged.foreground_triage {
-                "ingest"
-            } else {
-                "backfill"
-            },
+            trigger,
             triaged.notify_eligible_at.is_some(),
         )?;
 
         tx.commit()?;
-        Ok(id)
+        Ok(Some(id))
     }
 
     pub(super) fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool> {
@@ -1220,6 +1289,62 @@ impl SqliteStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    /// See [`crate::store::Store::blank_body_messages`].
+    pub(super) fn blank_body_messages(
+        &self,
+        account_id: AccountId,
+        before_id: i64,
+        limit: u32,
+    ) -> Result<crate::store::BlankBodyScan> {
+        let conn = self.lock()?;
+        // `body_html IS NOT NULL` is the only shape this heal can recover — a
+        // plain-text-only message with nothing in it has nothing to flatten —
+        // and it is a column test, so it bounds the read to HTML mail without
+        // re-expressing the blankness predicate. Bodies are streamed one row
+        // at a time and judged in Rust; only the blank ones are kept.
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.gmail_msg_id, m.received_at, m.body
+             FROM messages m
+             JOIN triage t ON t.message_id = m.id
+             WHERE m.account_id = ?1
+               AND m.id < ?2
+               AND m.body_html IS NOT NULL
+               AND m.is_sent = 0
+               AND m.is_spam = 0
+               AND t.sensitivity = 'normal'
+             ORDER BY m.id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account_id, before_id, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                dt(r, 2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut scan = crate::store::BlankBodyScan::default();
+        let mut seen = 0u32;
+        let mut last_id = None;
+        for row in rows {
+            let (message_id, gmail_msg_id, received_at, body) = row?;
+            seen += 1;
+            last_id = Some(message_id);
+            // A NULL body is nothing to read, the same as a blank one.
+            if crate::triage::text::is_blank(body.as_deref().unwrap_or("")) {
+                scan.candidates.push(crate::store::BlankBodyMessage {
+                    message_id,
+                    gmail_msg_id,
+                    received_at,
+                });
+            }
+        }
+        // A short chunk means the scan reached the oldest row; a full one may
+        // have more below it, and the next chunk starts under the last id seen.
+        scan.next_before_id = if seen < limit { None } else { last_id };
+        Ok(scan)
     }
 
     pub(super) fn set_message_to_addrs(

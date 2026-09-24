@@ -88,6 +88,11 @@ enum DeeperSearchPolicy {
         return .start(trigger: trigger)
     }
 
+    /// Explicit requests do not need a classifier verdict or fetched results.
+    static func canRequest(query: String, choice: DeeperSearchChoice, running: Bool) -> Bool {
+        choice != .off && !running && !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// THE PICKER ITSELF, MOVED, under a panel that may have a lane running.
     ///
     /// This is what makes `off` mean what its own blurb promises ("No model

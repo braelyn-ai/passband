@@ -722,6 +722,17 @@ struct UnsubscribeRecord: Codable, Sendable, Hashable, Identifiable {
 // MARK: - search / audit / stats
 
 struct SearchHit: Codable, Sendable, Identifiable, Hashable {
+    // Prepared once at ingestion; never decoded from or sent over the wire.
+    var displaySnippet: String? = nil
+    enum CodingKeys: String, CodingKey {
+        case is_done, subject_matches, snippet_matches, id, thread_id
+        case from_addr, from_name, subject, received_at, snippet, legs
+    }
+
+    // Optional for compatibility with older daemons: unknown is not unfinished.
+    var is_done: Bool? = nil
+    var subject_matches: [String]? = nil
+    var snippet_matches: [String]? = nil
     var id: Int
     var thread_id: String
     var from_addr: String

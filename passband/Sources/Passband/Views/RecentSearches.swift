@@ -31,7 +31,6 @@ struct RecentSearches: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
-            header
             ForEach(Array(queries.enumerated()), id: \.offset) { i, query in
                 Button {
                     onRun(query)
@@ -41,14 +40,14 @@ struct RecentSearches: View {
                         // markup — the same rule the hit rows follow, and this
                         // string has been round-tripped through UserDefaults.
                         Text(query)
-                            .font(.system(size: 12))
+                            .font(Typo.row)
                             .foregroundStyle(i == armed ? Palette.ink : Palette.inkDim)
                             .lineLimit(1)
                             .truncationMode(.middle)
                         Spacer(minLength: 8)
                     }
                     .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
+                    .padding(.vertical, 7)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                 }
@@ -58,40 +57,12 @@ struct RecentSearches: View {
                         .fill(i == armed ? Palette.accentSoft : .clear)
                 )
             }
-            HStack(spacing: 4) {
-                Kbd("↑↓")
-                Text("pick ·").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                Kbd("enter")
-                Text("search").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-            }
-            .padding(.horizontal, 9)
-            .padding(.top, 5)
         }
         .padding(4)
-    }
-
-    private var header: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "clock.arrow.circlepath")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Palette.inkFaintest)
-            Text("recent")
-                .font(Typo.sectionLabel)
-                .foregroundStyle(Palette.inkFaint)
-                .textCase(.uppercase)
-            Spacer(minLength: 8)
-            // No confirmation: there is nothing here to lose that a search does
-            // not put back, and a modal over ten strings would be heavier than
-            // the thing it guards.
-            Button(action: onClear) {
-                Text("clear")
-                    .font(Typo.micro)
-                    .foregroundStyle(Palette.inkFaintest)
-            }
-            .buttonStyle(.plain)
-            .help("Forget these searches")
+        .padding(.top, 8)
+        .contextMenu {
+            Button("Clear recent searches", action: onClear)
         }
-        .padding(.horizontal, 9)
-        .padding(.bottom, 4)
+        .accessibilityLabel("Recent searches")
     }
 }

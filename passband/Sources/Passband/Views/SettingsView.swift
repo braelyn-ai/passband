@@ -844,7 +844,7 @@ struct SearchSection: View {
         SectionCard(label: "Search") {
             InlineRow(key: "order") { SearchSortPicker() }
             SettingsHint(
-                "Recent ranks newer mail higher when two matches are close, which is usually the one you meant. Best match ignores the date and ranks on the words alone, for a thread you can quote but cannot place. Either way the search itself is unchanged: this is the order results come back in, not which mail is found."
+                "Relevance + recency favors newer mail when matches are close. Best match ranks on the words alone. In the search panel, unfinished mail comes first, and this setting orders results within each status group."
             )
         }
     }

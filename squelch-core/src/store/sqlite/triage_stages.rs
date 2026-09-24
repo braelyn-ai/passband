@@ -200,6 +200,18 @@ fn list_usage_category(
     Ok(rows)
 }
 
+// Keep the time-window range as the outer loop. Each matching request makes an
+// indexed equality probe into jobs, including the computed trigger value.
+pub(super) const RETRIAGE_PROGRESS_SQL: &str =
+    "SELECT COUNT(*),COALESCE(SUM(CASE WHEN j.state IN ('completed','failed')
+                 THEN 1 ELSE 0 END),0),MIN(t.retriage_at)
+             FROM triage t INDEXED BY idx_triage_retriage_window
+             CROSS JOIN agent_triage_jobs j INDEXED BY idx_agent_jobs_manual_progress
+               ON j.account_id=t.account_id AND j.message_id=t.message_id
+              AND j.trigger='manual:' || t.retriage_at
+              AND j.kind IN ('triage','access')
+             WHERE t.account_id=?1 AND t.retriage_at>=?2";
+
 impl SqliteStore {
     pub(super) fn extract_queue(
         &self,
@@ -373,17 +385,10 @@ impl SqliteStore {
     pub(super) fn retriage_progress(&self, account_id: AccountId) -> Result<RetriageProgress> {
         let conn = self.lock()?;
         let since = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
-        let (total, done, started_at): (i64, i64, Option<String>) = conn.query_row(
-            "SELECT COUNT(*),COALESCE(SUM(CASE WHEN j.state IN ('completed','failed')
-                 THEN 1 ELSE 0 END),0),MIN(t.retriage_at)
-             FROM triage t JOIN agent_triage_jobs j
-               ON j.account_id=t.account_id AND j.message_id=t.message_id
-              AND j.trigger='manual:' || t.retriage_at
-              AND j.kind IN ('triage','access')
-             WHERE t.account_id=?1 AND t.retriage_at>=?2",
-            params![account_id, since],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
+        let (total, done, started_at): (i64, i64, Option<String>) =
+            conn.query_row(RETRIAGE_PROGRESS_SQL, params![account_id, since], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
         Ok(RetriageProgress {
             total,
             done,

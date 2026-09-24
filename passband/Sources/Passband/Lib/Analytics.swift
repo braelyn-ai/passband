@@ -175,7 +175,7 @@ enum Analytics {
             // search lane (SearchIntent.Trigger). The query itself is the
             // reader's mail and goes nowhere near this event; these two say
             // only which RULE fired.
-            "question", "no_strict_hits",
+            "question", "no_strict_hits", "requested",
             // assistant_asked transports
             "relay", "byok",
             // invite_sent sources — where the share sheet was raised from

@@ -10,32 +10,14 @@ use std::collections::{HashMap, HashSet};
 use zerocopy::AsBytes;
 
 /// THE FTS5 MATCH WINDOW over the body column (column 1): up to 24 tokens
-/// around the matched terms, `…` where the window jumps a gap. No markup: the
-/// client paints highlights itself rather than decoding markup we invented.
+/// around the matched terms, `…` where the window jumps a gap. Internal markers
+/// become plain text plus matched surface forms before leaving the store.
 ///
-/// Used where the query has ALREADY established that the body matched, which
-/// on this leg means a body-scoped MATCH (`body : (...)`). Then a returned row
-/// is the proof and the window needs no probe.
-const BODY_WINDOW: &str = "snippet(messages_fts, 1, '', '', '…', 24)";
-
-/// [`BODY_WINDOW`] with a did-the-body-match PROBE in the open marker slot.
-///
-/// `snippet()` on a column the terms did not hit returns that column's head,
-/// which is indistinguishable from a real window by content alone, so a
-/// subject-only hit would silently swap the curated stored snippet for the raw
-/// head of the body. The marker says which happened, and is stripped before
-/// anything leaves the store.
-///
-/// IT IS A HEURISTIC, NOT A GUARANTEE. `messages.body` is flattened
-/// sender-controlled text and nothing strips C0 controls at ingest, so a sender
-/// who plants U+0001 in their own body makes a subject-only hit on their own
-/// mail report a window. The consequence is that the reader sees the head of
-/// that sender's body instead of the head of that sender's stored snippet, on
-/// their own authed door: cosmetic, and self-inflicted by the one party it
-/// affects. The path that could not tolerate even that ([`SqliteStore::fts_snippet`],
-/// which runs for hits the keyword leg never produced) asks the question in SQL
-/// instead; this one cannot, because its MATCH has to span subject OR body.
-const BODY_WINDOW_PROBED: &str = "snippet(messages_fts, 1, char(1), '', '…', 24)";
+/// A column without matches yields its head. Keyword mapping uses the markers
+/// to keep the stored snippet in that case; a sender-supplied control character
+/// can fool this cosmetic check. Recall snippets establish body membership in
+/// SQL before replacing the stored snippet.
+const BODY_WINDOW: &str = "snippet(messages_fts, 1, char(1), char(2), '…', 24)";
 
 /// THE RELEVANCE SCORE for every keyword-leg query: bm25 with the SUBJECT
 /// weighted four times the body.
@@ -52,7 +34,7 @@ const BODY_WINDOW_PROBED: &str = "snippet(messages_fts, 1, char(1), '', '…', 2
 /// is the relevance and every ORDER BY here reads biggest-first.
 const BM25: &str = "bm25(messages_fts, 4.0, 1.0)";
 
-/// The marker `BODY_WINDOW_PROBED` plants on each matched term.
+/// The marker `BODY_WINDOW` plants on each matched term.
 const SNIPPET_MARK: char = '\u{1}';
 
 /// HOW FAR A DIAGNOSTIC COUNT COUNTS before it answers "that many, at least".
@@ -103,15 +85,39 @@ pub(super) fn fts_count_sql(include_sent: bool) -> String {
     )
 }
 
-/// A `BODY_WINDOW_PROBED` value is a real match window only if the marker is
-/// present — otherwise the terms hit the subject (or nothing) and the caller
-/// should keep the stored snippet.
+/// Extract matched surface forms from the internal FTS highlight markers.
+fn matched_words(raw: &str) -> Vec<String> {
+    raw.split(SNIPPET_MARK)
+        .skip(1)
+        .filter_map(|part| {
+            let (word, _) = part.split_once('\u{2}')?;
+            (!word.is_empty()).then(|| word.to_string())
+        })
+        .collect()
+}
+
 fn body_window(raw: Option<String>) -> Option<String> {
     let raw = raw?;
     if raw.contains(SNIPPET_MARK) {
-        Some(raw.replace(SNIPPET_MARK, ""))
+        Some(raw.replace([SNIPPET_MARK, '\u{2}'], ""))
     } else {
         None
+    }
+}
+
+struct MatchExcerpt {
+    snippet: Option<String>,
+    snippet_matches: Vec<String>,
+    subject_matches: Vec<String>,
+}
+
+impl MatchExcerpt {
+    fn apply(self, hit: &mut SearchHit) {
+        if let Some(snippet) = self.snippet {
+            hit.snippet = snippet;
+        }
+        hit.snippet_matches = self.snippet_matches;
+        hit.subject_matches = self.subject_matches;
     }
 }
 
@@ -125,15 +131,21 @@ fn map_search_hit(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
         subject: r.get(4)?,
         received_at: dt(r, 5)?,
         snippet: r.get(6)?,
+        is_done: r.get(7)?,
+        subject_matches: Vec::new(),
+        snippet_matches: Vec::new(),
     })
 }
 
-/// [`map_search_hit`] plus a trailing `BODY_WINDOW_PROBED` column (7): the window
-/// replaces the stored snippet only when the body really matched.
+/// Envelope, status, subject highlights, then the body match window.
+/// Keep the stored snippet unless the returned body window carries a marker.
 fn map_search_hit_with_window(r: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
     let mut hit = map_search_hit(r)?;
-    if let Some(window) = body_window(r.get::<_, Option<String>>(7)?) {
+    hit.subject_matches = matched_words(&r.get::<_, String>(8)?);
+    let raw: Option<String> = r.get(9)?;
+    if let Some(window) = body_window(raw.clone()) {
         hit.snippet = window;
+        hit.snippet_matches = raw.as_deref().map(matched_words).unwrap_or_default();
     }
     Ok(hit)
 }
@@ -160,6 +172,10 @@ fn escape_like(value: &str) -> String {
 /// Shared by the keyword path and the filter-only listing so the two cannot
 /// drift apart in what `from:2026-01-01` means.
 fn push_filter_clauses(sql: &mut String, args: &mut Vec<Value>, filter: &SearchFilter) {
+    if let Some(done) = filter.done {
+        sql.push_str(" AND (COALESCE(t.status, 'new') = 'done') = ?");
+        args.push(Value::Integer(i64::from(done)));
+    }
     if let Some(from) = &filter.from {
         // Substring on EITHER sender field: `from:jane` should find the address
         // and the display name. SQLite's LIKE is already ASCII-case-insensitive;
@@ -282,8 +298,10 @@ impl SqliteStore {
             }
             let hit = conn
                 .query_row(
-                    "SELECT id,thread_id,from_addr,from_name,subject,received_at,snippet
-                 FROM messages WHERE account_id=?1 AND id=?2 AND is_spam=0",
+                    "SELECT m.id,m.thread_id,m.from_addr,m.from_name,m.subject,m.received_at,m.snippet,
+                        (COALESCE(t.status, 'new') = 'done')
+                 FROM messages m LEFT JOIN triage t ON t.message_id=m.id
+                 WHERE m.account_id=?1 AND m.id=?2 AND m.is_spam=0",
                     params![account_id, candidate.id],
                     map_search_hit,
                 )
@@ -487,7 +505,7 @@ impl SqliteStore {
         want_windows: bool,
         k: usize,
     ) -> Result<(Vec<LeggedHit>, bool)> {
-        self.hybrid_search_legs_windowed(
+        self.hybrid_search_legs_ordered(
             account_id,
             query_text,
             filter,
@@ -498,13 +516,8 @@ impl SqliteStore {
         )
     }
 
-    /// Hybrid recall with match snippets only for the specified range of
-    /// filtered results. Ranking, filtering, provenance and window fullness are
-    /// identical to `hybrid_search_legs`; callers still paginate the returned
-    /// hits. Restricting snippet work avoids probing candidates outside the
-    /// page while keeping hydration and snippets under the same store lock.
     #[allow(clippy::too_many_arguments)]
-    pub fn hybrid_search_legs_windowed(
+    pub fn hybrid_search_legs_ordered(
         &self,
         account_id: AccountId,
         query_text: &str,
@@ -554,28 +567,23 @@ impl SqliteStore {
         let conn = self.lock()?;
         let mut out = Vec::with_capacity(ranked.len());
         for c in ranked {
-            if let Some(mut hit) = self.search_hit_by_id(&conn, account_id, c.id)? {
+            if let Some(hit) = self.search_hit_by_id(&conn, account_id, c.id)? {
                 if !filter.matches(&hit) {
                     continue;
-                }
-                // Every hit on the requested page is asked for a window, not
-                // just the ones the keyword leg produced. A vector hit surfaced
-                // by meaning may carry one of the reader's words deep in its
-                // body, and the sentence around that word is the reason to
-                // believe the result; the stored head is what a hit gets when
-                // the body holds no term at all. The ANY expression is what is
-                // asked, because a strict window would find nothing in exactly
-                // the mail this whole wave exists for.
-                if snippet_range.contains(&out.len())
-                    && let Some(window) = self.fts_snippet(&conn, account_id, c.id, &fts.any)?
-                {
-                    hit.snippet = window;
                 }
                 out.push(LeggedHit {
                     keyword: from_fts.contains(&c.id),
                     vector: from_vec.contains(&c.id),
                     hit,
                 });
+            }
+        }
+        filter.order_hits(&mut out, |item| item.hit.is_done);
+        for (index, item) in out.iter_mut().enumerate() {
+            if snippet_range.contains(&index)
+                && let Some(window) = self.fts_snippet(&conn, account_id, item.hit.id, &fts.any)?
+            {
+                window.apply(&mut item.hit);
             }
         }
         Ok((out, window_full))
@@ -589,13 +597,9 @@ impl SqliteStore {
     /// snippet, so a bad query degrades the preview instead of failing the
     /// search.
     ///
-    /// THE MATCH IS SCOPED TO THE BODY COLUMN (`body : (...)`), which is what
-    /// makes "the terms hit the subject rather than the body" an answer SQLite
-    /// gives rather than one we infer. Its sibling on the keyword page has to
-    /// infer it from a marker planted in the snippet, because that query's
-    /// MATCH must span subject OR body; here there is one message and one
-    /// question, so the column filter can ask it outright and a sender cannot
-    /// forge the answer by planting the marker in their own body.
+    /// The body-scoped subquery distinguishes body evidence from subject-only
+    /// hits, even if a sender puts our cosmetic marker in their own body.
+    /// Subject-only hits keep their stored snippet and report subject matches.
     ///
     /// `prepare_cached`, and the connection comes from the caller: this runs
     /// once per hydrated hit, up to `recall_k` (600) of them for a deep page.
@@ -608,12 +612,15 @@ impl SqliteStore {
         account_id: AccountId,
         message_id: i64,
         match_expr: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<MatchExcerpt>> {
         if match_expr.is_empty() {
             return Ok(None);
         }
         let sql = format!(
-            "SELECT {BODY_WINDOW}
+            "SELECT CASE WHEN f.rowid IN (
+                 SELECT rowid FROM messages_fts WHERE rowid = ?1 AND messages_fts MATCH ?4
+             ) THEN {BODY_WINDOW} END,
+             highlight(messages_fts, 0, char(1), char(2))
              FROM messages_fts f
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
@@ -629,11 +636,18 @@ impl SqliteStore {
         // A syntactically-invalid MATCH errors at step time, not prepare time;
         // both collapse to "no window".
         let scoped = format!("body : ({match_expr})");
-        stmt.query_row(params![message_id, account_id, scoped], |r| {
-            r.get::<_, Option<String>>(0)
+        stmt.query_row(params![message_id, account_id, match_expr, scoped], |r| {
+            let body: Option<String> = r.get(0)?;
+            let subject: String = r.get(1)?;
+            Ok(MatchExcerpt {
+                snippet: body
+                    .as_deref()
+                    .map(|raw| raw.replace([SNIPPET_MARK, '\u{2}'], "")),
+                snippet_matches: body.as_deref().map(matched_words).unwrap_or_default(),
+                subject_matches: matched_words(&subject),
+            })
         })
         .optional()
-        .map(|raw| raw.flatten().filter(|w| !w.is_empty()))
         .or(Ok(None))
     }
 
@@ -682,11 +696,12 @@ impl SqliteStore {
                 && filter.matches(&hit)
             {
                 if let Some(window) = self.fts_snippet(&conn, account_id, c.id, &fts.any)? {
-                    hit.snippet = window;
+                    window.apply(&mut hit);
                 }
                 out.push(hit);
             }
         }
+        filter.order_hits(&mut out, |hit| hit.is_done);
         Ok((out, window_full))
     }
 
@@ -803,7 +818,7 @@ impl SqliteStore {
         let row = conn
             .prepare_cached(
                 "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
-                        m.received_at, m.snippet
+                        m.received_at, m.snippet, (COALESCE(t.status, 'new') = 'done')
                  FROM messages m
                  LEFT JOIN triage t ON t.message_id = m.id
                  WHERE m.account_id = ?1 AND m.id = ?2
@@ -864,12 +879,12 @@ impl SqliteStore {
         // snippet.
         let mut sql = format!(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
-                    m.received_at, m.snippet, {BODY_WINDOW_PROBED}
+                    m.received_at, m.snippet, (COALESCE(t.status, 'new') = 'done'),
+                    highlight(messages_fts, 0, char(1), char(2)), {BODY_WINDOW}
              FROM messages_fts f
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND m.is_sent = 0
                AND m.is_spam = 0
                AND messages_fts MATCH ?"
         );
@@ -883,6 +898,9 @@ impl SqliteStore {
                      SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)",
             );
             args.push(Value::Text(exclude.to_string()));
+        }
+        if !filter.include_sent {
+            sql.push_str(" AND m.is_sent = 0");
         }
         push_filter_clauses(&mut sql, &mut args, filter);
         // THE SORT KEY. Both branches are BIGGEST FIRST — bm25 is NEGATIVE
@@ -954,11 +972,13 @@ impl SqliteStore {
              CROSS JOIN messages m ON m.id = f.rowid
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND m.is_sent = 0
                AND m.is_spam = 0
                AND messages_fts MATCH ?",
         );
         let mut args = vec![Value::Integer(account_id), Value::Text(expr.to_string())];
+        if !filter.include_sent {
+            sql.push_str(" AND m.is_sent = 0");
+        }
         push_filter_clauses(&mut sql, &mut args, filter);
         let mut stmt = conn.prepare(&sql)?;
         // THIS ONE PROPAGATES, unlike every sibling MATCH on this leg, and the
@@ -1011,10 +1031,75 @@ impl SqliteStore {
             .0)
     }
 
+    /// Desktop search: status groups precede the strict/partial seam and
+    /// LIMIT/OFFSET. Corpus scope comes from the same filter as diagnostics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_unfinished_first(
+        &self,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchHit>> {
+        let conn = self.lock()?;
+        let fts = FtsQuery::build(text, partial);
+        // Validate the caller's filter before adding our internal status predicate.
+        if fts.is_empty() && filter.is_empty() {
+            return self
+                .search_filtered_locked(
+                    &conn, account_id, text, filter, sort, partial, limit, offset,
+                )
+                .map(|(hits, _)| hits);
+        }
+        let mut group = filter.clone();
+        group.done = Some(false);
+        let unfinished = if offset == 0 {
+            0 // No seam count is needed to fill the first page.
+        } else if fts.is_empty() {
+            let mut sql = String::from(
+                "SELECT COUNT(*) FROM messages m LEFT JOIN triage t ON t.message_id = m.id WHERE m.account_id = ? AND m.is_spam = 0",
+            );
+            let mut args = vec![Value::Integer(account_id)];
+            if !group.include_sent {
+                sql.push_str(" AND m.is_sent = 0");
+            }
+            push_filter_clauses(&mut sql, &mut args, &group);
+            conn.query_row(&sql, params_from_iter(args), |r| r.get::<_, u32>(0))?
+        } else {
+            self.keyword_total(&conn, account_id, &fts.any, &group)?
+        };
+        let mut out = self
+            .search_filtered_locked(
+                &conn, account_id, text, &group, sort, partial, limit, offset,
+            )?
+            .0;
+        let owed = limit.saturating_sub(out.len() as u32);
+        if owed > 0 {
+            group.done = Some(true);
+            out.extend(
+                self.search_filtered_locked(
+                    &conn,
+                    account_id,
+                    text,
+                    &group,
+                    sort,
+                    partial,
+                    owed,
+                    offset.saturating_sub(unfinished),
+                )?
+                .0,
+            );
+        }
+        Ok(out)
+    }
+
     /// [`search_filtered`](Self::search_filtered) plus THE STRICT COUNT IT
     /// ALREADY TOOK, for a caller that would otherwise take it again.
     ///
-    /// The seam between the strict page and the any-only one is a `COUNT(*)`
+    /// Beyond page zero, the seam between strict and any-only is a `COUNT(*)`
     /// over the strict expression (see [`keyword_total`](Self::keyword_total)),
     /// and the diagnostics beside the page report that same number as
     /// `strict_hits`. Counting it twice per request is one full doclist walk
@@ -1043,6 +1128,24 @@ impl SqliteStore {
         limit: u32,
         offset: u32,
     ) -> Result<(Vec<SearchHit>, Option<u32>)> {
+        let conn = self.lock()?;
+        self.search_filtered_locked(
+            &conn, account_id, text, filter, sort, partial, limit, offset,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_filtered_locked(
+        &self,
+        conn: &Connection,
+        account_id: AccountId,
+        text: &str,
+        filter: &SearchFilter,
+        sort: SearchSort,
+        partial: bool,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(Vec<SearchHit>, Option<u32>)> {
         let fts = FtsQuery::build(text, partial);
         if fts.is_empty() {
             // No text AND no filter is not a search — it is "page me the whole
@@ -1060,10 +1163,9 @@ impl SqliteStore {
             }
             // No MATCH ran, so there is no strict set and nothing to report a
             // count of.
-            let hits = self.filter_only_listing(account_id, filter, limit, offset)?;
+            let hits = self.filter_only_listing(conn, account_id, filter, limit, offset)?;
             return Ok((hits, None));
         }
-        let conn = self.lock()?;
         // ONE TERM means strict and any are the same expression, so there is no
         // any-only pass to run and no count to take: the strict page IS the
         // page. Skipping both is not just an optimisation — a `NOT IN` against
@@ -1071,7 +1173,7 @@ impl SqliteStore {
         // more FTS scans to learn that is silly.
         if fts.terms.len() == 1 {
             let hits = self.keyword_page(
-                &conn,
+                conn,
                 account_id,
                 &fts.strict,
                 None,
@@ -1082,11 +1184,30 @@ impl SqliteStore {
             )?;
             return Ok((hits, None));
         }
-        let strict_total = self.keyword_total(&conn, account_id, &fts.strict, filter)?;
+        if offset == 0 {
+            let mut hits =
+                self.keyword_page(conn, account_id, &fts.strict, None, filter, sort, limit, 0)?;
+            if hits.len() == limit as usize {
+                return Ok((hits, None));
+            }
+            let strict_total = hits.len() as u32;
+            hits.extend(self.keyword_page(
+                conn,
+                account_id,
+                &fts.any,
+                Some(&fts.strict),
+                filter,
+                sort,
+                limit - strict_total,
+                0,
+            )?);
+            return Ok((hits, Some(strict_total)));
+        }
+        let strict_total = self.keyword_total(conn, account_id, &fts.strict, filter)?;
         let mut out = Vec::new();
         if offset < strict_total {
             out = self.keyword_page(
-                &conn,
+                conn,
                 account_id,
                 &fts.strict,
                 None,
@@ -1104,7 +1225,7 @@ impl SqliteStore {
         if owed > 0 {
             let any_offset = offset.saturating_sub(strict_total);
             let rest = self.keyword_page(
-                &conn,
+                conn,
                 account_id,
                 &fts.any,
                 Some(&fts.strict),
@@ -1255,22 +1376,24 @@ impl SqliteStore {
     /// pending and restricted inbound messages remain readable.
     fn filter_only_listing(
         &self,
+        conn: &Connection,
         account_id: AccountId,
         filter: &SearchFilter,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<SearchHit>> {
-        let conn = self.lock()?;
         let mut sql = String::from(
             "SELECT m.id, m.thread_id, m.from_addr, m.from_name, m.subject,
-                    m.received_at, m.snippet
+                    m.received_at, m.snippet, (COALESCE(t.status, 'new') = 'done')
              FROM messages m
              LEFT JOIN triage t ON t.message_id = m.id
              WHERE m.account_id = ?
-               AND m.is_sent = 0
                AND m.is_spam = 0",
         );
         let mut args = vec![Value::Integer(account_id)];
+        if !filter.include_sent {
+            sql.push_str(" AND m.is_sent = 0");
+        }
         push_filter_clauses(&mut sql, &mut args, filter);
         // The id tiebreaker matters: Date headers are second-resolution, so a
         // list blast ties routinely, and OFFSET over an unstable sort drops and

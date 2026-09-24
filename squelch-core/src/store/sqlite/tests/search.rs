@@ -1121,7 +1121,7 @@ fn hybrid_snippet_range_counts_filtered_results_and_preserves_ranking() {
     assert!(full);
     for range in [0..1, 1..3, 3..8, 0..0, 8..10] {
         let (page, page_full) = store
-            .hybrid_search_legs_windowed(
+            .hybrid_search_legs_ordered(
                 acct,
                 "pangolin",
                 &filter,
@@ -2065,6 +2065,198 @@ fn the_fts_table_drives_every_join() {
 }
 
 #[test]
+fn unfinished_search_groups_before_strict_matches_and_page_boundaries() {
+    let (store, acct) = store();
+    let done_strict = triaged(acct, "done-strict", "done-strict")
+        .subject("anjuna tickets")
+        .seed(&store);
+    let open_partial = triaged(acct, "open-partial", "open-partial")
+        .subject("tickets")
+        .seed(&store);
+    let open_strict = triaged(acct, "open-strict", "open-strict")
+        .subject("anjuna tickets")
+        .seed(&store);
+    let done_partial = triaged(acct, "done-partial", "done-partial")
+        .subject("tickets")
+        .seed(&store);
+    for id in [done_strict, done_partial] {
+        store
+            .set_attention_status(acct, id, AttentionStatus::Done)
+            .unwrap();
+    }
+    let other = store.ensure_account("other-search@example.com").unwrap();
+    triaged(other, "sealed", "sealed")
+        .subject("anjuna tickets")
+        .sealed(SealedKind::Otp)
+        .seed(&store);
+    for sort in [SearchSort::Recent, SearchSort::BestMatch] {
+        let full = store
+            .search_unfinished_first(
+                acct,
+                "anjuna tickets",
+                &SearchFilter::default(),
+                sort,
+                true,
+                50,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            full.iter().map(|h| h.id).collect::<Vec<_>>(),
+            vec![open_strict, open_partial, done_strict, done_partial]
+        );
+        assert_eq!(
+            full.iter().map(|h| h.is_done).collect::<Vec<_>>(),
+            vec![false, false, true, true]
+        );
+        for size in [1, 2, 3] {
+            let mut paged = Vec::new();
+            for offset in (0..6).step_by(size as usize) {
+                paged.extend(
+                    store
+                        .search_unfinished_first(
+                            acct,
+                            "anjuna tickets",
+                            &SearchFilter::default(),
+                            sort,
+                            true,
+                            size,
+                            offset,
+                        )
+                        .unwrap(),
+                );
+            }
+            assert_eq!(
+                paged.iter().map(|h| h.id).collect::<Vec<_>>(),
+                full.iter().map(|h| h.id).collect::<Vec<_>>()
+            );
+        }
+    }
+    // Opt-in: ordinary search still places strict matches before partial ones.
+    let ordinary = store.search(acct, "anjuna tickets", 50, 0).unwrap();
+    assert!(
+        ordinary.iter().position(|h| h.id == done_strict).unwrap()
+            < ordinary.iter().position(|h| h.id == open_partial).unwrap()
+    );
+}
+
+#[test]
+fn unfinished_filter_listing_includes_untriaged_and_tracks_status_changes() {
+    let (store, acct) = store();
+    let done = triaged(acct, "done", "done").seed(&store);
+    store
+        .set_attention_status(acct, done, AttentionStatus::Done)
+        .unwrap();
+    let fresh = triaged(acct, "fresh", "fresh").upsert(&store);
+    let filter = SearchFilter {
+        from: Some("alice".into()),
+        ..Default::default()
+    };
+    let page = |offset| {
+        store
+            .search_unfinished_first(acct, "", &filter, SearchSort::Recent, false, 1, offset)
+            .unwrap()
+    };
+    assert_eq!(page(0)[0].id, fresh);
+    assert!(!page(0)[0].is_done);
+    assert_eq!(page(1)[0].id, done);
+    store
+        .set_attention_status(acct, done, AttentionStatus::Open)
+        .unwrap();
+    assert!(!page(1)[0].is_done);
+}
+
+#[test]
+fn search_reports_surface_forms_for_stems_and_prefixes_without_markers() {
+    let (store, acct) = store();
+    triaged(acct, "ticket", "ticket")
+        .subject("Your tickets")
+        .body("Save the tickets to your phone")
+        .seed(&store);
+    let hits = store
+        .search_unfinished_first(
+            acct,
+            "ticket",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            false,
+            50,
+            0,
+        )
+        .unwrap();
+    assert_eq!(hits[0].subject_matches, vec!["tickets"]);
+    assert_eq!(hits[0].snippet_matches, vec!["tickets"]);
+    assert!(!hits[0].snippet.contains(['\u{1}', '\u{2}']));
+    let hits = store
+        .search_unfinished_first(
+            acct,
+            "tick",
+            &SearchFilter::default(),
+            SearchSort::Recent,
+            true,
+            50,
+            0,
+        )
+        .unwrap();
+    assert_eq!(hits[0].snippet_matches, vec!["tickets"]);
+}
+
+#[test]
+fn hybrid_unfinished_order_windows_snippets_after_the_status_partition() {
+    let embedder = Arc::new(StubEmbedder::new(VEC_DIMS));
+    let (store, acct) = store_with_embedder(embedder.clone());
+    for i in 0..8 {
+        let id = triaged(acct, &format!("status-g{i}"), &format!("status-t{i}"))
+            .subject("digest")
+            .snippet("stored head")
+            .body(DEEP_BODY)
+            .seed(&store);
+        embed_and_store(&store, &*embedder, acct, id, "digest", DEEP_BODY);
+        if i % 2 == 0 {
+            store
+                .set_attention_status(acct, id, AttentionStatus::Done)
+                .unwrap();
+        }
+    }
+    let filter = SearchFilter::default();
+    for sort in [SearchSort::Recent, SearchSort::BestMatch] {
+        let (ordinary, _) = store
+            .hybrid_search_legs_ordered(acct, "pangolin", &filter, sort, false, 0..8, 600)
+            .unwrap();
+        let mut expected: Vec<_> = ordinary.iter().collect();
+        expected.sort_by_key(|item| item.hit.is_done);
+        for range in [0..3, 3..6, 6..9] {
+            let (grouped, _) = store
+                .hybrid_search_legs_ordered(
+                    acct,
+                    "pangolin",
+                    &SearchFilter {
+                        unfinished_first: true,
+                        ..filter.clone()
+                    },
+                    sort,
+                    false,
+                    range.clone(),
+                    600,
+                )
+                .unwrap();
+            assert_eq!(
+                grouped.iter().map(|h| h.hit.id).collect::<Vec<_>>(),
+                expected.iter().map(|h| h.hit.id).collect::<Vec<_>>()
+            );
+            for (index, item) in grouped.iter().enumerate() {
+                if range.contains(&index) {
+                    assert!(item.hit.snippet.contains("pangolin"));
+                    assert!(!item.hit.snippet_matches.is_empty());
+                } else {
+                    assert_eq!(item.hit.snippet, "stored head");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn external_search_fills_limit_after_hidden_leading_results() {
     let (store, acct) = store();
     let now = Utc::now();
@@ -2091,4 +2283,72 @@ fn external_search_fills_limit_after_hidden_leading_results() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn status_grouping_validates_before_adding_internal_filters() {
+    let (store, acct) = store();
+    triaged(acct, "empty-guard", "empty-guard")
+        .subject("anything")
+        .seed(&store);
+    let scope = SearchFilter {
+        include_sent: true,
+        ..Default::default()
+    };
+    assert!(
+        store
+            .search_unfinished_first(acct, "  ", &scope, SearchSort::Recent, true, 50, 0)
+            .is_err()
+    );
+    for text in ["***", "???"] {
+        assert!(
+            store
+                .search_unfinished_first(acct, text, &scope, SearchSort::Recent, true, 50, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn first_keyword_page_only_counts_when_it_reaches_the_strict_seam() {
+    let (store, acct) = store();
+    for i in 0..4 {
+        triaged(acct, &format!("strict-{i}"), &format!("strict-{i}"))
+            .subject("anjuna tickets")
+            .seed(&store);
+    }
+    triaged(acct, "partial-count", "partial-count")
+        .subject("tickets")
+        .seed(&store);
+    let filter = SearchFilter::default();
+    let (first, count) = store
+        .search_filtered_counted(
+            acct,
+            "anjuna tickets",
+            &filter,
+            SearchSort::Recent,
+            true,
+            2,
+            0,
+        )
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(
+        count, None,
+        "a filled first page does not need an exact count"
+    );
+    let (all, count) = store
+        .search_filtered_counted(
+            acct,
+            "anjuna tickets",
+            &filter,
+            SearchSort::Recent,
+            true,
+            10,
+            0,
+        )
+        .unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(count, Some(4));
 }
