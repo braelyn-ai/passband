@@ -1073,6 +1073,49 @@ pub struct SentMissingRecipients {
     pub gmail_msg_id: String,
 }
 
+/// A stored message whose text body is BLANK TO A READER while a rendered HTML
+/// body sits beside it: the population the one-shot blank-body heal re-fetches.
+/// Carries only what the Gmail raw fetch and the re-ingest decision need. See
+/// [`Store::blank_body_messages`].
+#[derive(Debug, Clone)]
+pub struct BlankBodyMessage {
+    pub message_id: i64,
+    pub gmail_msg_id: String,
+    /// So the caller can decide, by the history window the agent cutover
+    /// itself re-triaged, whether a re-read is worth an investigation or
+    /// only the text.
+    pub received_at: DateTime<Utc>,
+}
+
+/// One chunk of the blank-body scan: the blank rows found among the `limit`
+/// newest rows below the cursor, and where the next chunk starts.
+#[derive(Debug, Clone, Default)]
+pub struct BlankBodyScan {
+    pub candidates: Vec<BlankBodyMessage>,
+    /// The id to pass back as `before_id` for the next chunk; `None` when the
+    /// scan has walked past the oldest row and there is nothing left to read.
+    pub next_before_id: Option<i64>,
+}
+
+/// How far [`Store::ingest_message_fresh`] hands a re-read row back to the
+/// agent. Under either scope the message's CONTENT REVISION advances (the
+/// stored body changed), which is what makes the external-agent access
+/// assessment it carried go back to `pending` until re-read over the real
+/// text; the two scopes differ only in which durable job the re-read queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealScope {
+    /// The text, and an ACCESS reassessment only (one small model call, the
+    /// `source_access` job). For mail past the history window: the cutover
+    /// did not investigate it either, and a background investigation of a
+    /// years-old row is model spend that produces a placement nobody asked
+    /// for. Its current decision stays whatever it was.
+    Text,
+    /// The text AND a fresh investigation: the row re-enters the agent's
+    /// background lane at its new content revision, exactly as a changed
+    /// message does, under the `heal` trigger.
+    TextAndTriage,
+}
+
 /// The squelch local store. Implemented by [`SqliteStore`].
 ///
 /// SECURITY: every method that can feed the MCP surface (`ranked_updates`,
@@ -1531,6 +1574,37 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
     /// queryable as normal mail (docs/SECURITY.md §4).
     fn ingest_message(&self, triaged: &TriagedMessage) -> Result<i64>;
 
+    /// [`Store::ingest_message`] for a message the store ALREADY HOLDS, re-read
+    /// with a body it was first stored without. Never inserts: a message the
+    /// store does not hold, or holds as spam or sealed (a live re-check inside
+    /// the transaction, so a verdict landing mid-sweep wins), is REFUSED with
+    /// `Ok(None)` and nothing is written.
+    ///
+    /// The write is the ordinary ingest transaction — the message upsert
+    /// replaces the body, and the agent bookkeeping at its end sees a changed
+    /// content snapshot, advances the row's revision, retires any job still
+    /// queued against the old content and puts external access back to
+    /// `pending` — with three differences. The stale vector is dropped so the
+    /// vector backfill re-embeds the row from its real text; the
+    /// unsubscribe-violation ledger is NOT bumped again (the message was
+    /// counted when it arrived, and the bump is a blind `+ 1`); and the job
+    /// the new revision queues is chosen by `scope` rather than by sync
+    /// origin: a `heal` investigation under [`HealScope::TextAndTriage`], an
+    /// access reassessment alone under [`HealScope::Text`]. Neither is an
+    /// arrival: the notify-eligibility stamp is preserved as stored, so a
+    /// re-read of last year's mail cannot mint a notification.
+    ///
+    /// A PERSON'S DECISIONS SURVIVE: field corrections live in their own
+    /// table keyed by message and are re-applied to whatever the next
+    /// investigation commits, and the legacy `triage` row's verdict columns
+    /// are kept by the upsert's own re-ingest guard. Nothing here touches
+    /// either.
+    fn ingest_message_fresh(
+        &self,
+        triaged: &TriagedMessage,
+        scope: HealScope,
+    ) -> Result<Option<i64>>;
+
     /// True if `addr` appears in this account's Sent-derived contacts (the
     /// "people I know" signal the sync engine feeds to Stage-1).
     fn is_known_contact(&self, account_id: AccountId, addr: &str) -> Result<bool>;
@@ -1759,6 +1833,27 @@ pub trait Store: agent_triage::AgentTriageStore + Send + Sync {
         account_id: AccountId,
         limit: u32,
     ) -> Result<Vec<SentMissingRecipients>>;
+
+    /// One chunk of the blank-body heal's queue: among the `limit` newest
+    /// inbound, non-spam, non-sealed messages with `id < before_id` that carry
+    /// a `body_html`, the ones whose stored text body is blank to a reader —
+    /// mail ingested before the body selection learned to flatten the HTML
+    /// alternative when the text/plain one is empty. Chunked so the store lock
+    /// is held per chunk, not per mailbox, and cursor-driven so an interrupted
+    /// sweep resumes where it stopped instead of re-reading everything.
+    ///
+    /// Blankness is decided by [`crate::triage::text::is_blank`] in Rust — the
+    /// function ingest and the extractor use — never by a SQL re-expression of
+    /// it: SQLite's one-argument `TRIM` strips U+0020 and nothing else, and an
+    /// "empty" text/plain part on the wire is a bare CRLF. Sent mail is left
+    /// out: squelch's own composer always writes a text part, and a sent row
+    /// re-enters no queue, so a re-read would buy nothing but a raw fetch.
+    fn blank_body_messages(
+        &self,
+        account_id: AccountId,
+        before_id: i64,
+        limit: u32,
+    ) -> Result<BlankBodyScan>;
 
     /// Set one SENT message's display recipients; `false` when no such sent row
     /// exists. `""` is a legitimate value — it records that the headers were read

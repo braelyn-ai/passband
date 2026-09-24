@@ -1432,3 +1432,383 @@ fn external_thread_read_demand_queues_bounded_legacy_access_work() {
     );
     assert_eq!(count(), 20, "readable sources never requeue");
 }
+
+// ---- blank-body heal: the fresh write and what it queues --------------------
+
+fn stored_body(store: &SqliteStore, id: i64) -> String {
+    let conn = store.lock().unwrap();
+    conn.query_row("SELECT body FROM messages WHERE id=?1", params![id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// (revision, access) of the agent's view of the row.
+fn agent_state(store: &SqliteStore, acct: AccountId, id: i64) -> (i64, String) {
+    let conn = store.lock().unwrap();
+    conn.query_row(
+        "SELECT revision, access FROM agent_message_state WHERE account_id=?1 AND message_id=?2",
+        params![acct, id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// Every durable job the row has, oldest first: (kind, trigger, input_revision, state).
+fn agent_jobs(store: &SqliteStore, acct: AccountId, id: i64) -> Vec<(String, String, i64, String)> {
+    let conn = store.lock().unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, trigger, input_revision, state FROM agent_triage_jobs
+             WHERE account_id=?1 AND message_id=?2 ORDER BY id",
+        )
+        .unwrap();
+    stmt.query_map(params![acct, id], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
+    .unwrap()
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+/// A row as the pre-fix daemon left it: blank text, a vector embedded from the
+/// subject alone, and an arrival-time notify stamp. The first arrival's job is
+/// marked completed so the row reads as one the agent already ruled on.
+fn blank_row_already_ruled_on(store: &SqliteStore, acct: AccountId, gmail: &str) -> i64 {
+    let id = triaged(acct, gmail, &format!("t-{gmail}"))
+        .from("garminservices@billing.garmin.com")
+        .subject("Your Garmin Services Bill")
+        .body("\r\n")
+        .ingest(store);
+    store
+        .upsert_message_vector(acct, id, &[0.5f32; VEC_DIMS])
+        .unwrap();
+    let conn = store.lock().unwrap();
+    conn.execute(
+        "UPDATE triage SET notify_eligible_at='2026-09-04T20:41:01+00:00' WHERE message_id=?1",
+        params![id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE agent_triage_jobs SET state='completed' WHERE account_id=?1 AND message_id=?2",
+        params![acct, id],
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(agent_state(store, acct, id), (1, "pending".to_string()));
+    id
+}
+
+#[test]
+fn ingest_message_fresh_re_reads_a_recent_row_as_a_new_content_revision() {
+    let (store, acct) = store();
+    let id = blank_row_already_ruled_on(&store, acct, "g-bill");
+    let before = agent_jobs(&store, acct, id);
+    assert_eq!(before.len(), 1, "the arrival's own job, now completed");
+
+    // The same message, re-read with its body.
+    let fresh = triaged(acct, "g-bill", "t-g-bill")
+        .from("garminservices@billing.garmin.com")
+        .subject("Your Garmin Services Bill")
+        .body("no action is required. Balance due: $14.99")
+        .build();
+    let same = store
+        .ingest_message_fresh(&fresh, HealScope::TextAndTriage)
+        .unwrap();
+    assert_eq!(same, Some(id), "the upsert lands on the existing row");
+    assert!(stored_body(&store, id).contains("Balance due"));
+
+    // The content changed, so the agent's revision moved and the external
+    // access it carried is pending again until re-read over the real text.
+    assert_eq!(agent_state(&store, acct, id), (2, "pending".to_string()));
+    // Exactly one new job: a background investigation of revision 2 under the
+    // heal's own trigger. Nothing arrival-shaped — no notification job.
+    let after = agent_jobs(&store, acct, id);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(
+        after[1],
+        ("triage".into(), "heal".into(), 2, "queued".into())
+    );
+    assert!(after.iter().all(|j| j.0 != "notification"), "{after:?}");
+    // The stale vector goes; the backfill re-embeds from the real text.
+    assert_eq!(vec_count_for(&store, id), 0);
+    assert!(
+        store
+            .messages_missing_vectors(acct, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.message_id == id)
+    );
+    // A re-read is not an arrival: the stamp the row already carried stands.
+    let stamp: Option<String> = store
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT notify_eligible_at FROM triage WHERE message_id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stamp.as_deref(), Some("2026-09-04T20:41:01+00:00"));
+}
+
+#[test]
+fn ingest_message_fresh_retires_a_job_still_queued_against_the_blank_content() {
+    // The row arrived moments ago and its investigation has not run yet: the
+    // heal's revision supersedes it, so the model never reads the blank page.
+    let (store, acct) = store();
+    let id = triaged(acct, "g-new", "t-g-new")
+        .body("\r\n")
+        .ingest(&store);
+    assert_eq!(
+        agent_jobs(&store, acct, id)[0].3,
+        "queued",
+        "the arrival's job is waiting"
+    );
+    store
+        .ingest_message_fresh(
+            &triaged(acct, "g-new", "t-g-new").body("the words").build(),
+            HealScope::TextAndTriage,
+        )
+        .unwrap()
+        .expect("a live normal row is healed");
+    let jobs = agent_jobs(&store, acct, id);
+    let old: Vec<_> = jobs.iter().filter(|j| j.2 == 1).collect();
+    assert!(
+        old.iter().all(|j| j.3 == "completed"),
+        "revision-1 work is retired: {jobs:?}"
+    );
+    assert!(
+        jobs.iter()
+            .any(|j| j.0 == "triage" && j.2 == 2 && j.3 == "queued"),
+        "{jobs:?}"
+    );
+}
+
+#[test]
+fn ingest_message_fresh_text_scope_queues_an_access_reassessment_only() {
+    // Mail past the history window: the words arrive for search and the agent
+    // door, external access is re-read over them (one small model call), and
+    // no investigation is spent on a placement for years-old mail.
+    let (store, acct) = store();
+    let id = blank_row_already_ruled_on(&store, acct, "g-old");
+
+    let fresh = triaged(acct, "g-old", "t-g-old")
+        .from("garminservices@billing.garmin.com")
+        .subject("Your Garmin Services Bill")
+        .body("the actual words")
+        .build();
+    assert_eq!(
+        store.ingest_message_fresh(&fresh, HealScope::Text).unwrap(),
+        Some(id)
+    );
+    assert_eq!(stored_body(&store, id), "the actual words");
+    assert_eq!(agent_state(&store, acct, id), (2, "pending".to_string()));
+    let after = agent_jobs(&store, acct, id);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert_eq!(
+        after[1],
+        ("access".into(), "source_access".into(), 2, "queued".into())
+    );
+    assert!(
+        !after.iter().any(|j| j.0 == "triage" && j.2 == 2),
+        "no investigation for old mail: {after:?}"
+    );
+    assert_eq!(vec_count_for(&store, id), 0);
+}
+
+#[test]
+fn ingest_message_fresh_with_an_unchanged_body_moves_nothing() {
+    // The sweep's candidate list is a snapshot; a row healed by a concurrent
+    // path (or a body that flattens to the same text) is not a second revision
+    // and not a second model call.
+    let (store, acct) = store();
+    // The same `Date:` header both times, as a re-fetch of the same message
+    // carries: the agent's content snapshot hashes the received stamp too.
+    let received = Utc::now() - chrono::Duration::hours(3);
+    let id = triaged(acct, "g-same", "t-g-same")
+        .received_at(received)
+        .body("already the words")
+        .ingest(&store);
+    let before = agent_jobs(&store, acct, id);
+    assert_eq!(
+        store
+            .ingest_message_fresh(
+                &triaged(acct, "g-same", "t-g-same")
+                    .received_at(received)
+                    .body("already the words")
+                    .build(),
+                HealScope::TextAndTriage,
+            )
+            .unwrap(),
+        Some(id)
+    );
+    assert_eq!(
+        agent_state(&store, acct, id).0,
+        1,
+        "no content change, no revision"
+    );
+    assert_eq!(agent_jobs(&store, acct, id), before, "and no new work");
+}
+
+#[test]
+fn ingest_message_fresh_refuses_a_row_the_store_no_longer_holds_as_normal_inbound() {
+    // The sweep's candidate list is a snapshot; the live row rules. Spam
+    // (its `is_spam` is sticky-to-zero in the upsert, so a write here would
+    // flip a real verdict and queue a spam body for a model), sealed, and
+    // unknown are all refused with nothing written.
+    let (store, acct) = store();
+    let spam = triaged(acct, "g-spam", "t-spam")
+        .body("\r\n")
+        .is_spam(true)
+        .ingest(&store);
+    let sealed = triaged(acct, "g-otp", "t-otp")
+        .body("\r\n")
+        .sensitivity(Sensitivity::Sealed)
+        .sealed(SealedKind::Otp)
+        .ingest(&store);
+    for (gmail, id) in [("g-spam", spam), ("g-otp", sealed)] {
+        let jobs = agent_jobs(&store, acct, id);
+        let fresh = triaged(acct, gmail, &format!("t-{gmail}"))
+            .body("words")
+            .build();
+        assert_eq!(
+            store
+                .ingest_message_fresh(&fresh, HealScope::TextAndTriage)
+                .unwrap(),
+            None
+        );
+        assert_eq!(stored_body(&store, id), "\r\n", "nothing written");
+        assert_eq!(agent_jobs(&store, acct, id), jobs, "nothing queued");
+    }
+    let unknown = triaged(acct, "g-new", "t-new").body("words").build();
+    assert_eq!(
+        store
+            .ingest_message_fresh(&unknown, HealScope::TextAndTriage)
+            .unwrap(),
+        None,
+        "a heal never inserts"
+    );
+    assert!(store.thread_view(acct, "t-new").is_err());
+}
+
+#[test]
+fn ingest_message_fresh_does_not_re_bump_the_unsubscribe_ledger() {
+    let (store, acct) = store();
+    store
+        .upsert_unsubscribe(
+            acct,
+            "news@list.example",
+            "header",
+            None,
+            Utc::now() - chrono::Duration::days(10),
+        )
+        .unwrap();
+    let id = triaged(acct, "g-news", "t-news")
+        .from("news@list.example")
+        .body("\r\n")
+        .ingest(&store);
+    let count = |store: &SqliteStore| -> i64 {
+        let conn = store.lock().unwrap();
+        conn.query_row(
+            "SELECT violation_count FROM unsubscribes WHERE account_id=?1",
+            params![acct],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(&store), 1, "the arrival was counted");
+    let fresh = triaged(acct, "g-news", "t-news")
+        .from("news@list.example")
+        .body("the offer")
+        .build();
+    store
+        .ingest_message_fresh(&fresh, HealScope::TextAndTriage)
+        .unwrap();
+    assert_eq!(count(&store), 1, "a re-read is not a second violation");
+    assert_eq!(stored_body(&store, id), "the offer");
+}
+
+#[test]
+fn blank_body_messages_judges_blankness_in_rust_over_inbound_html_mail_only() {
+    let (store, acct) = store();
+    let seed = |gmail: &str, body: &str| {
+        triaged(acct, gmail, &format!("t-{gmail}"))
+            .body(body)
+            .ingest(&store)
+    };
+    let set_html = |id: i64, html: Option<&str>| {
+        let conn = store.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET body_html=?2 WHERE id=?1",
+            params![id, html],
+        )
+        .unwrap();
+    };
+    // The three blank forms the wire actually produces — a bare CRLF, a
+    // space, a zero-width character — none of which SQLite's TRIM agrees on.
+    let crlf = seed("g-crlf", "\r\n");
+    set_html(crlf, Some("<p>real</p>"));
+    let space = seed("g-space", " ");
+    set_html(space, Some("<p>real</p>"));
+    let zw = seed("g-zw", "\u{FEFF}");
+    set_html(zw, Some("<p>real</p>"));
+    // Not candidates: text present; no HTML to heal from; spam; sealed; sent.
+    let text = seed("g-text", "hello");
+    set_html(text, Some("<p>hello</p>"));
+    let plain = seed("g-plain", "\r\n");
+    set_html(plain, None);
+    let spam = triaged(acct, "g-spam", "t-spam")
+        .body("\r\n")
+        .is_spam(true)
+        .ingest(&store);
+    set_html(spam, Some("<p>buy</p>"));
+    let sealed = triaged(acct, "g-otp", "t-otp")
+        .body("\r\n")
+        .sensitivity(Sensitivity::Sealed)
+        .sealed(SealedKind::Otp)
+        .ingest(&store);
+    set_html(sealed, Some("<p>483920</p>"));
+    let sent = triaged(acct, "g-sent", "t-sent")
+        .body("\r\n")
+        .is_sent(true)
+        .ingest(&store);
+    set_html(sent, Some("<p>mine</p>"));
+
+    let scan = store.blank_body_messages(acct, i64::MAX, 100).unwrap();
+    let mut got: Vec<i64> = scan.candidates.iter().map(|m| m.message_id).collect();
+    got.sort();
+    let mut want = vec![crlf, space, zw];
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(scan.next_before_id, None, "a short chunk is the end");
+    let row = scan
+        .candidates
+        .iter()
+        .find(|m| m.message_id == crlf)
+        .unwrap();
+    assert_eq!(row.gmail_msg_id, "g-crlf");
+
+    // Chunking: the cursor walks newest (highest id) first, and a full chunk
+    // hands back where the next one starts, even when it held no blank row.
+    let first = store.blank_body_messages(acct, i64::MAX, 2).unwrap();
+    assert!(
+        first.next_before_id.is_some(),
+        "a full chunk says where the next one starts"
+    );
+    let mut walked = Vec::new();
+    let mut before = i64::MAX;
+    loop {
+        let chunk = store.blank_body_messages(acct, before, 2).unwrap();
+        walked.extend(chunk.candidates.iter().map(|m| m.message_id));
+        match chunk.next_before_id {
+            Some(next) => {
+                assert!(next < before);
+                before = next;
+            }
+            None => break,
+        }
+    }
+    walked.sort();
+    assert_eq!(walked, want, "chunked walk finds exactly the same rows");
+}

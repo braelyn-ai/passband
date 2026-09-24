@@ -448,7 +448,10 @@ fn queue_investigation(
         }
         if ((state == "completed" && existing_trigger != trigger)
             || (state == "failed" && trigger.starts_with("manual:") && existing_trigger != trigger))
-            && !matches!(trigger, "ingest" | "arrival" | "backfill" | "source_access")
+            && !matches!(
+                trigger,
+                "ingest" | "arrival" | "backfill" | "heal" | "source_access"
+            )
         {
             conn.execute("UPDATE agent_triage_jobs SET state='queued',kind=?2,trigger=?3,attempts=0,available_at=?4,last_error=NULL WHERE id=?1",
                 params![id,kind,trigger,Utc::now().to_rfc3339()])?;
@@ -536,7 +539,9 @@ pub(crate) fn enqueue_agent_triage_conn(
         params![account,message],
         |r|Ok((r.get(0)?,r.get(1)?))).optional()?;
     let changed = previous.as_ref().is_none_or(|p| p.0 != snapshot);
-    if !changed && matches!(trigger, "arrival" | "ingest" | "backfill") {
+    // `heal` sits with the ingest family: a re-read whose stored content did
+    // not actually change is a no-op, never a re-run.
+    if !changed && matches!(trigger, "arrival" | "ingest" | "backfill" | "heal") {
         if trigger != "backfill"
             && previous.as_ref().is_some_and(|p| p.1 == 1)
             && !m.is_sent
