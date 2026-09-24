@@ -340,14 +340,19 @@ struct MainShell: View {
                     // offsets have somewhere to move WITHIN, and a clip so a
                     // reader in flight never paints over the rail beside it.
                     ZStack {
+                        // A Reading stack flies its own card under the header
+                        // (see ThreadViewer.deck), so the window holds still.
+                        let flight: AppStore.ThreadFlight =
+                            store.readingStack ? .settled : store.threadFlight
                         ThreadViewer(threadId: threadId)
                             .id(threadId)
-                            .offset(store.threadFlight.offset(in: geo.size))
-                            .scaleEffect(store.threadFlight.scale)
-                            .opacity(store.threadFlight.opacity)
+                            .offset(flight.offset(in: geo.size))
+                            .scaleEffect(flight.scale)
+                            .opacity(flight.opacity)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipped()
+
                     if store.sideView.isOpen {
                         // Reserves the strip without taking clicks off the panel
                         // sitting under it.
@@ -588,6 +593,7 @@ extension AppStore.ThreadFlight {
         switch self {
         case .settled: .zero
         case .departing: CGSize(width: 0, height: -window.height)
+        case .departingDown: CGSize(width: 0, height: window.height)
         case .entering(.bottom): CGSize(width: 0, height: window.height)
         case .entering(.trailing): CGSize(width: window.width, height: 0)
         }
@@ -596,6 +602,15 @@ extension AppStore.ThreadFlight {
     /// Only the departure fades and shrinks, and both are slight: enough for the
     /// email to read as leaving the reader's plane rather than merely sliding,
     /// not so much that it becomes a card trick. What arrives arrives whole.
-    var opacity: Double { self == .departing ? 0 : 1 }
-    var scale: CGFloat { self == .departing ? 0.96 : 1 }
+    var opacity: Double { isDeparting ? 0 : 1 }
+    var scale: CGFloat { isDeparting ? 0.96 : 1 }
+
+    /// Both exits, whichever way they leave. The next variant added is a
+    /// departure or an arrival, and it says so here once.
+    var isDeparting: Bool {
+        switch self {
+        case .departing, .departingDown: true
+        case .settled, .entering: false
+        }
+    }
 }

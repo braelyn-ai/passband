@@ -23,6 +23,12 @@ run_suite() {
   "$BUILD/$name"
 }
 
+# The hero, peek and fire-and-forget preload must share one request.
+run_suite thread-prefetch \
+  Sources/Passband/Lib/AsyncMemo.swift \
+  Sources/Passband/Model/ThreadPrefetch.swift \
+  Tests/ThreadPrefetchTests.swift
+
 run_suite calendar-visibility \
   Sources/Passband/Lib/CalendarVisibility.swift \
   Tests/CalendarVisibilityTests.swift

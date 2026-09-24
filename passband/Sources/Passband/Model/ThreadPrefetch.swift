@@ -24,18 +24,22 @@ final class ThreadPrefetch {
     }
 
     private var cache = LRUMap<String, Entry>(limit: cacheMax)
-    /// Ids being fetched. A Set rather than parked tasks because prefetch is
-    /// fire-and-forget: nobody joins a running fetch, they take the cache hit
-    /// it leaves behind (which is why this is not an `AsyncMemo` — a hit here
-    /// is a hit only while it is FRESH, and freshness is not memoizable).
-    private var inflight: Set<String> = []
+    /// One shared task for preloads, heroes and visible previews. Results live
+    /// in the TTL cache above; this memo only coalesces concurrent requests.
+    private let inflight = AsyncMemo<String, Result<ClientThreadView, Error>>(
+        limit: 1, keep: { _ in false })
+    private let loader: @MainActor (String) async throws -> ClientThreadView
     /// Bumped by `wipe()`. Every fetch this class starts captures it and files
     /// nothing once it no longer matches: a thread fetched for the old account
     /// must not land in the new account's cache, and the trickle of a batch
     /// warm must not keep asking the NEW daemon for the OLD one's thread ids.
     private var generation = 0
 
-    private init() {}
+    init(loader: @escaping @MainActor (String) async throws -> ClientThreadView = {
+        try await APIClient.shared.getThread($0)
+    }) {
+        self.loader = loader
+    }
 
     private func put(
         _ threadId: String, _ view: ClientThreadView, fresh: TimeInterval, gen: Int
@@ -55,7 +59,7 @@ final class ThreadPrefetch {
     func wipe() {
         generation &+= 1
         cache.removeAll()
-        inflight.removeAll()
+        inflight.clear()
     }
 
     /// Fire-and-forget fetch + cache. Deduped while in flight; a fresh hit is a
@@ -71,23 +75,11 @@ final class ThreadPrefetch {
             }
             return
         }
-        guard !inflight.contains(threadId) else { return }
-        inflight.insert(threadId)
         let gen = generation
         Task { [weak self] in
-            defer { self?.settled(threadId, gen: gen) }
-            // Prefetch is best-effort; the real open surfaces any error.
-            guard let view = try? await APIClient.shared.getThread(threadId) else { return }
-            self?.put(threadId, view, fresh: ttl, gen: gen)
+            guard let self, gen == generation else { return }
+            _ = try? await fetch(threadId, fresh: ttl)
         }
-    }
-
-    /// Retire an in-flight marker — unless a `wipe()` has emptied the table
-    /// since, in which case the marker under this id is a NEWER fetch's and
-    /// clearing it would let a third copy start.
-    private func settled(_ threadId: String, gen: Int) {
-        guard gen == generation else { return }
-        inflight.remove(threadId)
     }
 
     /// A fresh cached view for instant render, or nil.
@@ -101,12 +93,32 @@ final class ThreadPrefetch {
     /// Fetch THROUGH the cache: a fresh hit resolves immediately.
     func fetch(_ threadId: String, fresh: TimeInterval? = nil) async throws -> ClientThreadView {
         let ttl = fresh ?? Self.freshDefault
-        if let hit = cache.get(threadId), Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
+        try Task.checkCancellation()
+        if var hit = cache.get(threadId), Date().timeIntervalSince(hit.ts) < max(hit.fresh, ttl) {
+            hit.fresh = max(hit.fresh, ttl)
+            cache.set(threadId, hit)
             return hit.view
         }
         let gen = generation
-        let view = try await APIClient.shared.getThread(threadId)
-        put(threadId, view, fresh: ttl, gen: gen)
+        let result = await inflight.resolve(threadId) { [self] in
+            do {
+                let view = try await loader(threadId)
+                put(threadId, view, fresh: ttl, gen: gen)
+                return .success(view)
+            } catch {
+                return .failure(error)
+            }
+        }
+        // A clear retires the shared task without cancelling another consumer.
+        // Old-account results must not escape to a hero or a newly mounted peek.
+        guard gen == generation else { throw CancellationError() }
+        try Task.checkCancellation()
+        let view = try result.get()
+        // Joiners can request a longer lifetime than the caller that started it.
+        if var hit = cache.get(threadId) {
+            hit.fresh = max(hit.fresh, ttl)
+            cache.set(threadId, hit)
+        }
         return view
     }
 

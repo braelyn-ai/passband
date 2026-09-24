@@ -677,6 +677,21 @@ final class AppStore {
     /// The ordered list the viewer was opened FROM, so "done + next" (e/d) can
     /// advance in place. Empty when opened from a surface without a queue.
     var threadQueue: [AttentionUpdate] = []
+    var readingMail = false
+    var readingStack: Bool {
+        guard readingMail, let first = threadQueue.first else { return false }
+        return threadQueue.dropFirst().contains { $0.thread_id != first.thread_id }
+    }
+
+    /// Shared by the preview and advance action so resolved siblings never peek.
+    var nextQueuedThread: AttentionUpdate? {
+        guard let threadId,
+            let current = threadQueue.firstIndex(where: { $0.thread_id == threadId })
+        else { return nil }
+        return threadQueue.dropFirst(current + 1).first {
+            $0.thread_id != threadId && !resolvedIds.contains($0.id)
+        }
+    }
     /// WHERE THE READER IS IN ITS FLIGHT. `settled` is where it lives and is the
     /// default, because opening an email is navigation: a surface people enter
     /// and leave all day should just BE there. The other two are the done+next
@@ -696,6 +711,7 @@ final class AppStore {
         case settled
         /// Lifted out through the top: the email you just finished.
         case departing
+        case departingDown
         /// Parked one window outside the frame, waiting to be walked in.
         case entering(ThreadEdge)
     }
@@ -1576,6 +1592,7 @@ final class AppStore {
         // been told about says nothing about this one's.
         arrivals.reset(to: nil)
         threadQueue = []
+        readingMail = false
         pendingReplyMessageId = nil
         focusedMessageId = nil
         focusedMessageView = nil
@@ -1781,7 +1798,7 @@ final class AppStore {
     /// id the reader should open its inline composer on once the thread loads.
     func openThread(
         _ threadId: String, queue: [AttentionUpdate] = [], replyTo: Int? = nil,
-        entering edge: ThreadEdge? = nil, focusMessage: Int? = nil
+        entering edge: ThreadEdge? = nil, focusMessage: Int? = nil, readingMail: Bool = false
     ) {
         // from_noise: an open from below the squelch line — someone digging for
         // mail the triage muted, which is the false-negative signal.
@@ -1806,6 +1823,7 @@ final class AppStore {
         // REOPEN of the same one — see ThreadArrivals.reset.
         arrivals.reset(to: threadId)
         self.threadQueue = queue
+        self.readingMail = readingMail
         // An ordinary open puts the reader straight in the window — opening an
         // email is a jump. Only done+next passes an edge, and it walks the
         // reader home itself a frame later.
@@ -1831,6 +1849,7 @@ final class AppStore {
         threadId = nil
         arrivals.reset(to: nil)
         threadQueue = []
+        readingMail = false
         // The flight is deliberately left where it is: the last email of a queue
         // is mid-departure when this runs, and there is nothing left to put back
         // in the window. `openThread` resets it for whatever comes next.
