@@ -135,13 +135,13 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 }
 
 /* BEFORE / AFTER. */
-.pb-section { padding: clamp(4.5rem, 10vw, 8rem) var(--gutter); max-width: 76rem; margin: 0 auto; }
+.pb-section { padding: clamp(4.5rem, 10vw, 8rem) var(--gutter); max-width: 84rem; margin: 0 auto; }
 .pb-h2 { margin: 0 0 0.9rem; font-family: var(--serif); font-weight: 500;
   font-size: clamp(2rem, 3.8vw, 2.9rem); line-height: 1.05; letter-spacing: -0.01em; }
 .pb-h2 em { font-style: normal; color: var(--accent-ink); }
 .pb-intro { margin: 0 0 clamp(2rem, 5vw, 3.25rem); color: var(--dim); font-size: 1.05rem;
   line-height: 1.6; max-width: 34rem; }
-.pb-pair { display: grid; grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr); gap: clamp(1rem, 2.5vw, 1.75rem);
+.pb-pair { display: grid; grid-template-columns: minmax(0, 0.58fr) minmax(0, 1.42fr); gap: clamp(1rem, 2.5vw, 1.75rem);
   align-items: stretch; }
 @media (max-width: 900px) { .pb-pair { grid-template-columns: minmax(0, 1fr); } }
 .pb-panel { margin: 0; display: flex; flex-direction: column; gap: 0.8rem; min-width: 0; }
@@ -172,68 +172,110 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 
 /* THE AFTER: a fake screenshot of the sitrep, built in HTML rather than shipped
    as a PNG so it stays sharp at every size and every word in it is real text.
-   Sized off its own width (container queries), so the phone layout is the
-   mock's own narrow layout, not a squashed desktop. */
-.pb-app { container-type: inline-size; display: flex; flex-direction: column; font-size: 12px; }
-/* The mock sets the pair's height; the doomscroll beside it fills whatever
-   that is, so the two windows always end on one line. */
-.pb-after .pb-window { min-height: 0; }
-.pb-app-bar { height: 40px; flex: none; display: flex; align-items: center; gap: 1rem;
-  padding: 0 1rem; border-bottom: 1px solid var(--hair); }
-.pb-lights { display: flex; gap: 7px; }
-.pb-lights i { width: 11px; height: 11px; border-radius: 50%; background: #3a4452; }
-.pb-lights i:nth-child(1) { background: #ec6a5e; } .pb-lights i:nth-child(2) { background: #f4bf4f; }
-.pb-lights i:nth-child(3) { background: #61c554; }
-.pb-app-title { display: flex; align-items: baseline; gap: 0.45rem; }
-.pb-app-title b { font-family: var(--serif); font-weight: 500; font-size: 15px; }
-.pb-app-title small { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faintest); }
-.pb-need { margin-left: auto; display: flex; align-items: center; gap: 5px; color: var(--danger);
-  font-size: 10.5px; font-weight: 600; padding: 3px 9px; border-radius: 99px; background: rgba(255, 122, 104, 0.13); }
-.pb-need::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--danger); }
-.pb-app-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 15.5rem; }
-.pb-app-main { padding: 1.1rem 1.1rem 0; display: flex; flex-direction: column; gap: 1.25rem; min-width: 0; }
-.pb-app-rail { border-left: 1px solid var(--hair); padding: 1.1rem 0.9rem; display: flex;
-  flex-direction: column; gap: 1.1rem; background: rgba(255, 255, 255, 0.012); }
-@container (max-width: 560px) {
-  .pb-app-body { grid-template-columns: 1fr; }
-  .pb-app-rail { border-left: 0; border-top: 1px solid var(--hair); display: grid;
-    grid-template-columns: 1fr 1fr; padding: 0.9rem 1.1rem; }
-  .pb-hide-narrow { display: none !important; }
-}
-.pb-zone-h { display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.5rem;
-  font-size: 10.5px; font-weight: 600; color: var(--dim); }
-.pb-zone-h svg { width: 12px; height: 12px; color: var(--zone, var(--faint)); }
-.pb-zone-h em { font-style: normal; font-weight: 500; color: var(--faintest); }
-.pb-zone-h small { font-weight: 400; color: var(--faintest); margin-left: 0.2rem; }
-.pb-eyes { display: flex; flex-direction: column; border-radius: 10px; border: 1px solid var(--hair);
-  background: var(--card); overflow: hidden; }
-.pb-eye { display: grid; grid-template-columns: 26px minmax(0, 1fr) auto; align-items: center; gap: 0.7rem;
-  padding: 0.62rem 0.8rem; border-bottom: 1px solid var(--hair); }
-.pb-eye:last-child { border-bottom: 0; }
-.pb-eye:first-child { background: rgba(78, 155, 234, 0.08); box-shadow: inset 2px 0 0 var(--accent); }
-.pb-avatar { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
-  font-size: 10px; font-weight: 700; }
-.pb-eye-text { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.pb-eye-text b { font-size: 11.5px; font-weight: 600; }
-.pb-eye-text span { color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pb-chip { font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 99px; white-space: nowrap;
-  color: var(--c); background: color-mix(in srgb, var(--c) 15%, transparent); }
-.pb-reading { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
-.pb-read { border-radius: 10px; border: 1px solid var(--hair); background: var(--card); padding: 0.6rem 0.65rem;
-  display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
-.pb-read-top { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
-.pb-read-top b { font-size: 10.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pb-read-top span { font-size: 9.5px; color: var(--faintest); font-variant-numeric: tabular-nums; }
-.pb-read p { margin: 0; font-size: 10px; line-height: 1.35; color: var(--faint);
+
+   Measured off the real app (the practice board, shot at 1440pt) and written
+   in the app's own POINTS: every "Npt" below is rewritten to a multiple of
+   --pt, which is the window's width over the width the mock is laid out at (1040pt, about the app's smallest window).
+   So the mock is the app at one fixed layout, scaled as a picture would be,
+   rather than a web page that reflows into something the app never draws.
+   Colours are sampled from the same shot. */
+.pb-after .pb-window { container-type: inline-size; min-height: 0; background: #262c35; }
+.pb-app { --pt: calc(100cqw / 1040); display: grid; grid-template-columns: 58pt minmax(0, 1fr);
+  grid-template-rows: 40pt auto; font-size: 12pt; color: var(--ink); line-height: 1.25; }
+.pb-app-bar { grid-column: 1 / -1; display: flex; align-items: center; gap: 14pt; padding: 0 18pt 0 16pt; }
+.pb-lights { display: flex; gap: 8pt; }
+.pb-lights i { width: 12pt; height: 12pt; border-radius: 50%; background: #ec6a5e; }
+.pb-lights i:nth-child(2) { background: #f4bf4f; } .pb-lights i:nth-child(3) { background: #61c554; }
+.pb-app-title { display: flex; align-items: baseline; gap: 8pt; margin-left: 12pt; }
+.pb-app-title b { font-family: var(--serif); font-weight: 500; font-size: 19pt; }
+.pb-app-title small { font-size: 10pt; font-weight: 500; letter-spacing: 0.06em; color: var(--faintest); }
+.pb-app-tools { margin-left: auto; display: flex; align-items: center; gap: 12pt; font-size: 10pt;
+  font-weight: 500; color: var(--faint); }
+.pb-app-tools svg { width: 10pt; height: 10pt; vertical-align: -1pt; margin-right: 3pt; }
+.pb-need { display: inline-flex; align-items: center; gap: 5pt; color: var(--danger); font-size: 11pt;
+  font-weight: 500; padding: 3pt 9pt; border-radius: 99pt; background: rgba(255, 122, 104, 0.14);
+  box-shadow: inset 0 0 0 0.75pt rgba(255, 122, 104, 0.45); }
+.pb-need::before { content: ""; width: 5pt; height: 5pt; border-radius: 50%; background: var(--danger); }
+.pb-side { background: #2c323f; border-right: 1px solid #363b48; border-top-right-radius: 10pt;
+  display: flex; flex-direction: column; align-items: center; gap: 13pt; padding: 12pt 0 16pt; }
+.pb-side span { width: 36pt; height: 30pt; display: grid; place-items: center; border-radius: 8pt; color: #9aa6b6; }
+.pb-side span.on { background: rgba(78, 155, 234, 0.2); color: var(--accent); }
+.pb-side svg { width: 18pt; height: 18pt; }
+.pb-side .pb-side-gap { flex: 1; }
+.pb-side .pb-me { width: 20pt; height: 20pt; border-radius: 50%; background: #24384F; color: #A9CBF0;
+  font-size: 10pt; font-weight: 600; }
+.pb-page { padding: 6pt 22pt 22pt 30pt; display: grid; grid-template-columns: minmax(0, 1fr) 252pt;
+  column-gap: 14pt; align-items: start; }
+.pb-dash-hero { grid-column: 1 / -1; margin-bottom: 16pt; }
+.pb-dash-hero small { display: block; font-size: 10pt; font-weight: 500; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--accent); margin-bottom: 2pt; }
+.pb-dash-hero b { font-family: var(--serif); font-weight: 500; font-size: 36pt; letter-spacing: -0.01em; line-height: 1.08; }
+.pb-col { display: flex; flex-direction: column; gap: 14pt; min-width: 0; }
+.pb-zone { border-radius: 16pt; padding: 12pt 12pt 10pt; background: #1f2c3a;
+  box-shadow: inset 0 0 0 0.75pt #2f4459; }
+.pb-zone-h { display: flex; align-items: center; gap: 7pt; padding: 0 4pt 7pt; font-size: 13pt; font-weight: 600; }
+.pb-zone-h svg { width: 14pt; height: 14pt; color: var(--zone, var(--accent)); flex: none; }
+.pb-zone-h em { font-style: normal; font-size: 10pt; font-weight: 500; color: var(--faint);
+  background: rgba(233, 238, 245, 0.08); border-radius: 99pt; padding: 1pt 6pt; }
+.pb-zone-h small { font-size: 10pt; font-weight: 500; color: var(--faintest); margin-left: 2pt; }
+.pb-eye { position: relative; display: flex; align-items: center; gap: 9pt; padding: 7pt 10pt; border-radius: 8pt;
+  white-space: nowrap; }
+.pb-eye.cursor { background: rgba(78, 155, 234, 0.1); }
+.pb-eye.overdue::before { content: ""; position: absolute; left: 0; top: 5pt; bottom: 5pt; width: 2pt;
+  border-radius: 1pt; background: var(--danger); }
+.pb-avatar { width: 22pt; height: 22pt; border-radius: 50%; flex: none; display: grid; place-items: center;
+  font-size: 9pt; font-weight: 600; }
+.pb-eye b { font-weight: 500; flex: none; }
+.pb-eye span.line { color: var(--dim); overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.pb-chip { flex: none; font-size: 10pt; font-weight: 500; padding: 2.5pt 7pt; border-radius: 99pt; color: var(--c);
+  box-shadow: inset 0 0 0 0.75pt color-mix(in srgb, var(--c) 30%, transparent); }
+.pb-chip.filled { background: color-mix(in srgb, var(--c) 16%, transparent); }
+.pb-reading { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8pt; }
+.pb-read { display: flex; gap: 10pt; padding: 8pt; border-radius: 12pt; background: #283647; min-width: 0; }
+.pb-logo { width: 46pt; height: 46pt; border-radius: 8pt; flex: none; display: grid; place-items: center;
+  font-weight: 700; font-size: 17pt; }
+.pb-read-text { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3pt; }
+.pb-read-top { display: flex; justify-content: space-between; gap: 6pt; }
+.pb-read-top b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pb-read-top span { font-size: 10pt; color: var(--faintest); white-space: nowrap; }
+.pb-read p { margin: 0; font-size: 10.5pt; line-height: 1.3; color: var(--faint);
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.pb-rec { display: flex; flex-direction: column; gap: 0.35rem; }
-.pb-rec-row { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
-.pb-rec-row b { font-size: 11px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.pb-rec-row span { font-size: 10.5px; color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.pb-card { border-radius: 10px; border: 1px solid var(--hair); background: var(--card); padding: 0.6rem 0.7rem;
-  display: flex; flex-direction: column; gap: 0.35rem; }
-.pb-filed { margin: 0; padding: 0.8rem 0 1rem; color: var(--faintest); font-size: 10.5px;
-  border-top: 1px dashed var(--hair); }
+/* The records rail: one TINTED card per zone, the zone's own hue washed into
+   its ground and its border, which is the single biggest thing that makes the
+   sitrep read as the sitrep. */
+.pb-rail { display: flex; flex-direction: column; gap: 12pt; min-width: 0; }
+.pb-rec { border-radius: 16pt; padding: 11pt 11pt 9pt; background: var(--bg-c); box-shadow: inset 0 0 0 0.75pt var(--edge); }
+.pb-rec .pb-zone-h { padding: 0 3pt 5pt; }
+.pb-rec-cal { --bg-c: #253341; --edge: #3b5673; --zone: var(--accent); }
+.pb-rec-ship { --bg-c: #35332d; --edge: #6a5a3e; --zone: var(--warn); }
+.pb-rec-bill { --bg-c: #2a3540; --edge: #3f566d; --zone: var(--accent); }
+.pb-rec-rcpt { --bg-c: #233635; --edge: #2f5a49; --zone: var(--positive); }
+.pb-rec-row { display: flex; justify-content: space-between; align-items: center; gap: 8pt; padding: 4.5pt 3pt;
+  font-size: 11.5pt; white-space: nowrap; }
+.pb-rec-row b { font-weight: 400; color: #cdd5df; overflow: hidden; text-overflow: ellipsis; }
+.pb-rec-row span { font-size: 10pt; color: var(--faintest); font-variant-numeric: tabular-nums; }
+.pb-rec-row .pb-chip { --c: var(--faint); }
+.pb-rec-rcpt .pb-rec-row span { font-size: 11.5pt; font-weight: 600; color: var(--positive); }
+.pb-ship { background: #3f3d38; border-radius: 10pt; padding: 7pt 8pt; margin-bottom: 6pt;
+  display: flex; flex-direction: column; gap: 6pt; }
+.pb-ship-top { display: flex; align-items: center; gap: 7pt; white-space: nowrap; }
+.pb-ship-top i { width: 14pt; height: 14pt; border-radius: 3pt; flex: none; background: #5a4631;
+  display: grid; place-items: center; font-style: normal; font-size: 8pt; font-weight: 700; color: #f4c47a; }
+.pb-ship-top b { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.pb-ship .pb-chip.eta { --c: var(--faint); align-self: flex-start; }
+
+/* Phones: the same app, laid out the way its own narrow window does it. The
+   rail stops being a pinned column and stacks under the work surface, and the
+   side rail goes, so the mock is scaled for 560pt instead of 1120pt. */
+@container (max-width: 640px) {
+  .pb-app { --pt: calc(100cqw / 520); grid-template-columns: minmax(0, 1fr); }
+  .pb-side, .pb-app-tools .pb-retriage { display: none; }
+  .pb-page { grid-template-columns: minmax(0, 1fr); padding: 6pt 16pt 16pt; row-gap: 12pt; }
+  .pb-reading { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pb-reading .pb-read:nth-child(3) { display: none; }
+  .pb-rail { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10pt; }
+  .pb-rec-cal { display: none; }
+}
 
 /* THE TRUST ROW. Three facts, no icons: the claims are specific enough to
    carry themselves, and an icon beside each is how a list becomes slop. */
@@ -258,6 +300,13 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
   .pb-cue::after { animation: none; }
 }
 `;
+
+// The mock's "Npt" lengths are the app's points: rewritten to multiples of
+// --pt, which scales the whole mock with its window (see THE AFTER above).
+const PAGE_CSS_RESOLVED = PAGE_CSS.replace(
+  /(\d*\.?\d+)pt\b/g,
+  "calc($1 * var(--pt))",
+);
 
 function FakeInbox() {
   // One randomized batch of rows, rendered twice so the scroll can wrap
@@ -968,69 +1017,74 @@ function Waitlist() {
 
 // MARK: - the "after": a fake sitrep
 
-// Zone glyphs, drawn to sit in for the SF Symbols the app uses (eye,
-// envelope.open, shippingbox, calendar, building.columns, receipt).
+// Stand-ins for the SF Symbols the app draws: gauge, envelope, key, sliders,
+// people and waveform in the side rail; eye, envelope.open, calendar,
+// shippingbox, building.columns and receipt on the zones.
 const GLYPHS = {
+  sitrep: "M8 14.2A6.2 6.2 0 1 0 8 1.8a6.2 6.2 0 0 0 0 12.4Zm0-3.6 2.8-5M3.8 8h1M8 3.8v1m4.2 3.2h-1",
+  mail: "M2 3.8h12v8.4H2V3.8Zm0 0 6 4.6 6-4.6",
+  key: "M8 6.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2Zm0 0v7.8l1.6-1.3M8 10.4h1.6",
+  sliders: "M2 4.5h12M2 8h12M2 11.5h12M5 3.3v2.4M10.5 6.8v2.4M6.5 10.3v2.4",
+  people: "M6 7.2a2.4 2.4 0 1 0 0-4.8 2.4 2.4 0 0 0 0 4.8Zm-4.2 6.4c.3-2.6 2-4 4.2-4s3.9 1.4 4.2 4M11 7.2a2 2 0 1 0 0-4m1.6 6.6c1 .5 1.6 1.7 1.8 3.8",
+  pulse: "M1.5 8.5h3l1.6-4.4 3 8.4 1.8-4h3.6",
+  gear: "M8 10.3a2.3 2.3 0 1 0 0-4.6 2.3 2.3 0 0 0 0 4.6ZM8 2v2m0 8v2M2 8h2m8 0h2M3.8 3.8l1.4 1.4m5.6 5.6 1.4 1.4m0-8.4-1.4 1.4m-5.6 5.6-1.4 1.4",
   eye: "M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Zm6.5 2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z",
   reading: "M2 6.5 8 2.5l6 4v7H2v-7Zm0 0 6 4 6-4",
-  box: "M8 1.8 14 4.6v6.8L8 14.2 2 11.4V4.6L8 1.8Zm0 0v0M2 4.6 8 7.4l6-2.8M8 7.4v6.8",
-  calendar: "M2.5 4h11v9.5h-11V4Zm0 3h11M5.5 2.5v3M10.5 2.5v3",
-  bank: "M2 6 8 2.5 14 6H2Zm1 0v6m3.3-6v6m3.4-6v6M13 6v6M2 13.5h12",
+  calendar: "M2.5 3.5h11v10h-11v-10Zm0 3h11M5 2v2.5M11 2v2.5",
+  box: "M8 1.8 14 4.6v6.8L8 14.2 2 11.4V4.6L8 1.8ZM2 4.6 8 7.4l6-2.8M8 7.4v6.8",
+  bank: "M2 6 8 2.5 14 6H2Zm1.2 0v6m3.2-6v6m3.2-6v6M12.8 6v6M2 13.5h12",
   receipt: "M3.5 1.8h9v12.4l-1.5-1-1.5 1-1.5-1-1.5 1-1.5-1-1.5 1V1.8Zm2.5 4h4m-4 3h4",
+  retriage: "M13.5 8a5.5 5.5 0 1 1-1.6-3.9M12.5 1.8v2.6H9.9",
 };
 
-function Zone({
-  glyph,
-  title,
-  count,
-  tint,
-  sub,
-}: {
-  glyph: keyof typeof GLYPHS;
-  title: string;
-  count: number;
-  tint: string;
-  sub?: string;
+function Glyph({ name }: { name: keyof typeof GLYPHS }) {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25"
+      strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={GLYPHS[name]} />
+    </svg>
+  );
+}
+
+function ZoneHead({ glyph, title, count, sub }: {
+  glyph: keyof typeof GLYPHS; title: string; count: number; sub?: string;
 }) {
   return (
-    <div className="pb-zone-h" style={{ ["--zone" as string]: tint }}>
-      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3"
-        strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-        <path d={GLYPHS[glyph]} />
-      </svg>
+    <div className="pb-zone-h">
+      <Glyph name={glyph} />
       {title} <em>{count}</em>
-      {sub && <small className="pb-hide-narrow">{sub}</small>}
+      {sub && <small>{sub}</small>}
     </div>
   );
 }
 
-// The avatar palette the app hashes senders into, a few of its pairs.
-const AVATARS: Record<string, [bg: string, fg: string]> = {
-  JC: ["#2a3f5c", "#9cc6f5"],
-  PP: ["#4a3325", "#f0b58a"],
-  DO: ["#26433a", "#8fdcb8"],
-  AR: ["#3d2f55", "#c5b2f5"],
-  M: ["#4a2d3b", "#f2a7c6"],
-};
+// The app's avatar palette, dark halves (Palette.avatarPalette).
+const AVATAR = {
+  blue: ["#24384F", "#A9CBF0"], green: ["#22392E", "#9AD3B6"], rust: ["#442C26", "#EBA894"],
+  violet: ["#2F2A4A", "#B8ACF2"], ochre: ["#3E2E1B", "#E2C078"], rose: ["#3E2839", "#E0A6CD"],
+} as const;
 
+// The mail from the "before" panel's scroll, as the sitrep has it: a name, the
+// model's one-line abstraction of what the thread wants, and a chip only where
+// there is a date. Overdue is the filled red chip plus the bar at the row's
+// edge, exactly as SitrepView draws it; upcoming is an amber outline.
 const EYES: Array<{
-  who: string;
-  initials: string;
-  line: string;
-  chip?: [text: string, color: string];
+  who: string; initials: string; tone: keyof typeof AVATAR; line: string;
+  chip?: string; overdue?: boolean;
 }> = [
-  { who: "Parkline Properties", initials: "PP", line: "Lease renewal: signature needed", chip: ["past due", "var(--danger)"] },
-  { who: "Dr. Ortiz's Office", initials: "DO", line: "Please confirm Thursday's appointment", chip: ["today", "var(--danger)"] },
-  { who: "Jamie Chen", initials: "JC", line: "A quick decision before Friday", chip: ["due Fri", "var(--warn)"] },
-  { who: "Alex Rivera", initials: "AR", line: "Re: offsite dates · you replied yesterday" },
-  { who: "Mom", initials: "M", line: "photos from the weekend!!" },
+  { who: "Parkline Properties", initials: "PP", tone: "ochre", line: "Your lease renewal still needs a signature before the new rate lapses.", chip: "3d PAST DUE", overdue: true },
+  { who: "Dr. Ortiz's Office", initials: "DO", tone: "green", line: "Confirm Thursday's 2:30 appointment or call to reschedule.", chip: "due today" },
+  { who: "Jamie Chen", initials: "JC", tone: "blue", line: "Needs your pick between two offsite venues so they can hold the date.", chip: "due Fri" },
+  { who: "Alex Rivera", initials: "AR", tone: "violet", line: "Replied to your offsite dates: the 14th works for everyone." },
+  { who: "Mom", initials: "M", tone: "rose", line: "Sent photos from the weekend." },
 ];
 
-const READING: Array<[sender: string, count: number, blurb: string]> = [
-  ["Medium Daily", 7, "10 Habits of Highly Effective Engineers, and six more"],
-  ["The Sunday Edit", 1, "A few things we thought you'd like"],
-  ["Product Hunt", 5, "An AI notetaker for your AI notetaker"],
-  ["DoorDash", 3, "Your Friday deserves 40% off"],
+// Newsletters from the scroll, one card per sender. Lettered tiles rather
+// than anybody's real logo.
+const READING: Array<[sender: string, count: number, blurb: string, tile: [bg: string, fg: string, mark: string]]> = [
+  ["Medium Daily Digest", 7, "10 Habits of Highly Effective Engineers, and six more stories picked for you.", ["#f2f2ee", "#111", "M"]],
+  ["Product Hunt Daily", 5, "An AI notetaker for your AI notetaker, and eight more launches.", ["#3a2a22", "#f08a5d", "P"]],
+  ["Substack", 3, "Three new posts from writers you follow.", ["#f3eee6", "#c2531f", "S"]],
 ];
 
 function AppMock() {
@@ -1038,88 +1092,115 @@ function AppMock() {
     <div
       className="pb-app"
       role="img"
-      aria-label="The Passband sitrep: two emails need you now, three more are waiting for you, newsletters are gathered into a reading shelf, and a shipment, an appointment, a statement and receipts sit in a side rail."
+      aria-label="The Passband sitrep. Two items for your eyes: a lease renewal three days past due and an appointment to confirm today, then three more conversations. Newsletters wait on a reading shelf, and a rail beside it holds the calendar, shipments, billing and receipts."
     >
       <div className="pb-app-bar">
         <div className="pb-lights" aria-hidden="true"><i /><i /><i /></div>
         <div className="pb-app-title">
           <b>passband</b>
-          <small>sitrep</small>
+          <small>SITREP</small>
         </div>
-        <span className="pb-need">2 need you now</span>
+        <div className="pb-app-tools">
+          <span className="pb-retriage"><Glyph name="retriage" />re-triage 7d</span>
+          <span className="pb-need">2 need you now</span>
+        </div>
       </div>
-      <div className="pb-app-body">
-        <div className="pb-app-main">
-          <section>
-            <Zone glyph="eye" title="For your eyes" count={EYES.length} tint="var(--accent)" />
-            <div className="pb-eyes">
-              {EYES.map(({ who, initials, line, chip }) => {
-                const [bg, fg] = AVATARS[initials];
-                return (
-                  <div key={who} className="pb-eye">
-                    <span className="pb-avatar" style={{ background: bg, color: fg }}>{initials}</span>
-                    <span className="pb-eye-text">
-                      <b>{who}</b>
-                      <span>{line}</span>
+
+      <nav className="pb-side" aria-hidden="true">
+        <span className="on"><Glyph name="sitrep" /></span>
+        <span><Glyph name="mail" /></span>
+        <span><Glyph name="key" /></span>
+        <span><Glyph name="sliders" /></span>
+        <span><Glyph name="people" /></span>
+        <i className="pb-side-gap" />
+        <span><Glyph name="pulse" /></span>
+        <span><Glyph name="gear" /></span>
+        <span className="pb-me">Y</span>
+      </nav>
+
+      <div className="pb-page">
+        <div className="pb-dash-hero">
+          <small>Good morning</small>
+          <b>Two items for your eyes.</b>
+        </div>
+
+        <div className="pb-col">
+          <section className="pb-zone">
+            <ZoneHead glyph="eye" title="For your eyes" count={EYES.length} />
+            {EYES.map(({ who, initials, tone, line, chip, overdue }, i) => {
+              const [bg, fg] = AVATAR[tone];
+              return (
+                <div key={who} className={`pb-eye${overdue ? " overdue" : ""}${i === 0 ? " cursor" : ""}`}>
+                  <span className="pb-avatar" style={{ background: bg, color: fg }}>{initials}</span>
+                  <b>{who}</b>
+                  <span className="line">{line}</span>
+                  {chip && (
+                    <span
+                      className={`pb-chip${overdue ? " filled" : ""}`}
+                      style={{ ["--c" as string]: overdue ? "var(--danger)" : "var(--warn)" }}
+                    >
+                      {chip}
                     </span>
-                    {chip ? (
-                      <span className="pb-chip" style={{ ["--c" as string]: chip[1] }}>{chip[0]}</span>
-                    ) : (
-                      <span />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+                  )}
+                </div>
+              );
+            })}
           </section>
-          <section>
-            <Zone glyph="reading" title="Reading" count={16} tint="var(--faint)"
+
+          <section className="pb-zone">
+            <ZoneHead glyph="reading" title="Reading" count={READING.length}
               sub="newsletters, announcements, and offers" />
             <div className="pb-reading">
-              {READING.map(([sender, count, blurb]) => (
+              {READING.map(([sender, count, blurb, [bg, fg, mark]]) => (
                 <div key={sender} className="pb-read">
-                  <div className="pb-read-top">
-                    <b>{sender}</b>
-                    <span>{count}</span>
+                  <span className="pb-logo" style={{ background: bg, color: fg }}>{mark}</span>
+                  <div className="pb-read-text">
+                    <div className="pb-read-top">
+                      <b>{sender}</b>
+                      <span>{count} emails</span>
+                    </div>
+                    <p>{blurb}</p>
                   </div>
-                  <p>{blurb}</p>
                 </div>
               ))}
             </div>
           </section>
-          <p className="pb-filed pb-hide-narrow">
-            LinkedIn, Confluence, sign-in alerts and 38 more filed quietly. Nothing here asked for you.
-          </p>
         </div>
-        <aside className="pb-app-rail">
-          <section>
-            <Zone glyph="box" title="Shipments" count={1} tint="var(--warn)" />
-            <div className="pb-card">
-              <div className="pb-rec-row"><b>Keychron Q1 Max</b></div>
-              <div className="pb-rec-row">
-                <span className="pb-chip" style={{ ["--c" as string]: "var(--warn)" }}>out for delivery</span>
-                <span>UPS</span>
+
+        <aside className="pb-rail">
+          <section className="pb-rec pb-rec-cal">
+            <ZoneHead glyph="calendar" title="Calendar" count={2} />
+            <div className="pb-rec-row"><b>Dr. Ortiz · checkup</b><span>Sep 26</span></div>
+            <div className="pb-rec-row"><b>Team offsite</b><span>Oct 14</span></div>
+          </section>
+          <section className="pb-rec pb-rec-ship">
+            <ZoneHead glyph="box" title="Shipments" count={2} />
+            <div className="pb-ship">
+              <div className="pb-ship-top">
+                <i>UPS</i>
+                <b>Keychron Q1</b>
+                <span className="pb-chip filled" style={{ ["--c" as string]: "var(--warn)" }}>out for delivery</span>
               </div>
             </div>
-          </section>
-          <section>
-            <Zone glyph="calendar" title="Calendar" count={1} tint="var(--accent)" />
-            <div className="pb-rec">
-              <div className="pb-rec-row"><b>Dr. Ortiz</b><span>Thu 2:30 PM</span></div>
+            <div className="pb-ship">
+              <div className="pb-ship-top">
+                <i>a</i>
+                <b>Linen notebooks</b>
+                <span className="pb-chip filled" style={{ ["--c" as string]: "var(--accent)" }}>shipped</span>
+              </div>
+              <span className="pb-chip eta">arrives Sat</span>
             </div>
           </section>
-          <section className="pb-hide-narrow">
-            <Zone glyph="bank" title="Billing" count={1} tint="var(--accent-ink)" />
-            <div className="pb-rec">
-              <div className="pb-rec-row"><b>Chase ··4417</b><span>$1,284.19</span></div>
-            </div>
+          <section className="pb-rec pb-rec-bill">
+            <ZoneHead glyph="bank" title="Billing" count={2} />
+            <div className="pb-rec-row"><b>Chase ··4417</b><span className="pb-chip">statement</span></div>
+            <div className="pb-rec-row"><b>Con Edison</b><span className="pb-chip">update</span></div>
           </section>
-          <section className="pb-hide-narrow">
-            <Zone glyph="receipt" title="Receipts" count={2} tint="var(--positive)" />
-            <div className="pb-rec">
-              <div className="pb-rec-row"><b>Blue Bottle</b><span>$6.50</span></div>
-              <div className="pb-rec-row"><b>DoorDash</b><span>$23.18</span></div>
-            </div>
+          <section className="pb-rec pb-rec-rcpt">
+            <ZoneHead glyph="receipt" title="Receipts" count={3} />
+            <div className="pb-rec-row"><b>Blue Bottle</b><span>$6.50</span></div>
+            <div className="pb-rec-row"><b>DoorDash</b><span>$23.18</span></div>
+            <div className="pb-rec-row"><b>Maple Books</b><span>$24.00</span></div>
           </section>
         </aside>
       </div>
@@ -1188,7 +1269,7 @@ export function App() {
 
   return (
     <main className="pb">
-      <style href="pb-page" precedence="default">{PAGE_CSS}</style>
+      <style href="pb-page" precedence="default">{PAGE_CSS_RESOLVED}</style>
 
       <section ref={storyRef} className="pb-story">
         <div
