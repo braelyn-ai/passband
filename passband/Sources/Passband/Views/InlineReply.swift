@@ -431,7 +431,12 @@ struct InlineReply: View {
                 // The autosave's one hook for this composer — the body is the only
                 // field it has, and it is bound through here.
                 guard store.inlineReply?[keyPath: keyPath] != value else { return }
-                patch { $0[keyPath: keyPath] = value }
+                // An edit relocks the override, as in the pane: consent covers
+                // the mail the guard judged, not this one.
+                patch {
+                    $0[keyPath: keyPath] = value
+                    $0.guardKinds = []
+                }
                 DraftSaver.shared.noteChange(.inlineReply)
             })
     }
@@ -445,7 +450,10 @@ struct InlineReply: View {
             get: { store.inlineReply?.recipients ?? Recipients() },
             set: { value in
                 guard store.inlineReply?.recipients != value else { return }
-                patch { $0.stateRecipients(value) }
+                patch {
+                    $0.stateRecipients(value)
+                    $0.guardKinds = []
+                }
                 DraftSaver.shared.noteChange(.inlineReply)
             })
     }

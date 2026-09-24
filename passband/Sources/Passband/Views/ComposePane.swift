@@ -548,8 +548,13 @@ struct ComposePane: View {
     private var bindings: [KeyBinding] {
         [
             KeyBinding("Escape", "cancel", allowInInput: true) { store.closeCompose() },
-            KeyBinding("Enter", "send", meta: true, allowInInput: true) {
+            // THE ASK BAR IS A MODAL ON TOP OF THIS PANE, in the same key
+            // context, and binds only Escape: a ⌘Enter typed into its field
+            // falls through to here, and must not send the mail underneath.
+            KeyBinding(declining: "Enter", "send", meta: true, allowInInput: true) {
+                guard !store.askBarOpen else { return false }
                 send(override: false)
+                return true
             },
             // Past a blocked verdict only; declines otherwise, so the chord is
             // not a quiet way to skip a guard that has not spoken.
@@ -575,7 +580,10 @@ struct ComposePane: View {
             get: { store.compose?.recipients ?? Recipients() },
             set: { value in
                 guard store.compose?.recipients != value else { return }
-                patch { $0.stateRecipients(value) }
+                patch {
+                    $0.stateRecipients(value)
+                    $0.guardKinds = []
+                }
                 DraftSaver.shared.noteChange(.compose)
             })
     }
@@ -588,7 +596,13 @@ struct ComposePane: View {
                 // the autosave hooks HERE and nowhere else: there is no way to edit
                 // the draft without arming a save.
                 guard store.compose?[keyPath: keyPath] != value else { return }
-                patch { $0[keyPath: keyPath] = value }
+                // AN EDIT RELOCKS THE OVERRIDE. "Send anyway" is consent to
+                // the mail the guard judged; after a keystroke it is a
+                // different mail, and the plain send is what judges it again.
+                patch {
+                    $0[keyPath: keyPath] = value
+                    $0.guardKinds = []
+                }
                 DraftSaver.shared.noteChange(.compose)
             })
     }
@@ -639,24 +653,20 @@ struct ComposePane: View {
 
 // MARK: - labels
 
-/// The two buttons whose LABEL names a key. Both composers say them, and on a
-/// phone the key half is a promise nothing can keep — there is no Esc — so the
-/// verb stands alone rather than teaching a shortcut that does not exist.
+/// A button whose LABEL names a key. On a phone the key half is a promise
+/// nothing can keep — there is no Esc — so the verb stands alone rather than
+/// teaching a shortcut that does not exist.
 enum ComposeLabels {
     #if os(macOS)
-        static let back = "esc back"
-        static let cancel = "esc cancel"
         static let dismiss = "esc dismiss"
     #else
-        static let back = "back"
-        static let cancel = "cancel"
         // "dismiss", never "discard": closing a composer FLUSHES its draft, so
         // the reply is kept and restored next time, not thrown away.
         static let dismiss = "dismiss"
     #endif
 }
 
-// MARK: - shared review chrome
+// MARK: - shared chrome
 
 /// THE outbound-guard verdict, rendered identically wherever a reply started.
 /// The one screen whose job is talking a reader out of a mistake must not read

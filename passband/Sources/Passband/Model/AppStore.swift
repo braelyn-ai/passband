@@ -869,6 +869,7 @@ final class AppStore {
         AccountManager.shared.stopAllFeeds()
         DraftSaver.shared.flush(.compose, compose)
         DraftSaver.shared.flush(.inlineReply, inlineReply)
+        parkHeldSends()
         await DraftSaver.shared.settle()
         epoch &+= 1
         SitrepPoller.shared.stop()
@@ -922,6 +923,7 @@ final class AppStore {
         connStatus = .loading
         DraftSaver.shared.flush(.compose, compose)
         DraftSaver.shared.flush(.inlineReply, inlineReply)
+        parkHeldSends()
         await DraftSaver.shared.settle()
         // A cancel that landed during settlement: nothing has been swapped
         // yet, so put the live board back the way a switch's restart does
@@ -1501,6 +1503,9 @@ final class AppStore {
             DraftSaver.shared.flush(.compose, compose)
             DraftSaver.shared.flush(.inlineReply, inlineReply)
         }
+        // A mail in its send hold is not sent from the account it was not
+        // written in, and not dropped either: it becomes a draft there.
+        parkHeldSends(save: flushDrafts)
         await DraftSaver.shared.settle()
 
         // (6) The ⌘K session: its transcript cites the old account's mail and
@@ -2894,8 +2899,14 @@ final class AppStore {
     /// what the reader asked for anyway.
     private func restoreNewMessage() async {
         let e = epoch
-        guard let rows = try? await APIClient.shared.listDrafts(),
-            let draft = rows.first(where: { $0.reply_to_message_id == nil })
+        // Not while a new message is in the send HOLD: its draft row is still
+        // there (the send deletes it), and restoring it here would put mail
+        // that is about to go out into a fresh composer, one ⌘Enter from going
+        // out twice.
+        guard !holdsDraft(replyTo: nil),
+            let rows = try? await APIClient.shared.listDrafts(),
+            let draft = rows.first(where: { $0.reply_to_message_id == nil }),
+            !holdsDraft(replyTo: nil)
         else { return }
         // Another account's drafts are not this composer's to restore.
         guard e == epoch else { return }
@@ -2993,8 +3004,12 @@ final class AppStore {
     /// think about it would silently un-blind-copy somebody.
     private func restoreReply(_ messageId: Int) async {
         let e = epoch
-        guard let rows = try? await APIClient.shared.listDrafts(),
-            let draft = rows.first(where: { $0.reply_to_message_id == messageId })
+        // Same rule as the new message: a reply to this message in the hold
+        // owns this draft row until its send deletes it.
+        guard !holdsDraft(replyTo: messageId),
+            let rows = try? await APIClient.shared.listDrafts(),
+            let draft = rows.first(where: { $0.reply_to_message_id == messageId }),
+            !holdsDraft(replyTo: messageId)
         else { return }
         // Another account's drafts are not this composer's to restore — and
         // `reply_to_message_id` is a per-daemon id, so one WOULD match.
@@ -3046,6 +3061,51 @@ final class AppStore {
     }
 
     private var heldSends: [UUID: HeldSend] = [:]
+    /// Every composer identity whose mail is held OR on the wire, and the
+    /// draft ids that saves in flight at send time came back with for them
+    /// (see `DraftSaver.adopt`). The double Optional is the save's own answer:
+    /// `.some(nil)` is a draft it deleted.
+    private var holding: Set<UUID> = []
+    private var detachedDrafts: [UUID: Int?] = [:]
+
+    func noteDetachedDraft(_ id: Int?, composer: UUID) {
+        guard holding.contains(composer) else { return }
+        detachedDrafts[composer] = .some(id)
+    }
+
+    /// Whether a held or sending mail owns the draft row for this reply key
+    /// (nil = the new-message row). Forwards never have one.
+    private func holdsDraft(replyTo: Int?) -> Bool {
+        heldSends.values.contains {
+            $0.state.replyToMessageId == replyTo && $0.state.forwardOfMessageId == nil
+        } || releasingReplyKeys.contains(replyTo)
+    }
+    private var releasingReplyKeys: [Int?] = []
+
+    /// The state as the send must see it: with any draft id a late save
+    /// brought back.
+    private func withDetachedDraft(_ state: ComposeState) -> ComposeState {
+        var state = state
+        if let late = detachedDrafts.removeValue(forKey: state.id) { state.draftId = late }
+        return state
+    }
+
+    /// PARK every held send as a draft, now: the account is changing under
+    /// it. Sending early would take away the undo the sender was promised;
+    /// dropping it would lose the mail. Called before the switch's `settle`,
+    /// which waits for these saves before the client is reconfigured.
+    ///
+    /// `save: false` is the account-REMOVAL path, same as its `flushDrafts`:
+    /// the daemon the draft would go to is the one being forgotten.
+    func parkHeldSends(save: Bool = true) {
+        for (key, held) in heldSends {
+            heldSends[key] = nil
+            undos.removeAll { $0.id == held.undoId }
+            let state = withDetachedDraft(held.state)
+            holding.remove(state.id)
+            if save { DraftSaver.shared.saveDetached(held.slot, state) }
+        }
+    }
 
     /// A reply typed in the reader went out and is already in the local store
     /// (the daemon echoed it), so that thread's reader refetches and shows it.
@@ -3088,6 +3148,7 @@ final class AppStore {
             guard let self, await self.unhold(key) else { throw HoldError.alreadySent }
         }
         heldSends[key] = held
+        holding.insert(state.id)
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.sendHold))
             await self?.release(key)
@@ -3114,6 +3175,7 @@ final class AppStore {
     /// claiming a mail that left was stopped.
     private func unhold(_ key: UUID) -> Bool {
         guard let held = heldSends.removeValue(forKey: key) else { return false }
+        holding.remove(held.state.id)
         putBack(held, error: nil)
         return true
     }
@@ -3122,13 +3184,36 @@ final class AppStore {
     /// the main actor, so an undo landing now finds nothing and cannot also
     /// reopen a composer for a mail that is on the wire.
     private func release(_ key: UUID) async {
-        guard let held = heldSends.removeValue(forKey: key) else { return }
+        guard var held = heldSends.removeValue(forKey: key) else { return }
         undos.removeAll { $0.id == held.undoId }
         guard held.epoch == epoch else {
+            // Unreachable while every switch parks the holds first; kept so a
+            // new way to change accounts cannot send from the wrong one.
+            holding.remove(held.state.id)
             pushToast("not sent: you switched accounts while it was waiting", .error)
             return
         }
-        switch await ComposeSubmit.fire(held.state, override: held.override) {
+        // A DRAFT SAVE STILL ON THE WIRE owns the id this send has to carry,
+        // or the daemon keeps a draft of mail that went out. Wait for it, then
+        // take what it brought back. Until the send returns, this reply key
+        // still owns its draft row (see `holdsDraft`).
+        let replyKey = held.state.forwardOfMessageId == nil ? held.state.replyToMessageId : -1
+        releasingReplyKeys.append(replyKey)
+        defer {
+            if let i = releasingReplyKeys.firstIndex(of: replyKey) { releasingReplyKeys.remove(at: i) }
+        }
+        await DraftSaver.shared.settle()
+        holding.remove(held.state.id)
+        held.state = withDetachedDraft(held.state)
+        guard held.epoch == epoch else { return }
+        let outcome = await ComposeSubmit.fire(held.state, override: held.override)
+        // The account changed while it was on the wire: whatever came back
+        // belongs to the OLD account, and its message ids mean nothing here.
+        guard held.epoch == epoch else {
+            if case .sent = outcome { pushToast("sent", .success) }
+            return
+        }
+        switch outcome {
         case .sent(let result):
             // The daemon resolved the replied-to update; without this the row
             // sits in its band until the next poll, reading as a no-op.
@@ -3179,8 +3264,16 @@ final class AppStore {
             compose = state
             DraftSaver.shared.noteChange(.compose)
         } else {
-            let saved = state.draftId != nil ? ". Its last autosave is in your drafts" : ""
-            pushToast("not sent: \(reason ?? "undone")\(saved)", .error)
+            // Nowhere to reopen it without overwriting a newer composer, so it
+            // goes back to the daemon as a draft instead. Not a forward: those
+            // are never saved (see `DraftSaver.save`), and saying otherwise
+            // would send somebody looking for mail that is not there.
+            if state.forwardOfMessageId == nil {
+                DraftSaver.shared.saveDetached(held.slot, state)
+                pushToast("not sent: \(reason ?? "undone"). It is in your drafts", .error)
+            } else {
+                pushToast("not sent: \(reason ?? "undone")", .error)
+            }
             return
         }
         if let reason { pushToast("not sent: \(reason)", .error) }

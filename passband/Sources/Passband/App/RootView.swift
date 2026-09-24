@@ -292,14 +292,16 @@ struct MainShell: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // The composer: a working surface in the layout, NOT an overlay
-                // — no scrim, no blur, the page beside it stays live. Opened
-                // out to full screen it leaves the layout for its own layer,
-                // below.
+                // The composer's STRIP: a working surface in the layout, NOT an
+                // overlay — no scrim, no blur, the page beside it shrinks and
+                // stays live. The pane itself is drawn in its own layer below,
+                // so that opening it out to full screen moves ONE view rather
+                // than swapping in a second one (which would drop the caret,
+                // the focus and the editor's undo stack on every toggle).
                 if store.compose != nil && !store.composeExpanded {
-                    ComposePane()
+                    Color.clear
                         .frame(width: composeWidth)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        .allowsHitTesting(false)
                 }
             }
 
@@ -377,19 +379,28 @@ struct MainShell: View {
                 .zIndex(20)
             }
 
-            // THE COMPOSER OPENED OUT: everything right of the rail, over the
-            // page and over an open reader alike, with the mail itself in a
-            // centred column (ComposePane holds the measure). The rail stays,
-            // same as it does for the reader.
-            if store.compose != nil && store.composeExpanded {
+            // THE COMPOSER, in both of its sizes. Side-by-side it sits in the
+            // strip reserved above, UNDER the side panels and the reader (which
+            // insets past it), exactly where it sat when it lived in the
+            // layout. Opened out it takes everything right of the rail, over
+            // the page and an open reader alike, with the mail in a centred
+            // column (ComposePane holds the measure). The rail stays, as it
+            // does for the reader. Same view in both: only its frame and its
+            // layer change.
+            if store.compose != nil {
                 HStack(spacing: 0) {
-                    Color.clear
-                        .frame(width: SidebarRail.railWidth)
-                        .allowsHitTesting(false)
+                    if store.composeExpanded {
+                        Color.clear
+                            .frame(width: SidebarRail.railWidth)
+                            .allowsHitTesting(false)
+                    } else {
+                        Spacer(minLength: 0)
+                    }
                     ComposePane()
+                        .frame(width: store.composeExpanded ? nil : composeWidth)
                 }
-                .transition(.opacity)
-                .zIndex(25)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+                .zIndex(store.composeExpanded ? 25 : 5)
             }
             }
             .blur(radius: store.modalOverlayOpen ? 9 : 0)

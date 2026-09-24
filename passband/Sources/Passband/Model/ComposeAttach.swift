@@ -239,6 +239,10 @@ enum ComposeAttach {
     }
 
     private static func write(_ slot: DraftSaver.Slot, _ state: ComposeState) {
+        // A file in or out is a different mail: a blocked send's override
+        // does not carry over to it (see the composers' `bind`).
+        var state = state
+        state.guardKinds = []
         switch slot {
         case .compose: AppStore.shared.compose = state
         case .inlineReply: AppStore.shared.inlineReply = state
