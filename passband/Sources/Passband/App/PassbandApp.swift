@@ -33,6 +33,7 @@ struct PassbandApp: App {
                 .background(WindowBackdrop().ignoresSafeArea())
                 .background(WindowConfigurator())
                 .onAppear {
+                    KeyMonitor.shared.onZoomIn = { Zoom.zoomIn() }
                     KeyMonitor.shared.install()
                     // The tester's panel beside the window, never for a
                     // customer: the flag is a launch argument only a
