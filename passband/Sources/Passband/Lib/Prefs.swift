@@ -127,6 +127,7 @@ final class Prefs {
         static let developerMode = "passband.pref.developerMode"
         static let tourCompleted = "passband.pref.tourCompleted"
         static let lastSeenReleaseNotes = "passband.pref.lastSeenReleaseNotes"
+        static let agentNudgeDone = "passband.pref.agentNudgeDone"
         static let theme = "passband.pref.theme"
         static let zoom = "passband.pref.zoom"
         static let threadStyle = "passband.pref.threadStyle"
@@ -149,6 +150,7 @@ final class Prefs {
             Key.settingsSection: SettingsSection.general.rawValue,
             Key.developerMode: false,
             Key.tourCompleted: false,
+            Key.agentNudgeDone: false,
             Key.theme: ThemeChoice.system.rawValue,
             Key.zoom: 1.0,
             Key.threadStyle: ThreadStyleDefault.auto.rawValue,
@@ -164,6 +166,7 @@ final class Prefs {
             ?? .general
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
+        _agentNudgeDone = defaults.bool(forKey: Key.agentNudgeDone)
         _lastSeenReleaseNotes = defaults.string(forKey: Key.lastSeenReleaseNotes)
         _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
         _zoom = Zoom.clamp(defaults.double(forKey: Key.zoom))
@@ -268,6 +271,17 @@ final class Prefs {
         set {
             _tourCompleted = newValue
             defaults.set(newValue, forKey: Key.tourCompleted)
+        }
+    }
+
+    /// Whether the "connect your agent" corner card has been answered, either
+    /// way. It asks once; Settings' Agents pane is where the offer lives after.
+    private var _agentNudgeDone: Bool
+    var agentNudgeDone: Bool {
+        get { _agentNudgeDone }
+        set {
+            _agentNudgeDone = newValue
+            defaults.set(newValue, forKey: Key.agentNudgeDone)
         }
     }
 

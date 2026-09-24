@@ -46,7 +46,7 @@ struct AccountPage: View {
     /// beside the pane is a map, and a map you can read at a glance has no
     /// reason to lead with anything.
     private static let order: [SettingsSection] = [
-        .account, .general, .mail, .triage, .assistant, .privacy, .audit,
+        .account, .general, .mail, .triage, .assistant, .agents, .privacy, .audit,
     ]
 
     private var accounts: [AccountRecord] { AccountManager.shared.accounts }
@@ -232,6 +232,8 @@ struct AccountPage: View {
                     RankingSection()
                 case .assistant:
                     AssistantSection()
+                case .agents:
+                    AgentsSection()
                 case .privacy:
                     PrivacySection()
                 case .audit:
@@ -258,6 +260,7 @@ struct AccountPage: View {
         case .mail: "envelope"
         case .triage: "arrow.triangle.branch"
         case .assistant: "sparkles"
+        case .agents: "point.3.connected.trianglepath.dotted"
         case .privacy: "hand.raised"
         case .audit: "scroll"
         case .account: "person.crop.circle"
@@ -270,6 +273,7 @@ struct AccountPage: View {
         case .mail: "images, search order, signature, read tracking"
         case .triage: "how it works, daily caps, ranking"
         case .assistant: "your own api key, and which model"
+        case .agents: "connect OpenClaw, Claude Code and others"
         case .privacy: "what telemetry leaves the app"
         case .audit: "what the agent and this app have done"
         case .account: "the mailboxes this install knows"

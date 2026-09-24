@@ -23,7 +23,7 @@ import Foundation
 /// bucket of entries. Keeping the three in one file is what lets the whole lot
 /// compile into a headless test with no app around it.
 enum SettingsSection: String, CaseIterable, Sendable {
-    case general, mail, triage, assistant, privacy, audit, account
+    case general, mail, triage, assistant, agents, privacy, audit, account
 
     var label: String {
         switch self {
@@ -31,6 +31,7 @@ enum SettingsSection: String, CaseIterable, Sendable {
         case .mail: "Mail"
         case .triage: "Triage"
         case .assistant: "Assistant"
+        case .agents: "Agents"
         case .privacy: "Privacy"
         case .audit: "Audit"
         case .account: "Account"
@@ -54,6 +55,7 @@ enum SettingsCard: String, CaseIterable, Sendable {
     case mail, search, signature, readTracking
     case triagePipeline, triageBudget, ranking
     case assistant
+    case agents
     case privacy
     case audit
     case account
@@ -65,6 +67,7 @@ enum SettingsCard: String, CaseIterable, Sendable {
         case .mail, .search, .signature, .readTracking: .mail
         case .triagePipeline, .triageBudget, .ranking: .triage
         case .assistant: .assistant
+        case .agents: .agents
         case .privacy: .privacy
         case .audit: .audit
         case .account: .account
@@ -102,6 +105,7 @@ enum SettingsCard: String, CaseIterable, Sendable {
         case .triageBudget: "While triage is working"
         case .ranking: "For your eyes"
         case .assistant: "Assistant"
+        case .agents: "Agents"
         case .privacy: "Developer Telemetry"
         case .audit: "Audit log"
         case .account: "Accounts"
@@ -135,7 +139,7 @@ enum SettingsSearch {
     /// control nobody can find by describing it, which is why the coverage
     /// assertion in the test suite fails a card that gains one and no words.
     static let entries: [SettingsEntry] = generalEntries + mailEntries + triageEntries
-        + assistantEntries + privacyEntries + auditEntries + accountEntries
+        + assistantEntries + agentEntries + privacyEntries + auditEntries + accountEntries
 
     private static let generalEntries: [SettingsEntry] = [
         SettingsEntry(
@@ -343,6 +347,26 @@ enum SettingsSearch {
             keywords: [
                 "search model", "deeper search model", "lane model", "haiku", "opus",
                 "which model searches", "search llm", "search ai",
+            ]),
+    ]
+
+    private static let agentEntries: [SettingsEntry] = [
+        SettingsEntry(
+            card: .agents,
+            title: "Connect an agent",
+            blurb: "Lets an AI agent you already run read your triaged inbox over MCP.",
+            keywords: [
+                "agent", "agents", "mcp", "model context protocol", "openclaw", "claude code",
+                "codex", "cursor", "claude desktop", "connect an agent", "integration",
+                "integrations", "ai agent", "tools", "mcp server", "agent door",
+            ]),
+        SettingsEntry(
+            card: .agents,
+            title: "Agent endpoint",
+            blurb: "The address an agent points at to reach this mailbox.",
+            keywords: [
+                "mcp url", "agent url", "streamable http", "allowed hosts",
+                "squelch_mcp_allowed_hosts", "403", "tailscale", "tailnet", "remote agent",
             ]),
     ]
 

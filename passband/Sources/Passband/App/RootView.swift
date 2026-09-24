@@ -253,6 +253,9 @@ private struct ShellWatchers: View {
                     store.tour.maybeStart()
                     // Onboarding claims the moment before release notes.
                     store.whatsNew.maybeShow()
+                    // The agent offer is a corner card, not a modal, so it can
+                    // wait out either of those rather than compete with them.
+                    AgentConnect.shared.maybeNudge(serverURL: store.settings?.serverURL)
                 }
             }
     }
