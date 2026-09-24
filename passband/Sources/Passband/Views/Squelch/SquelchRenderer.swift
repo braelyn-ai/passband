@@ -30,7 +30,7 @@ struct SquelchSceneState {
     /// crossfades instead of cutting.
     var light: Float = 0
 
-    static let waveSpeed: Float = 1.5
+    static let waveSpeed: Float = 2.4
     static let xMax: Float = 13
 
     /// Advance the fronts. `engaged` is the switch; everything else follows.
@@ -318,26 +318,12 @@ float noiseAmp(float i, float s, constant U& u) {
     float burst = 0.3 + 0.9 * smoothstep(-0.15, 0.7, vnoise(float2(s * 0.16, i * 0.31)));
     return (0.16 + 0.95 * hump) * burst;
 }
-// The noise itself. Each octave's temporal frequency (spatial frequency times
-// how fast it slides) is capped well under the display rate: when every octave
-// advected at the wave speed, the finest detail slid ~its own width per frame
-// and strobed, and anything
-// much above ~3 Hz across a hundred dense lines is tiring to look at. The broad shapes still flow downstream at full speed; the fine
-// grain drifts slower and churns in place, which reads as noise, not as lag.
+// The noise itself: one field, every octave advected together at the wave
+// speed. (Capping the fine octaves' speed stopped the strobing but layered a
+// second, slower motion under the first, which was worse to look at.)
 float noiseY(float i, float x, float t, constant U& u) {
-    float c = u.filter.y;
-    float s = x - c * t;
-    float sum = 0.0, a = 0.55, f = 2.7;
-    float2 off = float2(0.0, i * 1.93);
-    for (int k = 0; k < 4; k++) {
-        float v = min(c, 3.0 / f);             // cap: f * v <= 3 cycles/s
-        float2 p = float2(x * f - t * f * v, off.y) + float2(off.x, 0.0);
-        sum += a * vnoise(p) * (k == 3 ? 0.5 : 1.0);
-        off = off * 2.07 + float2(17.1, 3.7);
-        a *= 0.52;
-        f *= 2.07;
-    }
-    return noiseAmp(i, s, u) * sum * 1.12;
+    float s = x - u.filter.y * t;
+    return noiseAmp(i, s, u) * fbm(float2(s * 2.7, i * 1.93));
 }
 
 // The signal: wave packets on a carrier, one per stretch of stream per band.
