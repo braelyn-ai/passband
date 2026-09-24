@@ -770,6 +770,9 @@ mod tests {
             last_polled_at: None,
             poll_failures: 0,
             last_answered_at: None,
+            merchant: None,
+            orders: Vec::new(),
+            legs: Vec::new(),
         }
     }
 

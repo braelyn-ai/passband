@@ -75,12 +75,163 @@ fn record_newer_mail(
     Ok(())
 }
 
+/// One retained delivery proposal, laundered. Newest first in `reconcile`.
+struct Proposal {
+    message: i64,
+    received: DateTime<Utc>,
+    /// `item_name` is the sanitized agent name, or empty.
+    info: crate::triage::ShipmentInfo,
+    merchant: Option<String>,
+    order_refs: Vec<String>,
+}
+
+/// Rebuild the 'agent' order links of one shipment from its retained
+/// proposals. 'legacy' links are left alone, and one already holding a key
+/// wins.
+///
+/// ONE MERCHANT PER BOX. Every ref goes under the package's single `seller`
+/// (the newest proposal that named one, with its message), not under whatever
+/// each proposal said: one box is sold by one store, and letting two proposals
+/// file its refs under two stores would let a single package chain two shops'
+/// orders into one card. A ref with no seller anywhere is stored under
+/// merchant_key '' and never groups.
+///
+/// Each link records the message that printed its ref (`message_id`) and the
+/// one that named the seller (`merchant_msg`): the agent door serves a link
+/// only when both are mail it may read.
+fn rebuild_order_links(
+    conn: &Connection,
+    account: AccountId,
+    id: i64,
+    mine: &[&Proposal],
+    seller: Option<(&str, i64)>,
+) -> Result<()> {
+    use crate::triage::order_link::{merchant_key, order_key};
+    if !super::migrate::order_links_exist(conn)? {
+        // The migration could not create it this open; it retries next open.
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM shipment_order_links WHERE account_id=?1 AND shipment_id=?2 AND source='agent'",
+        params![account, id],
+    )?;
+    let (merchant, merchant_msg) = match seller {
+        Some((name, message)) => (name, Some(message)),
+        None => ("", None),
+    };
+    for proposal in mine {
+        for order_ref in &proposal.order_refs {
+            conn.execute(
+                "INSERT OR IGNORE INTO shipment_order_links
+                     (account_id,shipment_id,merchant_key,order_key,merchant,order_ref,source,
+                      message_id,merchant_msg)
+                 VALUES(?1,?2,?3,?4,?5,?6,'agent',?7,?8)",
+                params![
+                    account,
+                    id,
+                    merchant_key(merchant),
+                    order_key(order_ref),
+                    merchant,
+                    order_ref,
+                    proposal.message,
+                    merchant_msg,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// What the retained proposals say the package IS: its name and its seller.
+///
+/// An OWNED row is a projection, so both follow the newest proposal that
+/// states them, and fall away when the last such proposal is retracted. A
+/// proposal that states NO name never erases one: "newest with a name" skips
+/// it.
+///
+/// A LEGACY row's name and merchant were written by the old subsystem, and the
+/// agent's replace them only when mail NEWER than the row lands (`since`, the
+/// row's `last_update` before this pass), the same gate `record_newer_mail`
+/// uses. Nothing newer, or nothing newer that names it: untouched.
+///
+/// ONCE THE AGENT HAS RENAMED A LEGACY ROW the old name is gone, and the name
+/// is the agent's like an owned row's: it follows the newest proposal naming
+/// the package (the gate has nothing left to protect), and when the proposal
+/// that named it is retracted and none remaining does, it is cleared to the
+/// unnamed state. The legacy name cannot come back; showing a retracted
+/// mail's words would be worse. The merchant likewise, judged by
+/// `order_merchant_msg` (set only when the agent wrote it).
+fn record_identity(
+    conn: &Connection,
+    account: AccountId,
+    id: i64,
+    managed: bool,
+    mine: &[&Proposal],
+    since: DateTime<Utc>,
+) -> Result<()> {
+    let (agent_named, agent_merchant): (bool, bool) = match conn
+        .query_row(
+            "SELECT item_name_source='agent', order_merchant_msg IS NOT NULL
+             FROM shipments WHERE account_id=?1 AND id=?2",
+            params![account, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+    {
+        Some(flags) => flags,
+        // Retired by the caller: nothing to write.
+        None => return Ok(()),
+    };
+    let named = mine
+        .iter()
+        .filter(|p| managed || agent_named || p.received > since)
+        .find(|p| !p.info.item_name.is_empty());
+    let merchant = mine
+        .iter()
+        .filter(|p| managed || agent_merchant || p.received > since)
+        .find_map(|p| p.merchant.as_deref().map(|m| (m, p.message)));
+    match named {
+        Some(p) => {
+            conn.execute(
+                "UPDATE shipments SET item_name=?3, item_name_source='agent', item_name_msg=?4
+                 WHERE account_id=?1 AND id=?2",
+                params![account, id, p.info.item_name, p.message],
+            )?;
+        }
+        // Reset to the column's resting provenance, as every scrub does.
+        None if managed || agent_named => {
+            conn.execute(
+                "UPDATE shipments SET item_name='', item_name_source='regex', item_name_msg=NULL
+                 WHERE account_id=?1 AND id=?2",
+                params![account, id],
+            )?;
+        }
+        None => {}
+    }
+    if merchant.is_some() || managed || agent_merchant {
+        conn.execute(
+            "UPDATE shipments SET order_merchant=?3, order_merchant_msg=?4
+             WHERE account_id=?1 AND id=?2",
+            params![
+                account,
+                id,
+                merchant.map(|(m, _)| m),
+                merchant.map(|(_, msg)| msg)
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn reconcile(
     conn: &Connection,
     account: AccountId,
     previous: Option<&MessageDecision>,
     current: &MessageDecision,
 ) -> Result<()> {
+    use crate::triage::order_link::{
+        sanitize_agent_item_name, sanitize_merchant, sanitize_order_refs,
+    };
     let affected: BTreeSet<String> = previous
         .into_iter()
         .flat_map(tracking_numbers)
@@ -90,17 +241,22 @@ pub(super) fn reconcile(
         return Ok(());
     }
     let mut statement = conn.prepare(
-        "SELECT d.message_id,d.decision_json,m.received_at
+        "SELECT d.message_id,d.decision_json,m.received_at,m.subject
          FROM agent_message_decisions d JOIN messages m ON m.id=d.message_id AND m.account_id=d.account_id
          WHERE d.account_id=?1 AND m.is_sent=0 AND m.is_spam=0 ORDER BY m.received_at DESC,m.id DESC",
     )?;
     let decisions = statement
         .query_map([account], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, dt(row, 2)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                dt(row, 2)?,
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut proposals = Vec::new();
-    for (message, encoded, received) in decisions {
+    for (message, encoded, received, subject) in decisions {
         let decision: MessageDecision =
             serde_json::from_str(&encoded).map_err(|e| CoreError::Other(e.into()))?;
         for record in decision.records {
@@ -108,6 +264,9 @@ pub(super) fn reconcile(
                 carrier: Some(carrier),
                 tracking_number: Some(number),
                 status,
+                item_name,
+                merchant,
+                order_refs,
                 ..
             } = record
                 && let Some(number) = sanitize_tracking_number(Some(&number), None)
@@ -118,17 +277,29 @@ pub(super) fn reconcile(
                 )
                 && let Some(status) = crate::triage::ShipmentStatus::parse(&status)
             {
-                proposals.push((
+                let merchant = sanitize_merchant(merchant.as_deref());
+                let order_refs = sanitize_order_refs(&order_refs);
+                let item_name = sanitize_agent_item_name(
+                    item_name.as_deref(),
+                    &subject,
+                    merchant.as_deref(),
+                    &carrier,
+                    &order_refs,
+                )
+                .unwrap_or_default();
+                proposals.push(Proposal {
                     message,
                     received,
-                    crate::triage::ShipmentInfo {
+                    info: crate::triage::ShipmentInfo {
                         tracking_url: crate::triage::shipment::tracking_url(&carrier, &number),
                         carrier,
                         tracking_number: number,
                         status,
-                        item_name: String::new(),
+                        item_name,
                     },
-                ));
+                    merchant,
+                    order_refs,
+                });
             }
         }
     }
@@ -140,22 +311,29 @@ pub(super) fn reconcile(
                 |row| row.get(0),
             )
             .optional()?;
-        let latest = proposals
+        let mine: Vec<&Proposal> = proposals
             .iter()
-            .find(|(_, _, info)| info.tracking_number == number);
-        let Some((message, received, info)) = latest else {
+            .filter(|p| p.info.tracking_number == number)
+            .collect();
+        let Some(latest) = mine.first() else {
             if let Some(id) = existing {
                 // Imported legacy rows belong to their original subsystem and
                 // remain intact; only rows created by this projection are retired.
+                // Deleting a row takes its order links with it (the trigger in
+                // migrate.rs); a kept legacy row loses only the agent's links.
                 conn.execute("DELETE FROM shipments WHERE account_id=?1 AND id=?2 AND EXISTS(
                     SELECT 1 FROM agent_delivery_projections p WHERE p.account_id=?1 AND p.shipment_id=?2)", params![account,id])?;
                 conn.execute(
                     "DELETE FROM agent_delivery_projections WHERE account_id=?1 AND shipment_id=?2",
                     params![account, id],
                 )?;
+                rebuild_order_links(conn, account, id, &[], None)?;
+                // A kept legacy row the agent had renamed loses that name.
+                record_identity(conn, account, id, false, &[], Utc::now())?;
             }
             continue;
         };
+        let (message, received, info) = (&latest.message, &latest.received, &latest.info);
         let carrier_status: Option<String> = conn.query_row(
             "SELECT status FROM shipments WHERE account_id=?1 AND tracking_number=?2 AND carrier_status_raw IS NOT NULL",
             params![account,number], |row|row.get(0),
@@ -174,6 +352,11 @@ pub(super) fn reconcile(
             id
         };
         let managed: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_delivery_projections WHERE account_id=?1 AND shipment_id=?2)",params![account,id],|r|r.get(0))?;
+        let since: DateTime<Utc> = conn.query_row(
+            "SELECT last_update FROM shipments WHERE account_id=?1 AND id=?2",
+            params![account, id],
+            |r| dt(r, 0),
+        )?;
         // WHAT THE MAIL SAYS THE STATUS IS differs by ownership, and it is the
         // only thing that does. An OWNED row is a projection of the retained
         // proposals, so the newest one is authoritative and a retraction can
@@ -200,6 +383,11 @@ pub(super) fn reconcile(
         record_newer_mail(
             conn, account, id, managed, *message, info, &status, *received,
         )?;
+        record_identity(conn, account, id, managed, &mine, since)?;
+        let seller = mine
+            .iter()
+            .find_map(|p| p.merchant.as_deref().map(|m| (m, p.message)));
+        rebuild_order_links(conn, account, id, &mine, seller)?;
     }
     Ok(())
 }
@@ -228,14 +416,692 @@ mod tests {
     }
 
     fn delivery(number: &str, status: &str) -> MessageDecision {
+        named(number, status, None, None, &[])
+    }
+
+    fn named(
+        number: &str,
+        status: &str,
+        item: Option<&str>,
+        merchant: Option<&str>,
+        refs: &[&str],
+    ) -> MessageDecision {
         MessageDecision {
             records: vec![RecordProposal::Delivery {
                 carrier: Some("ups".into()),
                 tracking_number: Some(number.into()),
                 status: status.into(),
+                item_name: item.map(str::to_string),
+                merchant: merchant.map(str::to_string),
+                order_refs: refs.iter().map(|r| r.to_string()).collect(),
                 evidence: vec![],
             }],
             ..Default::default()
+        }
+    }
+
+    /// `(item_name, item_name_source, item_name_msg, order_merchant)` of a row.
+    fn identity(
+        store: &SqliteStore,
+        number: &str,
+    ) -> (String, String, Option<i64>, Option<String>) {
+        store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT item_name,item_name_source,item_name_msg,order_merchant
+                 FROM shipments WHERE tracking_number=?1",
+                [number],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    /// Every order link, as `(tracking_number, merchant_key, order_key, source)`.
+    fn links(store: &SqliteStore) -> Vec<(String, String, String, String)> {
+        let conn = store.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.tracking_number,l.merchant_key,l.order_key,l.source
+                 FROM shipment_order_links l JOIN shipments s ON s.id=l.shipment_id
+                 ORDER BY s.tracking_number,l.order_key",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    fn link_count(store: &SqliteStore) -> i64 {
+        store
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM shipment_order_links", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn add_message(store: &SqliteStore, id: i64, subject: &str, age: chrono::Duration) {
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO messages(id,account_id,gmail_msg_id,thread_id,from_addr,subject,received_at,snippet,body)
+                 VALUES(?1,1,?2,?2,'orders@billsexhausts.test',?3,?4,'','')",
+                params![id, id.to_string(), subject, (Utc::now() - age).to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    /// EVERY STORED DECISION IS RE-READ. One written before the three new
+    /// fields existed must still deserialize, or reconcile fails the whole pass
+    /// for every package the account has.
+    #[test]
+    fn a_stored_decision_without_the_new_fields_still_reconciles() {
+        let store = fixture();
+        let old = r#"{"kinds":["delivery"],"destinations":[],"summary":"s","reason":"r",
+            "auth":{"kinds":[],"evidence":[]},
+            "external_access":{"restricted":false,"reason":"r","evidence":[]},
+            "attention":{"show_in_fye":false,"state":"informational","actions":[],"summary":"",
+                "factors":{"urgency":0,"action_need":0,"personal_relevance":0,"importance":0,"attention_at":null},
+                "relevant_message_ids":[],"evidence":[]},
+            "records":[{"kind":"delivery","carrier":"ups","tracking_number":"1Z999AA10123456784",
+                "status":"shipped","evidence":[]}],
+            "related_updates":[],"rule_exceptions":[],
+            "notification":{"importance":0,"title":"","body":"","reason":""},"revisit":null}"#;
+        let decision: MessageDecision = serde_json::from_str(old).unwrap();
+        {
+            let mut conn = store.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute(
+                "INSERT INTO agent_message_decisions(account_id,message_id,revision,decision_json,decided_at)
+                 VALUES(1,1,1,?1,?2)",
+                params![old, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+            reconcile(&tx, 1, None, &decision).unwrap();
+            tx.commit().unwrap();
+        }
+        // A NEW decision about the same package re-reads the old one too.
+        write(
+            &store,
+            2,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "out_for_delivery",
+                Some("Desk Lamp"),
+                None,
+                &[],
+            ),
+        );
+        let rows = listed(&store);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item_name, "Desk Lamp");
+        assert_eq!(rows[0].status, "out_for_delivery");
+    }
+
+    /// THE REAL CASE. Two UPS numbers, one order: the supplier-to-merchant leg,
+    /// whose mail never prints the order number (the model found it in the
+    /// sender's July thread and cites that message), and the leg to the user.
+    /// One card, named, with both rows carrying order 21470.
+    #[test]
+    fn two_numbers_on_one_order_are_one_named_card() {
+        let store = fixture();
+        add_message(
+            &store,
+            3,
+            "Austin Racing shipment update",
+            chrono::Duration::minutes(50),
+        );
+        add_message(
+            &store,
+            4,
+            "A shipment from order #21470 is on the way",
+            chrono::Duration::minutes(10),
+        );
+        let inbound = named(
+            "1ZW061R3DG21045729",
+            "shipped",
+            None,
+            Some("Bill's Exhausts"),
+            &["21470"],
+        );
+        let outbound = named(
+            "1ZB8B2560323528551",
+            "shipped",
+            Some("Austin Racing DB Killer AUR10"),
+            Some("BILLS EXHAUSTS"),
+            &["Order #21470"],
+        );
+        write(&store, 3, None, &inbound);
+        write(&store, 4, None, &outbound);
+        assert_eq!(
+            links(&store),
+            vec![
+                (
+                    "1ZB8B2560323528551".into(),
+                    "billsexhausts".into(),
+                    "21470".into(),
+                    "agent".into()
+                ),
+                (
+                    "1ZW061R3DG21045729".into(),
+                    "billsexhausts".into(),
+                    "21470".into(),
+                    "agent".into()
+                ),
+            ]
+        );
+        let cards = listed(&store);
+        assert_eq!(cards.len(), 1, "one order, one card");
+        let card = &cards[0];
+        assert_eq!(
+            card.tracking_number, "1ZB8B2560323528551",
+            "the newest leg represents"
+        );
+        assert_eq!(card.item_name, "Austin Racing DB Killer AUR10");
+        assert_eq!(card.merchant.as_deref(), Some("BILLS EXHAUSTS"));
+        assert_eq!(card.orders.len(), 1);
+        assert_eq!(card.orders[0].order_ref, "21470");
+        assert_eq!(card.legs.len(), 1);
+        assert_eq!(card.legs[0].tracking_number, "1ZW061R3DG21045729");
+        // The poller still sees two numbers.
+        assert_eq!(
+            store
+                .list_pollable_shipments(1, Utc::now() - chrono::Duration::days(1), 5)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        // Retracting the outbound proposal retires its row AND its links, and
+        // the inbound leg stands alone again, still carrying the order.
+        write(&store, 4, Some(&outbound), &MessageDecision::default());
+        assert_eq!(links(&store).len(), 1);
+        let cards = listed(&store);
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].legs.is_empty());
+        assert_eq!(cards[0].item_name, "", "the inbound mail never named it");
+    }
+
+    /// A ref with no merchant is kept and shown but never groups: "#1001" is
+    /// a different purchase at every shop.
+    #[test]
+    fn merchantless_refs_are_stored_but_never_group() {
+        let store = fixture();
+        write(
+            &store,
+            1,
+            None,
+            &named("1Z999AA10123456784", "shipped", None, None, &["1001"]),
+        );
+        write(
+            &store,
+            2,
+            None,
+            &named("1Z999AA10123456785", "shipped", None, None, &["#1001"]),
+        );
+        assert_eq!(
+            links(&store)[0].1,
+            "",
+            "stored under the empty merchant key"
+        );
+        let cards = listed(&store);
+        assert_eq!(cards.len(), 2);
+        assert!(
+            cards
+                .iter()
+                .all(|c| c.orders.len() == 1 && c.legs.is_empty())
+        );
+    }
+
+    /// A mail that names the order but not the seller, about a box another
+    /// mail already attributed: same box, same seller, so the order groups.
+    #[test]
+    fn a_ref_borrows_the_packages_merchant() {
+        let store = fixture();
+        write(
+            &store,
+            1,
+            None,
+            &named("1Z999AA10123456784", "shipped", None, Some("Bean Co"), &[]),
+        );
+        write(
+            &store,
+            2,
+            None,
+            &named("1Z999AA10123456784", "shipped", None, None, &["7"]),
+        );
+        assert_eq!(links(&store)[0].1, "beanco");
+    }
+
+    /// Only visible rows group: a silent leg does not ride along on the card.
+    #[test]
+    fn a_hidden_row_never_groups() {
+        let store = fixture();
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(30)).to_rfc3339()],
+            )
+            .unwrap();
+        write(
+            &store,
+            1,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                None,
+                Some("Bean Co"),
+                &["7"],
+            ),
+        );
+        write(
+            &store,
+            2,
+            None,
+            &named(
+                "1Z999AA10123456785",
+                "shipped",
+                None,
+                Some("Bean Co"),
+                &["7"],
+            ),
+        );
+        assert!(
+            links(&store).iter().all(|l| l.1 == "beanco"),
+            "both carry a groupable key, so only the hide keeps them apart"
+        );
+        let cards = listed(&store);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].tracking_number, "1Z999AA10123456785");
+        assert!(cards[0].legs.is_empty(), "the silent leg stays hidden");
+    }
+
+    /// A retracted proposal takes its agent links with it, on a legacy row
+    /// too, and a legacy link is never touched.
+    #[test]
+    fn retraction_removes_agent_links_and_keeps_legacy_ones() {
+        let store = fixture();
+        let id = legacy_row(&store, "1Z999AA10123456784", 3);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO shipment_order_links
+                     (account_id,shipment_id,merchant_key,order_key,merchant,order_ref,source)
+                 VALUES(1,?1,'shopa','1042','Shop A','1042','legacy')",
+                [id],
+            )
+            .unwrap();
+        let update = named(
+            "1Z999AA10123456784",
+            "shipped",
+            None,
+            Some("Shop B"),
+            &["55"],
+        );
+        write(&store, 2, None, &update);
+        assert_eq!(link_count(&store), 2);
+        write(&store, 2, Some(&update), &MessageDecision::default());
+        assert_eq!(
+            links(&store),
+            vec![(
+                "1Z999AA10123456784".into(),
+                "shopa".into(),
+                "1042".into(),
+                "legacy".into()
+            )]
+        );
+    }
+
+    /// A legacy row's name is the old subsystem's; only mail NEWER than the
+    /// row replaces it, and then it is the agent's.
+    #[test]
+    fn a_legacy_name_is_replaced_only_by_newer_mail() {
+        let store = fixture();
+        legacy_row(&store, "1Z999AA10123456784", 1);
+        // The row is a day old; message 1 goes further back than that.
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(2)).to_rfc3339()],
+            )
+            .unwrap();
+        write(
+            &store,
+            1,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                Some("Old Desk Lamp"),
+                Some("Lamps Co"),
+                &[],
+            ),
+        );
+        let (name, source, _, merchant) = identity(&store, "1Z999AA10123456784");
+        assert_eq!(
+            (name.as_str(), source.as_str()),
+            ("Lamp", "regex"),
+            "older mail renames nothing"
+        );
+        assert_eq!(merchant, None);
+        write(
+            &store,
+            2,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                Some("Brass Desk Lamp"),
+                Some("Lamps Co"),
+                &[],
+            ),
+        );
+        let (name, source, msg, merchant) = identity(&store, "1Z999AA10123456784");
+        assert_eq!(
+            (name.as_str(), source.as_str(), msg),
+            ("Brass Desk Lamp", "agent", Some(2))
+        );
+        assert_eq!(merchant.as_deref(), Some("Lamps Co"));
+    }
+
+    /// A newer proposal that names nothing never erases a name, on an owned row
+    /// or a legacy one. Retracting the proposal that named it does.
+    #[test]
+    fn an_empty_name_never_erases_one() {
+        let store = fixture();
+        let named_mail = named(
+            "1Z999AA10123456784",
+            "shipped",
+            Some("Espresso Machine"),
+            Some("Bean Co"),
+            &[],
+        );
+        write(&store, 1, None, &named_mail);
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456784", "out_for_delivery"),
+        );
+        let (name, source, msg, merchant) = identity(&store, "1Z999AA10123456784");
+        assert_eq!(
+            (name.as_str(), source.as_str(), msg),
+            ("Espresso Machine", "agent", Some(1))
+        );
+        assert_eq!(merchant.as_deref(), Some("Bean Co"));
+        // The owned row is a projection: the naming proposal gone, the name goes.
+        write(&store, 1, Some(&named_mail), &MessageDecision::default());
+        let (name, source, msg, merchant) = identity(&store, "1Z999AA10123456784");
+        assert_eq!((name.as_str(), source.as_str(), msg), ("", "regex", None));
+        assert_eq!(merchant, None);
+
+        // Legacy: newer unnamed mail keeps the legacy name.
+        legacy_row(&store, "1Z999AA10123456785", 1);
+        write(
+            &store,
+            2,
+            None,
+            &delivery("1Z999AA10123456785", "out_for_delivery"),
+        );
+        assert_eq!(identity(&store, "1Z999AA10123456785").0, "Lamp");
+    }
+
+    /// The model's name is laundered before it lands: a status phrase, the
+    /// store's own name or the order number is not what is in the box.
+    #[test]
+    fn a_junk_agent_name_is_not_stored() {
+        let store = fixture();
+        for (id, junk) in [(1, "Arriving soon"), (2, "Bill's Exhausts")] {
+            write(
+                &store,
+                id,
+                None,
+                &named(
+                    "1Z999AA10123456784",
+                    "shipped",
+                    Some(junk),
+                    Some("Bill's Exhausts"),
+                    &["21470"],
+                ),
+            );
+            assert_eq!(identity(&store, "1Z999AA10123456784").0, "", "{junk}");
+        }
+    }
+
+    /// ONE MERCHANT PER BOX. Two mails about one box, the older naming Shop A
+    /// order 1 and the newer Shop B order 2: every ref lands under the box's
+    /// one seller (the newest), so the box cannot be the bridge that chains a
+    /// Shop A order into a Shop B card.
+    #[test]
+    fn one_box_files_every_ref_under_its_one_seller() {
+        let store = fixture();
+        add_message(&store, 3, "Order update", chrono::Duration::minutes(5));
+        write(
+            &store,
+            1,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                None,
+                Some("Shop A"),
+                &["1"],
+            ),
+        );
+        write(
+            &store,
+            2,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                None,
+                Some("Shop B"),
+                &["2"],
+            ),
+        );
+        write(
+            &store,
+            3,
+            None,
+            &named(
+                "1Z999AA10123456785",
+                "shipped",
+                None,
+                Some("Shop A"),
+                &["1"],
+            ),
+        );
+        let box_links: Vec<_> = links(&store)
+            .into_iter()
+            .filter(|l| l.0 == "1Z999AA10123456784")
+            .map(|l| (l.1, l.2))
+            .collect();
+        assert_eq!(
+            box_links,
+            vec![("shopb".into(), "1".into()), ("shopb".into(), "2".into())]
+        );
+        assert_eq!(
+            listed(&store).len(),
+            2,
+            "Shop A's other box stays its own card"
+        );
+    }
+
+    /// A LEGACY ROW THE AGENT RENAMED, THEN RETRACTED. The legacy name is gone
+    /// for good once the agent replaced it, so when the only proposal naming
+    /// the package is retracted the row goes back to unnamed, with no
+    /// provenance pointing at the retracted mail and no agent merchant.
+    #[test]
+    fn a_retracted_rename_of_a_legacy_row_clears_the_agents_name() {
+        let store = fixture();
+        legacy_row(&store, "1Z999AA10123456784", 1);
+        let rename = named(
+            "1Z999AA10123456784",
+            "shipped",
+            Some("Brass Desk Lamp"),
+            Some("Lamps Co"),
+            &[],
+        );
+        write(&store, 2, None, &rename);
+        assert_eq!(identity(&store, "1Z999AA10123456784").0, "Brass Desk Lamp");
+        write(&store, 2, Some(&rename), &MessageDecision::default());
+        let (name, source, msg, merchant) = identity(&store, "1Z999AA10123456784");
+        assert_eq!((name.as_str(), source.as_str(), msg), ("", "regex", None));
+        assert_eq!(merchant, None);
+        let merchant_msg: Option<i64> = store
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT order_merchant_msg FROM shipments WHERE tracking_number='1Z999AA10123456784'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(merchant_msg, None);
+        assert!(
+            listed(&store).len() == 1,
+            "a legacy row is kept, only the agent's words go"
+        );
+    }
+
+    /// The same, when an OLDER proposal still names it: once the agent owns
+    /// the name, the newest remaining proposal naming the package names it,
+    /// even though that mail is older than the row.
+    #[test]
+    fn a_retracted_rename_falls_back_to_a_remaining_agent_name() {
+        let store = fixture();
+        legacy_row(&store, "1Z999AA10123456784", 1);
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE messages SET received_at=?1 WHERE id=1",
+                [(Utc::now() - chrono::Duration::days(2)).to_rfc3339()],
+            )
+            .unwrap();
+        let old = named(
+            "1Z999AA10123456784",
+            "shipped",
+            Some("Desk Lamp"),
+            Some("Lamps Co"),
+            &[],
+        );
+        let rename = named(
+            "1Z999AA10123456784",
+            "shipped",
+            Some("Brass Desk Lamp"),
+            Some("Lamp Shop"),
+            &[],
+        );
+        write(&store, 1, None, &old);
+        write(&store, 2, None, &rename);
+        write(&store, 2, Some(&rename), &MessageDecision::default());
+        let (name, source, msg, merchant) = identity(&store, "1Z999AA10123456784");
+        assert_eq!(
+            (name.as_str(), source.as_str(), msg),
+            ("Desk Lamp", "agent", Some(1))
+        );
+        assert_eq!(merchant.as_deref(), Some("Lamps Co"));
+    }
+
+    /// THE REPRESENTATIVE IS THE BOX STILL COMING. The newer box was delivered
+    /// two days ago and the older one is still in transit: one card, in
+    /// transit, on the listing the client reads (delivered included) and on
+    /// the one without delivered alike.
+    #[test]
+    fn a_delivered_leg_never_represents_an_order_still_in_transit() {
+        let store = fixture();
+        add_message(&store, 3, "Shipped", chrono::Duration::days(3));
+        add_message(&store, 4, "Delivered", chrono::Duration::days(2));
+        write(
+            &store,
+            3,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                None,
+                Some("Bean Co"),
+                &["5"],
+            ),
+        );
+        write(
+            &store,
+            4,
+            None,
+            &named(
+                "1Z999AA10123456785",
+                "delivered",
+                None,
+                Some("Bean Co"),
+                &["5"],
+            ),
+        );
+        let policy = crate::config::ShipmentListPolicy::default();
+        for include_delivered in [true, false] {
+            let cards = store.list_shipments(1, include_delivered, policy).unwrap();
+            assert_eq!(cards.len(), 1, "include_delivered={include_delivered}");
+            assert_eq!(cards[0].tracking_number, "1Z999AA10123456784");
+            assert_eq!(cards[0].status, "shipped");
+            assert_eq!(
+                cards[0].legs.len(),
+                1,
+                "the delivered box rides along (include_delivered={include_delivered})"
+            );
+        }
+    }
+
+    /// CLEARING A CARD CLEARS THE PURCHASE. The client posts the one id it
+    /// shows; every package on that card is cleared, whichever id it posts.
+    #[test]
+    fn clearing_any_package_of_a_card_clears_the_card() {
+        let policy = crate::config::ShipmentListPolicy::default();
+        for tap_leg in [false, true] {
+            let store = fixture();
+            write(
+                &store,
+                1,
+                None,
+                &named(
+                    "1Z999AA10123456784",
+                    "shipped",
+                    None,
+                    Some("Bean Co"),
+                    &["5"],
+                ),
+            );
+            write(
+                &store,
+                2,
+                None,
+                &named(
+                    "1Z999AA10123456785",
+                    "shipped",
+                    None,
+                    Some("Bean Co"),
+                    &["5"],
+                ),
+            );
+            let card = listed(&store).remove(0);
+            assert_eq!(card.legs.len(), 1);
+            let tapped = if tap_leg { card.legs[0].id } else { card.id };
+            assert!(store.clear_shipment(1, tapped, Utc::now(), policy).unwrap());
+            assert!(
+                store.list_shipments(1, true, policy).unwrap().is_empty(),
+                "tap_leg={tap_leg}"
+            );
         }
     }
 
@@ -313,6 +1179,111 @@ mod tests {
             marker_count, 0,
             "normalized final retraction removes ownership marker"
         );
+    }
+
+    /// A LONG DELIVERED HISTORY IS NEVER LOADED. Two thousand packages that
+    /// landed two months ago, every one linked to the same order as today's
+    /// box, are hidden for certain by the silence rule, so the listing, the
+    /// agent door's feed, its per-number check and a clear all read only the
+    /// rows that could show: today's box, and an old one a carrier answered
+    /// for yesterday (vouched, so still listed). Had the old rows been read
+    /// and wrongly kept, they would be legs on today's card.
+    #[test]
+    fn a_long_delivered_history_is_never_loaded() {
+        use super::super::specialists::{SHIPMENT_LINKS_READ, SHIPMENT_ROWS_READ};
+        use crate::store::agent_triage::AgentTriageStore;
+        let rows_read = || SHIPMENT_ROWS_READ.with(|n| n.replace(0));
+        let links_read = || SHIPMENT_LINKS_READ.with(|n| n.replace(0));
+        let store = fixture();
+        let policy = crate::config::ShipmentListPolicy::default();
+        let silence = policy.silence(Utc::now());
+        assert!(silence.is_some(), "the default policy goes silent");
+        write(
+            &store,
+            1,
+            None,
+            &named(
+                "1Z999AA10123456784",
+                "shipped",
+                None,
+                Some("Shop A"),
+                &["1042"],
+            ),
+        );
+        {
+            let mut conn = store.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            let old = (Utc::now() - chrono::Duration::days(60)).to_rfc3339();
+            for i in 0..2000 {
+                tx.execute(
+                    "INSERT INTO shipments(account_id,tracking_number,carrier,item_name,status,
+                         first_seen,last_update,delivered_at)
+                     VALUES(1,?1,'ups','','delivered',?2,?2,?2)",
+                    params![format!("OLD{i:06}"), old],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO shipment_order_links(account_id,shipment_id,merchant_key,
+                         order_key,merchant,order_ref,source)
+                     VALUES(1,?1,'shopa','1042','Shop A','1042','legacy')",
+                    [tx.last_insert_rowid()],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO shipments(account_id,tracking_number,carrier,item_name,status,
+                     first_seen,last_update,delivered_at,last_answered_at)
+                 VALUES(1,'VOUCHED','ups','','delivered',?1,?1,?1,?2)",
+                params![old, (Utc::now() - chrono::Duration::days(1)).to_rfc3339()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        rows_read();
+        links_read();
+
+        let cards = store.list_shipments(1, true, policy).unwrap();
+        let mut numbers: Vec<_> = cards.iter().map(|c| c.tracking_number.as_str()).collect();
+        numbers.sort();
+        assert_eq!(numbers, ["1Z999AA10123456784", "VOUCHED"]);
+        assert!(
+            cards.iter().all(|c| c.legs.is_empty()),
+            "no old box is a leg"
+        );
+        assert_eq!(rows_read(), 2, "only the rows that could show are read");
+        assert_eq!(links_read(), 1, "only the listed rows' links are read");
+
+        store.external_shipments_within(1, silence).unwrap();
+        assert_eq!(rows_read(), 2, "the agent door's feed is cut the same way");
+        assert!(
+            store
+                .agent_shipment_is_hidden(1, "OLD000007", silence)
+                .unwrap(),
+            "a record whose row was cut is hidden with it"
+        );
+        assert!(
+            !store
+                .agent_shipment_is_hidden(1, "VOUCHED", silence)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .agent_shipment_is_hidden(1, "OLD000007", None)
+                .unwrap(),
+            "with the window off, nothing is silent"
+        );
+
+        let fresh = cards
+            .iter()
+            .find(|c| c.tracking_number == "1Z999AA10123456784")
+            .unwrap();
+        assert!(
+            store
+                .clear_shipment(1, fresh.id, Utc::now(), policy)
+                .unwrap()
+        );
+        assert_eq!(rows_read(), 2, "a clear reads no history either");
+        assert_eq!(store.list_shipments(1, true, policy).unwrap().len(), 1);
     }
 
     /// A row written before the agent owned deliveries, `age_days` silent.

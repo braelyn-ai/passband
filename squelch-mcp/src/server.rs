@@ -23,7 +23,9 @@ use squelch_core::triage::agent_config::RankingConfig;
 use squelch_core::triage::decision::{
     EmailKind, MessageDestination, RecordProposal, SupportedTime, ThreadAttentionDecision,
 };
-use squelch_core::types::{AccountId, Disposition, SenderRule, ThreadView};
+use squelch_core::types::{
+    AccountId, Disposition, SenderRule, ShipmentLeg, ShipmentOrder, ThreadView,
+};
 
 /// The squelch MCP server. Single-account: the account is resolved once at
 /// construction, though every row already carries `account_id`.
@@ -158,6 +160,82 @@ pub struct ShipmentHit {
     /// poll. Carried because our five-rung ladder loses detail the agent can
     /// usefully relay ("Delivered to neighbor", "Held at customs").
     pub carrier_status_raw: Option<String>,
+    /// Who sold it, when known. Same meaning as the human door's.
+    pub merchant: Option<String>,
+    /// The orders this package (or, on a grouped hit, every package in the
+    /// group) carries.
+    pub orders: Vec<ShipmentOrder>,
+    /// The other packages folded into this hit because they share an order.
+    /// Grouped by the same rule as the human door, after the same hides.
+    pub legs: Vec<ShipmentLeg>,
+    /// The carrier row behind this hit, for grouping. Not served.
+    #[serde(skip)]
+    row: Option<squelch_core::types::Shipment>,
+}
+
+impl ShipmentHit {
+    fn from_row(shipment: squelch_core::types::Shipment) -> Self {
+        Self {
+            item_name: shipment.item_name.clone(),
+            carrier: shipment.carrier.clone(),
+            status: shipment.status.clone(),
+            tracking_number: shipment.tracking_number.clone(),
+            tracking_url: shipment.tracking_url.clone(),
+            last_update: shipment.last_update,
+            eta: shipment.eta,
+            carrier_status_raw: shipment.carrier_status_raw.clone(),
+            merchant: shipment.merchant.clone(),
+            orders: shipment.orders.clone(),
+            legs: Vec::new(),
+            row: Some(shipment),
+        }
+    }
+}
+
+/// One purchase, one hit: the human door's grouping (`order_link`), applied to
+/// the agent door's merged list, with the same representative rule
+/// ([`representative_first`](squelch_core::triage::order_link::representative_first):
+/// the newest package still on its way, the newest overall only when all have
+/// landed). Only a hit backed by a carrier row can carry orders, so a record
+/// with no tracking number always stands alone. The name and merchant fall
+/// back to the newest non-empty one in the group.
+fn group_hits(hits: Vec<ShipmentHit>) -> Vec<ShipmentHit> {
+    use squelch_core::triage::order_link::{card_name_and_merchant, fold_groups, union_orders};
+    let row_id = |h: &ShipmentHit| h.row.as_ref().map_or(0, |r| r.id);
+    let groups = fold_groups(
+        hits,
+        |h| h.orders.as_slice(),
+        |h| (h.status == "delivered", h.last_update, row_id(h)),
+    );
+    let mut out = Vec::with_capacity(groups.len());
+    for members in groups {
+        let orders = union_orders(members.iter().map(|m| m.orders.as_slice()));
+        let (item_name, merchant) = card_name_and_merchant(
+            members
+                .iter()
+                .map(|m| (m.item_name.as_str(), m.merchant.as_deref())),
+        );
+        let mut members = members.into_iter();
+        let Some(mut hit) = members.next() else {
+            continue;
+        };
+        hit.legs = members
+            .map(|m| ShipmentLeg {
+                id: row_id(&m),
+                delivered_at: m.row.as_ref().and_then(|r| r.delivered_at),
+                carrier: m.carrier,
+                tracking_number: m.tracking_number,
+                status: m.status,
+                tracking_url: m.tracking_url,
+                last_update: m.last_update,
+            })
+            .collect();
+        hit.item_name = item_name;
+        hit.merchant = merchant;
+        hit.orders = orders;
+        out.push(hit);
+    }
+    out
 }
 
 /// Parameters for `set_sender_rule`.
@@ -622,15 +700,20 @@ impl SquelchServer {
                 },
             )
             .map_err(Self::map_err)?;
-        // The RAW observation feed, silent rows included: a record hit is
-        // decorated with its carrier row first and judged after, so the same
-        // `Silence::hides` the human door applies sees the same carrier
+        // The observation feed, UNGROUPED and not yet judged silent: a record
+        // hit is decorated with its carrier row first and judged after, so the
+        // same `Silence::hides` the human door applies sees the same carrier
         // evidence here. Two doors, one rule, one package list.
+        //
+        // Only the rows the window is CERTAIN to hide are cut, in SQL (a long
+        // delivered history stays on disk), and a record whose row was cut is
+        // dropped by `agent_shipment_is_hidden` below, exactly as the row's
+        // own `Silence::hides` would have dropped it.
+        let silence = self.shipment_policy.silence(Utc::now());
         let shipments = self
             .store
-            .external_shipments(self.account_id, true)
+            .external_shipments_within(self.account_id, silence)
             .map_err(Self::map_err)?;
-        let silence = self.shipment_policy.silence(Utc::now());
         let mut out: Vec<ShipmentHit> = Vec::new();
         let mut represented = std::collections::HashSet::new();
         for item in records {
@@ -659,13 +742,17 @@ impl SquelchServer {
                 if !number.is_empty()
                     && self
                         .store
-                        .agent_shipment_is_cleared(self.account_id, &number)
+                        .agent_shipment_is_hidden(self.account_id, &number, silence)
                         .map_err(Self::map_err)?
                 {
                     continue;
                 }
                 let mut hit = ShipmentHit {
                     item_name: item.decision.summary.clone(),
+                    merchant: None,
+                    orders: Vec::new(),
+                    legs: Vec::new(),
+                    row: None,
                     carrier: carrier.unwrap_or_default(),
                     status,
                     tracking_number: number,
@@ -683,9 +770,24 @@ impl SquelchServer {
                     hit.tracking_url = observation.tracking_url.clone();
                     hit.eta = observation.eta;
                     hit.carrier_status_raw = observation.carrier_status_raw.clone();
-                    if observation.carrier_status_raw.is_some() {
-                        hit.status = observation.status.clone();
+                    // The row's name, merchant and orders are the reconciled
+                    // ones (sanitized, newest first); the summary is only the
+                    // fallback for a row that has no name.
+                    if !observation.item_name.trim().is_empty() {
+                        hit.item_name = observation.item_name.clone();
                     }
+                    hit.merchant = observation.merchant.clone();
+                    hit.orders = observation.orders.clone();
+                    hit.row = Some(observation.clone());
+                    // THE ROW'S STATUS IS THE PACKAGE'S STATUS, not this
+                    // record's. Reconcile already decided it from every
+                    // retained proposal plus the carrier: the newest proposal
+                    // on an owned row, the no-regress merge on a legacy one
+                    // (a delivered legacy row stays delivered when newer mail
+                    // says "shipped"). Reading the record here instead made the
+                    // doors pick different representatives, and disagree about
+                    // which cards `include_delivered=false` drops.
+                    hit.status = observation.status.clone();
                     // THE ROW'S CLOCK IS THE PACKAGE'S CLOCK. Reconcile already
                     // folded every accepted mail into `last_update`; a mail it
                     // rejected (no carrier, a status it could not read) is not
@@ -693,9 +795,10 @@ impl SquelchServer {
                     // doors disagree about exactly the hidden rows.
                     hit.last_update = observation.last_update;
                 }
-                if (include_delivered || hit.status != "delivered")
-                    && !silence.is_some_and(|s| s.hides(hit.last_update, observation))
-                {
+                // NO delivered filter here: grouping sees every visible
+                // package, exactly as the human door's does, and the filter
+                // applies to whole cards below.
+                if !silence.is_some_and(|s| s.hides(hit.last_update, observation)) {
                     out.push(hit);
                 }
             }
@@ -703,24 +806,20 @@ impl SquelchServer {
         // Legacy tracked packages keep their carrier observations during cutover.
         for shipment in shipments {
             if represented.contains(&shipment.tracking_number)
-                || (!include_delivered && shipment.status == "delivered")
                 || silence.is_some_and(|s| s.hides(shipment.last_update, Some(&shipment)))
             {
                 continue;
             }
-            out.push(ShipmentHit {
-                item_name: shipment.item_name,
-                carrier: shipment.carrier,
-                status: shipment.status,
-                tracking_number: shipment.tracking_number,
-                tracking_url: shipment.tracking_url,
-                last_update: shipment.last_update,
-                eta: shipment.eta,
-                carrier_status_raw: shipment.carrier_status_raw,
-            });
+            out.push(ShipmentHit::from_row(shipment));
         }
         out.sort_by(|a, b| b.last_update.cmp(&a.last_update));
-        Self::ok_json(out)
+        // A card is delivered iff its representative is, which is only when
+        // every package on it has landed.
+        let cards: Vec<ShipmentHit> = group_hits(out)
+            .into_iter()
+            .filter(|hit| include_delivered || hit.status != "delivered")
+            .collect();
+        Self::ok_json(cards)
     }
 
     /// Create or update a local sender rule. Writes ONLY squelch's local store;
@@ -1036,6 +1135,9 @@ mod tests {
                     carrier: Some("ups".into()),
                     tracking_number: Some(" 1z999 aa10 1234 56784 ".into()),
                     status: "shipped".into(),
+                    item_name: None,
+                    merchant: None,
+                    order_refs: vec![],
                     evidence: vec![],
                 },
             ],
@@ -1108,7 +1210,12 @@ mod tests {
             "spaced canonical number receives compact-row carrier observations"
         );
         store
-            .clear_shipment(account, polling_row.id, Utc::now())
+            .clear_shipment(
+                account,
+                polling_row.id,
+                Utc::now(),
+                ShipmentListPolicy::default(),
+            )
             .unwrap();
         assert!(
             values(
@@ -1157,6 +1264,542 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    /// ONE PURCHASE, ONE HIT, on both doors. Two tracking numbers that share an
+    /// order (the supplier leg and the leg to the user) come back from
+    /// `get_shipments` as one hit shaped like the human door's one card: the
+    /// newest package represents, the other is a leg, the name and merchant
+    /// are the reconciled ones, and the orders are the union.
+    #[tokio::test]
+    async fn get_shipments_groups_one_order_like_the_human_door() {
+        use squelch_core::store::agent_triage::AgentCommitOutcome;
+        use squelch_core::triage::decision::MessageDecision;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let leg = |number: &str, item: Option<&str>, refs: &[&str]| MessageDecision {
+            summary: "Shipment update".into(),
+            records: vec![RecordProposal::Delivery {
+                carrier: Some("ups".into()),
+                tracking_number: Some(number.into()),
+                status: "shipped".into(),
+                item_name: item.map(str::to_string),
+                merchant: Some("Bill's Exhausts".into()),
+                order_refs: refs.iter().map(|r| r.to_string()).collect(),
+                evidence: vec![],
+            }],
+            ..Default::default()
+        };
+        for (thread, decision) in [
+            ("inbound", leg("1ZW061R3DG21045729", None, &["21470"])),
+            (
+                "outbound",
+                leg(
+                    "1ZB8B2560323528551",
+                    Some("Austin Racing DB Killer AUR10"),
+                    &["#21470"],
+                ),
+            ),
+        ] {
+            let id = seed(&store, account, thread, "Shipment update");
+            while let Some(job) = store
+                .claim_agent_job(account, "triage", Utc::now(), 120)
+                .unwrap()
+            {
+                assert_eq!(job.message_id, id);
+                let context = store.load_agent_context(&job).unwrap();
+                assert_eq!(
+                    store
+                        .commit_agent_decision(
+                            &job,
+                            &context,
+                            &decision,
+                            std::slice::from_ref(&context.message.source)
+                        )
+                        .unwrap(),
+                    AgentCommitOutcome::Applied
+                );
+            }
+        }
+        assert_eq!(
+            store.external_shipments(account, true).unwrap().len(),
+            2,
+            "the raw observation feed stays ungrouped"
+        );
+        let human = store.list_shipments(account, true, policy).unwrap();
+        let agent = values(
+            &server
+                .get_shipments(Parameters(GetShipmentsParams {
+                    include_delivered: Some(true),
+                }))
+                .await
+                .unwrap(),
+        );
+        let agent = agent.as_array().unwrap();
+        assert_eq!((human.len(), agent.len()), (1, 1), "one card on both doors");
+        let hit = &agent[0];
+        assert_eq!(hit["tracking_number"], human[0].tracking_number);
+        assert_eq!(hit["item_name"], "Austin Racing DB Killer AUR10");
+        assert_eq!(hit["item_name"], human[0].item_name);
+        assert_eq!(hit["merchant"], "Bill's Exhausts");
+        assert_eq!(hit["orders"].as_array().unwrap().len(), 1);
+        assert_eq!(hit["orders"][0]["order_ref"], "21470");
+        assert_eq!(hit["legs"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hit["legs"][0]["tracking_number"],
+            human[0].legs[0].tracking_number
+        );
+        assert_eq!(hit["legs"][0]["id"], human[0].legs[0].id);
+        assert!(
+            hit.get("row").is_none(),
+            "the grouping handle is not served"
+        );
+    }
+
+    /// Ingest one mail received at `at` and commit one delivery record for
+    /// it, the way production does. Returns the message id.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver(
+        store: &SqliteStore,
+        account: i64,
+        thread: &str,
+        at: chrono::DateTime<Utc>,
+        restricted: bool,
+        number: &str,
+        status: &str,
+        merchant: Option<&str>,
+        refs: &[&str],
+    ) -> i64 {
+        let record = RecordProposal::Delivery {
+            carrier: Some("ups".into()),
+            tracking_number: Some(number.into()),
+            status: status.into(),
+            item_name: None,
+            merchant: merchant.map(str::to_string),
+            order_refs: refs.iter().map(|r| r.to_string()).collect(),
+            evidence: vec![],
+        };
+        ingest_decided(store, account, thread, at, restricted, number, vec![record])
+    }
+
+    /// Ingest one mail received at `at` (gmail id `{thread}-{key}`) and commit
+    /// a decision carrying `records` for it. Returns the message id.
+    fn ingest_decided(
+        store: &SqliteStore,
+        account: i64,
+        thread: &str,
+        at: chrono::DateTime<Utc>,
+        restricted: bool,
+        key: &str,
+        records: Vec<RecordProposal>,
+    ) -> i64 {
+        use squelch_core::store::agent_triage::AgentCommitOutcome;
+        use squelch_core::sync::ingest::{RawFetched, ingest_with_rules};
+        use squelch_core::triage::decision::MessageDecision;
+        let raw = RawFetched {
+            account_id: account,
+            gmail_msg_id: format!("{thread}-{key}"),
+            gmail_thread_id: Some(thread.into()),
+            raw: format!(
+                "From: shop@example.com\r\nTo: me@localhost\r\nSubject: Update\r\nDate: {}\r\n\r\nUpdate",
+                at.to_rfc2822()
+            )
+            .into_bytes(),
+            internal_date: Some(at),
+            is_sent: false,
+            is_spam: false,
+            account_addr: "me@localhost".into(),
+        };
+        let message = ingest_with_rules(&raw, &Default::default(), at, &[], |_| false);
+        let id = store.ingest_message(&message).unwrap();
+        let mut decision = MessageDecision {
+            summary: "Shipment update".into(),
+            records,
+            ..Default::default()
+        };
+        decision.external_access.restricted = restricted;
+        while let Some(job) = store
+            .claim_agent_job(account, "triage", Utc::now(), 120)
+            .unwrap()
+        {
+            assert_eq!(job.message_id, id);
+            let context = store.load_agent_context(&job).unwrap();
+            assert_eq!(
+                store
+                    .commit_agent_decision(
+                        &job,
+                        &context,
+                        &decision,
+                        std::slice::from_ref(&context.message.source)
+                    )
+                    .unwrap(),
+                AgentCommitOutcome::Applied
+            );
+        }
+        id
+    }
+
+    async fn agent_hits(server: &SquelchServer, include_delivered: bool) -> serde_json::Value {
+        values(
+            &server
+                .get_shipments(Parameters(GetShipmentsParams {
+                    include_delivered: Some(include_delivered),
+                }))
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A DELIVERED BOX NEVER STANDS FOR ONE STILL COMING, on either door, and
+    /// both doors group the same packages whatever `include_delivered` says:
+    /// the newer box landed two days ago, the older is still in transit, and
+    /// both show one in-transit card carrying the delivered box as a leg.
+    #[tokio::test]
+    async fn both_doors_show_an_order_in_transit_while_any_box_is() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let days = |n| Utc::now() - chrono::Duration::days(n);
+        let (coming, landed) = ("1ZW061R3DG21045729", "1ZB8B2560323528551");
+        deliver(
+            &store,
+            account,
+            "a",
+            days(3),
+            false,
+            coming,
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        deliver(
+            &store,
+            account,
+            "b",
+            days(2),
+            false,
+            landed,
+            "delivered",
+            Some("Bean Co"),
+            &["5"],
+        );
+        for include_delivered in [true, false] {
+            let human = store
+                .list_shipments(account, include_delivered, policy)
+                .unwrap();
+            let agent = agent_hits(&server, include_delivered).await;
+            let agent = agent.as_array().unwrap();
+            assert_eq!((human.len(), agent.len()), (1, 1), "{include_delivered}");
+            assert_eq!(human[0].tracking_number, coming);
+            assert_eq!(human[0].status, "shipped");
+            assert_eq!(agent[0]["tracking_number"], coming);
+            assert_eq!(agent[0]["status"], "shipped");
+            assert_eq!(human[0].legs.len(), 1, "{include_delivered}");
+            assert_eq!(
+                agent[0]["legs"].as_array().unwrap().len(),
+                1,
+                "the agent door groups the same members ({include_delivered})"
+            );
+        }
+        // Every box landed: the card is delivered, and only a listing that
+        // asks for delivered packages shows it, on either door.
+        deliver(
+            &store,
+            account,
+            "c",
+            days(1),
+            false,
+            coming,
+            "delivered",
+            Some("Bean Co"),
+            &["5"],
+        );
+        for (include_delivered, want) in [(true, 1), (false, 0)] {
+            let human = store
+                .list_shipments(account, include_delivered, policy)
+                .unwrap();
+            let agent = agent_hits(&server, include_delivered).await;
+            assert_eq!(
+                (human.len(), agent.as_array().unwrap().len()),
+                (want, want),
+                "{include_delivered}"
+            );
+        }
+    }
+
+    /// A LEGACY ROW'S STATUS IS THE ROW'S, on both doors. The old extractor
+    /// recorded box X delivered; newer mail the model read as "shipped" (a
+    /// re-ship notice, a survey) cannot walk a legacy row back, so the row
+    /// stays delivered. The agent door used to serve the record's "shipped"
+    /// instead, so it picked X to represent the order and kept the card under
+    /// `include_delivered=false`; the human door picked box Y, still coming.
+    #[tokio::test]
+    async fn both_doors_take_a_legacy_rows_status_from_the_row() {
+        use squelch_core::triage::ShipmentStatus;
+        use squelch_core::triage::extract::shipments::ShipmentsApplied;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let days = |n| Utc::now() - chrono::Duration::days(n);
+        let (legacy, coming) = ("1ZW061R3DG21045729", "1ZB8B2560323528551");
+        // The legacy row: the old extractor's delivered verdict on an allowed
+        // mail that carries no delivery record of its own.
+        let minted = ingest_decided(&store, account, "old", days(5), false, "old", vec![]);
+        assert!(
+            store
+                .shipments_extract_apply(&ShipmentsApplied {
+                    message_id: minted,
+                    account_id: account,
+                    thread_id: "old".into(),
+                    is_shipment: true,
+                    tracking_number: Some(legacy.into()),
+                    order_ref: None,
+                    item_name: None,
+                    carrier: "ups".into(),
+                    status: Some(ShipmentStatus::Delivered),
+                    received_at: days(5),
+                    extractor_model_used: "legacy-extractor".into(),
+                })
+                .unwrap()
+        );
+        deliver(
+            &store,
+            account,
+            "y",
+            days(3),
+            false,
+            coming,
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        // Newer mail about the legacy box, read as "shipped", naming the order.
+        deliver(
+            &store,
+            account,
+            "x",
+            days(1),
+            false,
+            legacy,
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        let raw = store.external_shipments(account, true).unwrap();
+        let row = raw.iter().find(|s| s.tracking_number == legacy).unwrap();
+        assert_eq!(row.status, "delivered", "the no-regress merge held");
+        for include_delivered in [true, false] {
+            let human = store
+                .list_shipments(account, include_delivered, policy)
+                .unwrap();
+            let agent = agent_hits(&server, include_delivered).await;
+            let agent = agent.as_array().unwrap();
+            assert_eq!((human.len(), agent.len()), (1, 1), "{include_delivered}");
+            assert_eq!(human[0].tracking_number, coming);
+            assert_eq!(agent[0]["tracking_number"], coming, "{include_delivered}");
+            assert_eq!(agent[0]["status"], human[0].status);
+            assert_eq!(agent[0]["status"], "shipped");
+            assert_eq!(human[0].legs[0].status, "delivered");
+            assert_eq!(agent[0]["legs"][0]["tracking_number"], legacy);
+            assert_eq!(agent[0]["legs"][0]["status"], "delivered");
+        }
+    }
+
+    /// CLEARING A GROUPED CARD CLEARS THE PURCHASE on both doors: the client
+    /// posts one id, and no package of that order comes back on either.
+    #[tokio::test]
+    async fn clearing_a_grouped_card_empties_both_doors() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let hours = |n| Utc::now() - chrono::Duration::hours(n);
+        deliver(
+            &store,
+            account,
+            "a",
+            hours(3),
+            false,
+            "1ZW061R3DG21045729",
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        deliver(
+            &store,
+            account,
+            "b",
+            hours(2),
+            false,
+            "1ZB8B2560323528551",
+            "shipped",
+            Some("Bean Co"),
+            &["5"],
+        );
+        let card = store
+            .list_shipments(account, true, policy)
+            .unwrap()
+            .remove(0);
+        assert_eq!(card.legs.len(), 1);
+        assert_eq!(agent_hits(&server, true).await.as_array().unwrap().len(), 1);
+        assert!(
+            store
+                .clear_shipment(account, card.id, Utc::now(), policy)
+                .unwrap()
+        );
+        assert!(
+            store
+                .list_shipments(account, true, policy)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            agent_hits(&server, true)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "no leg of the cleared card is left on the agent door"
+        );
+    }
+
+    /// A RESTRICTED MAIL'S MERCHANT AND ORDER NUMBER NEVER REACH THE AGENT. A
+    /// pharmacy order mail (restricted) names the store and the order; a plain
+    /// carrier notice (allowed) about the same number is what the agent may
+    /// see. The package is served, without the pharmacy or the order, and the
+    /// hidden order cannot merge it with another box either. The human door
+    /// still shows all of it.
+    #[tokio::test]
+    async fn a_restricted_mails_merchant_and_ref_stay_off_the_agent_door() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let account = store.ensure_account("me@localhost").unwrap();
+        let policy = ShipmentListPolicy::default();
+        let server = SquelchServer::new(store.clone(), "me@localhost")
+            .unwrap()
+            .with_shipment_policy(policy);
+        let hours = |n| Utc::now() - chrono::Duration::hours(n);
+        let number = "1ZW061R3DG21045729";
+        deliver(
+            &store,
+            account,
+            "rx",
+            hours(3),
+            true,
+            number,
+            "shipped",
+            Some("X Pharmacy"),
+            &["RX-99"],
+        );
+        deliver(
+            &store,
+            account,
+            "ups",
+            hours(2),
+            false,
+            number,
+            "out_for_delivery",
+            None,
+            &[],
+        );
+        let agent = agent_hits(&server, true).await;
+        let agent = agent.as_array().unwrap();
+        assert_eq!(agent.len(), 1, "the package itself is servable");
+        assert_eq!(agent[0]["status"], "out_for_delivery");
+        assert!(agent[0]["merchant"].is_null(), "{}", agent[0]);
+        assert!(
+            agent[0]["orders"].as_array().unwrap().is_empty(),
+            "{}",
+            agent[0]
+        );
+        assert!(!agent[0].to_string().contains("Pharmacy"));
+        assert!(!agent[0].to_string().contains("RX"));
+        let human = store.list_shipments(account, true, policy).unwrap();
+        assert_eq!(human[0].merchant.as_deref(), Some("X Pharmacy"));
+        assert_eq!(human[0].orders.len(), 1);
+
+        // A second box whose own allowed mail names the same order groups with
+        // it for the human, and not for the agent: the link that would merge
+        // them came from the restricted mail.
+        deliver(
+            &store,
+            account,
+            "box2",
+            hours(1),
+            false,
+            "1ZB8B2560323528551",
+            "shipped",
+            Some("X Pharmacy"),
+            &["RX-99"],
+        );
+        assert_eq!(
+            store.list_shipments(account, true, policy).unwrap().len(),
+            1
+        );
+        let agent = agent_hits(&server, true).await;
+        let agent = agent.as_array().unwrap();
+        assert_eq!(agent.len(), 2, "no grouping on a link the agent cannot see");
+        assert!(
+            agent
+                .iter()
+                .all(|h| h["legs"].as_array().unwrap().is_empty())
+        );
+        let first = agent
+            .iter()
+            .find(|h| h["tracking_number"] == number)
+            .unwrap();
+        assert!(first["merchant"].is_null() && first["orders"].as_array().unwrap().is_empty());
+
+        // One box, the seller named by restricted mail and the order number by
+        // allowed mail: the link files the ref under the restricted seller, so
+        // it is withheld too.
+        let third = "1Z999AA10123456784";
+        deliver(
+            &store,
+            account,
+            "rx3",
+            hours(1),
+            true,
+            third,
+            "shipped",
+            Some("Y Pharmacy"),
+            &[],
+        );
+        deliver(
+            &store,
+            account,
+            "ups3",
+            Utc::now(),
+            false,
+            third,
+            "shipped",
+            None,
+            &["RX-7"],
+        );
+        let agent = agent_hits(&server, true).await;
+        let hit = agent
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["tracking_number"] == third)
+            .unwrap()
+            .clone();
+        assert!(!hit.to_string().contains("Pharmacy"), "{hit}");
+        assert!(hit["orders"].as_array().unwrap().is_empty(), "{hit}");
+        let human = store.list_shipments(account, true, policy).unwrap();
+        let row = human.iter().find(|c| c.tracking_number == third).unwrap();
+        assert_eq!(row.orders[0].merchant.as_deref(), Some("Y Pharmacy"));
     }
 
     /// TWO DOORS, ONE PACKAGE LIST. The agent door applies the human door's
@@ -1209,6 +1852,9 @@ mod tests {
                 carrier: Some("ups".into()),
                 tracking_number: Some("1Z999AA10123456784".into()),
                 status: "shipped".into(),
+                item_name: None,
+                merchant: None,
+                order_refs: vec![],
                 evidence: vec![],
             }],
             ..Default::default()
@@ -1305,6 +1951,9 @@ mod tests {
                 carrier: None,
                 tracking_number: Some("1Z999AA10123456784".into()),
                 status: "unknown".into(),
+                item_name: None,
+                merchant: None,
+                order_refs: vec![],
                 evidence: vec![],
             }],
             ..Default::default()

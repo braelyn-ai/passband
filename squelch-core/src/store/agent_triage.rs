@@ -180,7 +180,17 @@ pub trait AgentTriageStore: Send + Sync {
         limit: usize,
         query: &AgentListQuery,
     ) -> Result<Vec<AgentListItem>>;
-    fn agent_shipment_is_cleared(&self, account: AccountId, tracking_number: &str) -> Result<bool>;
+    /// Is the row for `tracking_number` one the listing hides for certain:
+    /// cleared (and not moved since), or silent by
+    /// [`external_shipments_within`](crate::store::SqliteStore::external_shipments_within)'s
+    /// SQL cut under the same `silence`? The agent door drops a delivery
+    /// record whose row is hidden, rather than serve it off the record alone.
+    fn agent_shipment_is_hidden(
+        &self,
+        account: AccountId,
+        tracking_number: &str,
+        silence: Option<crate::config::Silence>,
+    ) -> Result<bool>;
     fn correct_agent_triage(
         &self,
         account: AccountId,

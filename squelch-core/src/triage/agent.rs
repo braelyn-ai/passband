@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PROMPT_VERSION: &str = "agent-triage-v2";
+pub const PROMPT_VERSION: &str = "agent-triage-v3";
 const SYSTEM: &str = include_str!("prompts/agent-v1.txt");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
@@ -700,6 +700,9 @@ pub fn decision_schema() -> Value {
                     "unknown",
                 ]),
             ),
+            ("item_name", nullable(text())),
+            ("merchant", nullable(text())),
+            ("order_refs", array(text())),
             ("evidence", evidence_schema()),
         ]),
         object(vec![
@@ -927,6 +930,49 @@ mod tests {
             evidence: decision.attention.evidence.clone(),
         });
         assert!(validate_decision(&decision, &BTreeSet::from([7]), &BTreeMap::new(), &[]).is_err());
+    }
+    /// A shipping email that never prints its order number: the model finds
+    /// the number in the sender's history and cites THAT message. Any message a
+    /// tool exposed this run is in `sources`, so the citation stands; one the
+    /// run never saw does not.
+    #[test]
+    fn delivery_order_refs_may_cite_a_fetched_earlier_message() {
+        let mut decision = valid();
+        decision.records.push(RecordProposal::Delivery {
+            carrier: Some("ups".into()),
+            tracking_number: Some("1ZW061R3DG21045729".into()),
+            status: "shipped".into(),
+            item_name: None,
+            merchant: Some("Bill's Exhausts".into()),
+            order_refs: vec!["21470".into()],
+            evidence: vec![
+                EvidenceRef {
+                    message_id: 7,
+                    location: "body".into(),
+                },
+                EvidenceRef {
+                    message_id: 3,
+                    location: "subject".into(),
+                },
+            ],
+        });
+        let fetched = BTreeSet::from([7, 3]);
+        assert!(validate_decision(&decision, &fetched, &BTreeMap::new(), &[]).is_ok());
+        assert_eq!(
+            validate_decision(&decision, &BTreeSet::from([7]), &BTreeMap::new(), &[]),
+            Err("record_requires_evidence".into())
+        );
+        let delivery = &decision_schema()["properties"]["records"]["items"]["anyOf"][2];
+        for field in ["item_name", "merchant", "order_refs"] {
+            assert!(
+                delivery["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f == field),
+                "{field}"
+            );
+        }
     }
     #[test]
     fn delivery_schema_statuses_are_compatible_with_carrier_projection() {

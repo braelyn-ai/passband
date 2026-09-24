@@ -316,6 +316,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // a row left NULL simply matches no future order mail, which is the safe
     // direction — a missed name donation, never a cross-merchant one.
     let added_order_merchant = add_column_if_missing(conn, "shipments", "order_merchant", "TEXT")?;
+    // `order_merchant_msg` — which MESSAGE named the current `order_merchant`,
+    // for the agent door's access check. NULL on every pre-existing row: the
+    // old extractor's domain merchant, judged by the row's own mail.
+    add_column_if_missing(conn, "shipments", "order_merchant_msg", "INTEGER")?;
     if tables_exist(conn, &["shipments"])? {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_shipments_order_merchant
@@ -523,6 +527,8 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         eprintln!("squelch: migration re-queued {unstamped} row(s) whose body has since arrived");
     }
 
+    create_shipment_order_links(conn)?;
+
     // Guarded on table existence — migration unit tests build partial schemas.
     if !tables_exist(conn, &["triage", "deadlines", "messages"])? {
         return Ok(());
@@ -598,6 +604,148 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Is `shipment_order_links` there? Readers guard on it because the migration
+/// unit tests build partial schemas.
+pub(super) fn order_links_exist(conn: &Connection) -> Result<bool> {
+    tables_exist(conn, &["shipment_order_links"])
+}
+
+/// ORDER LINKS: which orders each package carries, many-to-many, so the
+/// listing can fold one purchase's packages into one card.
+///
+/// NOT `shipment_orders`: that name is the old extractor's staging table for
+/// orders with no tracking number yet, a different thing.
+///
+/// Created HERE rather than in schema.sql because its creation is the one-shot
+/// backfill's trigger: schema.sql runs on every open before this function, so
+/// a table it created would already exist and the backfill could never tell a
+/// first open from the hundredth. On the open that creates it, every shipment
+/// the old extractor gave both an order reference and a merchant gets a
+/// 'legacy' link. Once, and never again: after this, `shipments.order_merchant`
+/// is also written by the agent (a store name, not a domain), and re-running
+/// the backfill would pair that with a stale extractor `order_ref`.
+///
+/// The AFTER DELETE trigger is how every path that deletes a shipment (the
+/// agent projection's retirement, the extractor's phantom reaping, anything
+/// added later) also deletes its links, without each remembering to.
+///
+/// ATOMIC, like [`rebuild_fts_if_stale`]: the table, its index, its trigger
+/// and the backfill commit together under `BEGIN IMMEDIATE`, and existence is
+/// re-checked INSIDE the transaction. Otherwise a backfill that failed halfway
+/// would leave a table whose mere existence tells every later open "already
+/// done", and the legacy links it never wrote would be lost for good; and two
+/// daemons opening one file could both see "absent" and both backfill.
+///
+/// A legacy row it cannot read or sanitize is SKIPPED (see the body): junk in
+/// one row must not cost every other row its link. On a real failure (a busy
+/// sibling, an SQL error) it rolls back, says so, and returns Ok: the next open
+/// tries again, and every reader and writer of the table guards on
+/// [`order_links_exist`].
+pub(super) fn create_shipment_order_links(conn: &Connection) -> Result<()> {
+    if !tables_exist(conn, &["shipments"])? {
+        return Ok(());
+    }
+    if !order_links_exist(conn)? {
+        let created = (|| -> Result<()> {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            // Another handle may have created it between the check above and
+            // the write lock; its backfill already ran.
+            if !order_links_exist(conn)? {
+                create_and_backfill_order_links(conn)?;
+            }
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(e) = created {
+            eprintln!("squelch: could not create shipment order links ({e}); will retry next open");
+            let _ = conn.execute_batch("ROLLBACK");
+            return Ok(());
+        }
+    }
+    // PROVENANCE, added after the table first shipped (a DB that ran the
+    // first version of this migration has the table without them). NULL on
+    // every pre-existing link, which is exactly "legacy, no message recorded".
+    add_column_if_missing(conn, "shipment_order_links", "message_id", "INTEGER")?;
+    add_column_if_missing(conn, "shipment_order_links", "merchant_msg", "INTEGER")?;
+    Ok(())
+}
+
+/// The body of [`create_shipment_order_links`]'s transaction.
+fn create_and_backfill_order_links(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE shipment_order_links (
+             account_id   INTEGER NOT NULL,
+             shipment_id  INTEGER NOT NULL,
+             -- lowercase alphanumerics of `merchant`; '' = unknown seller,
+             -- which never groups (see triage::order_link).
+             merchant_key TEXT NOT NULL,
+             -- uppercase alphanumerics of the sanitized `order_ref`.
+             order_key    TEXT NOT NULL,
+             merchant     TEXT NOT NULL DEFAULT '',
+             order_ref    TEXT NOT NULL,
+             -- 'agent': rebuilt by reconcile from the retained delivery
+             -- proposals. 'legacy': the backfill; reconcile never touches it.
+             source       TEXT NOT NULL CHECK (source IN ('agent', 'legacy')),
+             -- PROVENANCE, for the agent door's access check: the message that
+             -- printed `order_ref`, and the one that named `merchant`. NULL on
+             -- a legacy link and (merchant_msg) on a merchant-less one.
+             message_id   INTEGER,
+             merchant_msg INTEGER,
+             PRIMARY KEY (account_id, shipment_id, merchant_key, order_key)
+         );
+         CREATE INDEX IF NOT EXISTS idx_shipment_order_links_order
+             ON shipment_order_links(account_id, merchant_key, order_key);
+         CREATE TRIGGER IF NOT EXISTS shipment_order_links_follow_shipment
+         AFTER DELETE ON shipments BEGIN
+             DELETE FROM shipment_order_links
+             WHERE account_id = OLD.account_id AND shipment_id = OLD.id;
+         END;",
+    )?;
+    if !has_columns(conn, "shipments", &["order_ref", "order_merchant"])? {
+        return Ok(());
+    }
+    // A ROW THE BACKFILL CANNOT READ IS SKIPPED, NOT FATAL. A merchant or
+    // reference that is not valid text (a number, a blob, bytes that are not
+    // UTF-8) is junk this link could not have been built from anyway, and
+    // failing the whole backfill on it would fail it on every open, forever,
+    // while the table's absence also turns off every agent link write. Only a
+    // real SQL error (the `?`s below) rolls the transaction back.
+    type LegacyRow = (i64, i64, Option<String>, Option<String>);
+    let legacy: Vec<LegacyRow> = {
+        let mut stmt = conn.prepare(
+            "SELECT account_id, id, order_merchant, order_ref FROM shipments
+             WHERE TRIM(COALESCE(order_ref, '')) <> ''
+               AND TRIM(COALESCE(order_merchant, '')) <> ''",
+        )?;
+        let text = |r: &rusqlite::Row<'_>, i: usize| -> rusqlite::Result<Option<String>> {
+            Ok(r.get_ref(i)?.as_str().ok().map(str::to_owned))
+        };
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, text(r, 2)?, text(r, 3)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (account, id, merchant, raw_ref) in legacy {
+        use crate::triage::order_link::{merchant_key, order_key};
+        let (Some(merchant), Some(raw_ref)) = (merchant, raw_ref) else {
+            continue;
+        };
+        let Some(order_ref) = crate::triage::extract::shipments::sanitize_order_ref(Some(&raw_ref))
+        else {
+            continue;
+        };
+        let (mkey, okey) = (merchant_key(&merchant), order_key(&order_ref));
+        if mkey.is_empty() || okey.is_empty() {
+            continue;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO shipment_order_links
+                 (account_id, shipment_id, merchant_key, order_key, merchant, order_ref, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'legacy')",
+            params![account, id, mkey, okey, merchant.trim(), order_ref],
+        )?;
+    }
     Ok(())
 }
 

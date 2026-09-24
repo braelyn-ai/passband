@@ -549,6 +549,43 @@ pub struct Shipment {
     /// bare digit-run the carrier keeps rejecting is very likely a retailer item
     /// or order id that was never a tracking number at all.
     pub poll_failures: u32,
+    /// Who sold it (`shipments.order_merchant`). On a grouped card, the
+    /// representative's, else the newest non-empty one in the group. Rows the
+    /// old shipments extractor wrote carry the sender's registrable DOMAIN here
+    /// ("amazon.com"), not a store name.
+    #[serde(default)]
+    pub merchant: Option<String>,
+    /// Every order this card carries, deduped by (merchant, order) key. On a
+    /// grouped card, the union across all its packages.
+    #[serde(default)]
+    pub orders: Vec<ShipmentOrder>,
+    /// The OTHER packages merged into this card because they share an order
+    /// (see [`crate::triage::order_link`]). Empty for a lone package, and on
+    /// the raw observation feed, which never groups.
+    #[serde(default)]
+    pub legs: Vec<ShipmentLeg>,
+}
+
+/// One order a package carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShipmentOrder {
+    /// `None` when the mail named an order but not who sold it. Such an order
+    /// is shown but NEVER groups: a bare "#1001" collides across stores.
+    pub merchant: Option<String>,
+    pub order_ref: String,
+}
+
+/// Another package folded into a grouped shipment card. Each one is still its
+/// own `shipments` row and is still polled on its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShipmentLeg {
+    pub id: i64,
+    pub carrier: String,
+    pub tracking_number: String,
+    pub status: String,
+    pub tracking_url: Option<String>,
+    pub last_update: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 /// A record of money ALREADY PAID, extracted from NON-SEALED past-transaction

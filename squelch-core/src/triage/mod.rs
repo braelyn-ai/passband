@@ -17,6 +17,7 @@ pub mod llm;
 pub mod login_code;
 pub mod money;
 pub mod notify_llm;
+pub mod order_link;
 pub mod ranking;
 pub mod receipt;
 pub mod receipt_match;

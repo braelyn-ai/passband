@@ -361,38 +361,52 @@ pub(super) fn external_shipment_allowed_conn(
     account_id: AccountId,
     shipment_id: i64,
 ) -> Result<bool> {
-    type ShipmentProvenance = (Option<i64>, Option<i64>, Option<i64>, String);
-    let provenance: Option<ShipmentProvenance> = conn
+    let row: Option<(super::specialists::Provenance, String)> = conn
         .query_row(
-            "SELECT created_by_message_id,last_message_id,item_name_msg,item_name
+            "SELECT created_by_message_id,last_message_id,order_merchant_msg,item_name_msg,
+                    item_name
              FROM shipments WHERE account_id=?1 AND id=?2",
             params![account_id, shipment_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    super::specialists::Provenance {
+                        created: row.get(0)?,
+                        last: row.get(1)?,
+                        merchant_msg: row.get(2)?,
+                        name_msg: row.get(3)?,
+                    },
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((Some(created), Some(last), name_source, name)) = provenance else {
+    let Some((prov, name)) = row else {
         return Ok(false);
     };
-    if !name.trim().is_empty() && name_source.is_none() {
+    super::specialists::agent_row_allowed(conn, account_id, &name, &prov, &mut Default::default())
+}
+
+/// May the agent door carry text that `message_id` contributed to a derived
+/// row? The message's own current assessment (and every source it consumed)
+/// must be allowed, and so must its thread. The per-field half of
+/// [`external_shipment_allowed_conn`]: the merchant and each order link are
+/// judged by the message that supplied them, one at a time, so a restricted
+/// mail's merchant drops off an otherwise servable package instead of riding
+/// along on it.
+pub(super) fn external_contributor_allowed_conn(
+    conn: &Connection,
+    account_id: AccountId,
+    message_id: i64,
+) -> Result<bool> {
+    if !external_message_allowed_conn(conn, account_id, message_id)? {
         return Ok(false);
     }
-    for id in [Some(created), Some(last), name_source]
-        .into_iter()
-        .flatten()
-    {
-        if !external_message_allowed_conn(conn, account_id, id)? {
-            return Ok(false);
-        }
-        let thread: String = conn.query_row(
-            "SELECT thread_id FROM messages WHERE account_id=?1 AND id=?2",
-            params![account_id, id],
-            |r| r.get(0),
-        )?;
-        if thread_guard_and_subject(conn, account_id, &thread).is_err() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let thread: String = conn.query_row(
+        "SELECT thread_id FROM messages WHERE account_id=?1 AND id=?2",
+        params![account_id, message_id],
+        |r| r.get(0),
+    )?;
+    Ok(thread_guard_and_subject(conn, account_id, &thread).is_ok())
 }
 
 impl SqliteStore {
