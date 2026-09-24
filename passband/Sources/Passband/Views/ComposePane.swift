@@ -21,11 +21,10 @@
 // MobileRootView presents this same view at `.large` off the same
 // `store.compose`, so opening, restoring, autosaving and sending are one code
 // path on both platforms. What is fenced below is the DESKTOP FURNITURE only —
-// the key hints (there is no Esc to promise), the pane's glass edge and its
-// leftward shadow (a sheet brings its own ground), and the labels that named
-// keys. The ceremony itself, both phases of it, is shared and untouched: a
-// phone drives it with the footer buttons that were always there beside the
-// hints.
+// the keys printed beside the footer's verbs (there is no Esc to promise), and
+// the pane's glass edge and its leftward shadow (a sheet brings its own
+// ground). The ceremony itself, both phases of it, is shared and untouched: a
+// phone drives it with the same footer buttons, minus their keys.
 
 import SwiftUI
 
@@ -118,13 +117,10 @@ struct ComposePane: View {
                 .font(Typo.micro)
                 .foregroundStyle(Palette.inkFaintest)
             Spacer()
-            // The key chip is the Mac's promise that a key does this.
-            #if os(macOS)
-                HStack(spacing: 4) {
-                    Kbd("Esc")
-                    Text("close").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                }
-            #else
+            // NO `Esc close` CHIP ON THE MAC. The footer's cancel button names
+            // the same key, and the header saying it too made three places on
+            // one pane promising Esc.
+            #if os(iOS)
                 // THE PHONE'S PRIMARY ACTION, IN THE CORNER IT LIVES IN. On a
                 // phone the edit phase is a sheet with the keyboard up, and the
                 // bottom of the screen is spoken for three times over — the
@@ -245,24 +241,27 @@ struct ComposePane: View {
     }
 
     private func footer(_ compose: ComposeState) -> some View {
+        // THE KEYS LIVE IN THE BUTTONS. This bar used to carry a row of key
+        // hints on the left AND the same verbs as buttons on the right, and at
+        // half a window wide the hints lost the fight for room and wrapped
+        // mid-word. One statement per verb: the button, with its key beside it.
         HStack(spacing: 8) {
-            #if os(macOS)
-                hint
-            #endif
-            Spacer()
             if inReview {
-                Button(ComposeLabels.back) { patch { $0.phase = .edit; $0.error = nil } }
-                    .buttonStyle(.glass)
+                Spacer()
+                Button { patch { $0.phase = .edit; $0.error = nil } } label: {
+                    keyed("back", "esc")
+                }
+                .buttonStyle(.glass)
                 if guarded {
-                    Button(compose.sending ? "sending…" : "override + send") {
-                        Task { await fire(override: true) }
+                    Button { Task { await fire(override: true) } } label: {
+                        keyed(compose.sending ? "sending…" : "override + send", "⇧↵")
                     }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.danger)
                     .disabled(compose.sending)
                 } else {
-                    Button(compose.sending ? "sending…" : "send") {
-                        Task { await fire(override: false) }
+                    Button { Task { await fire(override: false) } } label: {
+                        keyed(compose.sending ? "sending…" : "send", "↵")
                     }
                     .buttonStyle(.glassProminent)
                     .tint(Palette.accent)
@@ -279,12 +278,14 @@ struct ComposePane: View {
                 #if os(macOS)
                     // What goes out is settled by the time review is up, and a
                     // switch beside the send button is a switch nobody meant to
-                    // touch.
+                    // touch. So the two message options sit at the far LEFT,
+                    // away from the verbs, and the verbs stand together.
                     AttachButton(slot: .compose)
                     TrackerToggle(on: bindFlag(\.includeTracker))
-                    Button(ComposeLabels.cancel) { store.closeCompose() }
+                    Spacer()
+                    Button { store.closeCompose() } label: { keyed("cancel", "esc") }
                         .buttonStyle(.glass)
-                    Button("review →") { toReview() }
+                    Button { toReview() } label: { keyed("review", "⌘↵") }
                         .buttonStyle(.glassProminent)
                         .tint(Palette.accent)
                 #endif
@@ -295,26 +296,42 @@ struct ComposePane: View {
         .overlay(alignment: .top) { Hairline() }
     }
 
+    /// A footer verb with its key beside it, dimmer, in the key chip's mono.
+    /// The key half is Mac only: a phone has no Esc to promise.
+    private func keyed(_ verb: String, _ key: String) -> some View {
+        HStack(spacing: 6) {
+            Text(verb)
+            #if os(macOS)
+                Text(key)
+                    .font(Typo.mono(10, weight: .medium))
+                    .opacity(0.6)
+            #endif
+        }
+    }
+
+    /// ONE CARD, THE WAY A MAIL HEADER IS ONE BLOCK: the recipient lines and
+    /// the subject as labelled lines ruled apart, and the body under them on
+    /// the same ground. This used to be three captioned wells stacked like a
+    /// sign-up form (plus a fourth caption teaching markdown), and a message is
+    /// not a form: the boxes were most of what the eye had to read.
+    ///
+    /// The markdown cheat sheet went with the body's caption. The editor styles
+    /// markdown LIVE with the markers kept visible, so the syntax teaches itself
+    /// the first time it is typed.
     private func editPane(_ compose: ComposeState) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            recipientRow(compose)
-            Field(label: "subject") {
-                // Left blank on a reply the daemon titles from the parent; the
-                // placeholder says so, because an empty field otherwise reads as
-                // an unset required value.
-                TextField(subjectPlaceholder, text: bind(\.subject))
-                    .textFieldStyle(.plain)
-                    .focused($focusedField, equals: .subject)
-            }
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 6) {
-                    Text("body").font(Typo.micro).foregroundStyle(Palette.inkFaint)
-                    Text("markdown: **bold**, *italic*, `code`, [links](url)")
-                        .font(Typo.micro)
-                        .foregroundStyle(Palette.inkFaintest)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.85)
+            VStack(alignment: .leading, spacing: 0) {
+                recipientRow(compose)
+                Hairline()
+                InlineFieldRow(label: "subject") {
+                    // Left blank on a reply the daemon titles from the parent;
+                    // the placeholder says so, because an empty field otherwise
+                    // reads as an unset required value.
+                    TextField(subjectPlaceholder, text: bind(\.subject))
+                        .textFieldStyle(.plain)
+                        .focused($focusedField, equals: .subject)
                 }
+                Hairline()
                 MarkdownTextView(
                     text: bind(\.body),
                     // Dropped ON THE EDITOR: at the drop point. Pasted: at
@@ -332,22 +349,31 @@ struct ComposePane: View {
                     onDropHover: { dropTargeted = $0 }
                 )
                 .frame(maxHeight: .infinity)
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Palette.canvas.opacity(0.65))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(
-                            dropTargeted ? Palette.accent : Palette.hairlineStrong,
-                            lineWidth: dropTargeted ? 1.5 : 0.75))
-                .animation(.easeOut(duration: 0.12), value: dropTargeted)
-                // The files, under the editor where a mail client puts them.
-                // Draws nothing when there are none.
+                // The text view's own inset plus its line-fragment padding make
+                // up the rest, so the body's left edge is the labels' edge.
+                .padding(.horizontal, InlineFieldMetrics.inset - 7)
+                .padding(.vertical, 8)
+                // The files, under the editor where a mail client puts them,
+                // still on the card. Draws nothing when there are none.
                 AttachmentTray(slot: .compose)
+                    .padding(.horizontal, InlineFieldMetrics.inset)
+                    .padding(.bottom, 10)
             }
             .frame(maxHeight: .infinity)
+            // Near-opaque, like every input well: a translucent card over a
+            // busy wallpaper leaves typed text unreadable.
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Palette.canvas.opacity(0.65))
+            )
+            // The drop cue is the whole card lighting up: a file let go
+            // anywhere on the message lands (see `composeDropTarget`).
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(
+                        dropTargeted ? Palette.accent : Palette.hairlineStrong,
+                        lineWidth: dropTargeted ? 1.5 : 0.75))
+            .animation(.easeOut(duration: 0.12), value: dropTargeted)
 
             // UNDER the editor, where the quote sits in the mail itself, and in
             // a scroller of its own: the note is what you are writing and keeps
@@ -373,44 +399,44 @@ struct ComposePane: View {
     /// would be offering a refusal.
     @ViewBuilder
     private func recipientRow(_ compose: ComposeState) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            // `to`, with cc and bcc folded behind their own labels on its line
-            // — and unfolded on their own whenever they hold anybody. The group
-            // affordances belong to `to` alone: a group is an audience, and an
-            // audience is who the mail is TO. See `RecipientFields`.
-            RecipientFields(
-                recipients: recipientsBinding, focus: $focusedField,
-                field: FocusTarget.recipient,
-                suggestGroups: canAddressGroup,
-                onGroupPicked: { pick($0) },
-                resolvedGroup: compose.groupName.map {
-                    (name: $0, count: groupMemberCount)
-                })
-            if canAddressGroup {
-                HStack(spacing: 8) {
-                    Button {
-                        groupPickerOpen = true
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "person.2").font(.system(size: 9, weight: .semibold))
-                            Text("groups").font(Typo.micro)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Palette.inkFaint)
-                    .popover(isPresented: $groupPickerOpen, arrowEdge: .bottom) {
-                        GroupPicker { group in
-                            groupPickerOpen = false
-                            pick(group)
-                        }
-                    }
-                    // The bcc toggle used to live here. It is on the `to`
-                    // field's own label row now, beside cc, where both fields
-                    // are unfolded from — and a bcc group still opens the row
-                    // on its own by filling it.
-                    Spacer()
-                }
+        // `to`, with cc and bcc folded behind their own labels on its line
+        // — and unfolded on their own whenever they hold anybody. The group
+        // affordances belong to `to` alone: a group is an audience, and an
+        // audience is who the mail is TO. See `RecipientFields`.
+        RecipientFields(
+            recipients: recipientsBinding, focus: $focusedField,
+            field: FocusTarget.recipient,
+            suggestGroups: canAddressGroup,
+            onGroupPicked: { pick($0) },
+            resolvedGroup: compose.groupName.map {
+                (name: $0, count: groupMemberCount)
+            },
+            inline: true,
+            toAccessory: canAddressGroup ? AnyView(groupsButton) : nil)
+    }
+
+    /// Browse groups, on the `to` line beside cc/bcc: the three things that
+    /// widen who a message is to, in one place. It used to hang on a line of
+    /// its own under the field, a whole row for one small word.
+    private var groupsButton: some View {
+        Button {
+            groupPickerOpen = true
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "person.2").font(.system(size: 9, weight: .semibold))
+                Text("groups")
+            }
+            .font(Typo.micro)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Palette.inkFaintest)
+        .pointingHand()
+        .help("address a send group")
+        .popover(isPresented: $groupPickerOpen, arrowEdge: .bottom) {
+            GroupPicker { group in
+                groupPickerOpen = false
+                pick(group)
             }
         }
     }
@@ -610,31 +636,6 @@ struct ComposePane: View {
             // The mechanism was never what needed explaining on a clean draft.
             if !compose.guardKinds.isEmpty {
                 GuardVerdictBox(kinds: compose.guardKinds)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var hint: some View {
-        HStack(spacing: 4) {
-            if inReview {
-                Kbd("esc")
-                Text("back").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                Text("·").foregroundStyle(Palette.inkFaintest)
-                if guarded {
-                    Kbd("shift+enter")
-                    Text("override + send")
-                        .font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                } else {
-                    Kbd("enter")
-                    Text("send").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                }
-            } else {
-                Kbd("esc")
-                Text("cancel").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
-                Text("·").foregroundStyle(Palette.inkFaintest)
-                Kbd("⌘enter")
-                Text("review").font(Typo.micro).foregroundStyle(Palette.inkFaintest)
             }
         }
     }
