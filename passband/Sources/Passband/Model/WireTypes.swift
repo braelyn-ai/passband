@@ -475,6 +475,7 @@ struct CalendarUpdate: Codable, Sendable, Identifiable, Hashable {
     var starts_at: String?
     var organizer: String?
     var received_at: String
+    var start_timezone: String? = nil
 }
 
 enum BankingKind: String, LenientRawEnum {
@@ -1633,7 +1634,8 @@ extension AgentFeed {
                 return CalendarUpdate(id: item.message_id * 1000 + index,
                     message_id: item.message_id, thread_id: item.thread_id, kind: .event,
                     event_title: record.title, starts_at: record.start?.value,
-                    organizer: nil, received_at: item.received_at)
+                    organizer: nil, received_at: item.received_at,
+                    start_timezone: record.start?.timezone)
             }
         }
     }

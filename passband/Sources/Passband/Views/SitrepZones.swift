@@ -19,8 +19,8 @@ struct CalendarZone: View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
             let rows = store.zones.calendar.filter {
                 CalendarVisibility.shared.admits(
-                    account: accountScope, item: $0.id, start: Fmt.date($0.starts_at),
-                    allDay: $0.starts_at?.count == 10, now: context.date)
+                    account: accountScope, item: $0.id, startValue: $0.starts_at,
+                    timezone: $0.start_timezone, now: context.date)
             }
             ZoneCard(
                 symbol: "calendar", title: "Calendar", count: rows.count, tint: Palette.accent

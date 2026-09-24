@@ -19,6 +19,38 @@ final class CalendarVisibility {
         defaults.set(now.timeIntervalSince1970, forKey: key)
     }
 
+    /// SupportedTime may carry a local wall time and a separate IANA zone.
+    /// Explicit offsets win; missing zones use the user's current calendar.
+    static func startDate(_ value: String?, timezone: String?, calendar: Calendar = .current) -> Date? {
+        guard let value else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: value) { return date }
+        iso.formatOptions = [.withInternetDateTime]
+        if let date = iso.date(from: value) { return date }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timezone.flatMap(TimeZone.init(identifier:)) ?? calendar.timeZone
+        formatter.isLenient = false
+        for format in ["yyyy-MM-dd", "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd'T'HH:mm:ss.SSS"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value), formatter.string(from: date) == value {
+                return date
+            }
+        }
+        return nil
+    }
+
+    func admits(account: String, item: Int, startValue: String?, timezone: String?,
+                now: Date, calendar: Calendar = .current) -> Bool {
+        var eventCalendar = calendar
+        if let timezone, let zone = TimeZone(identifier: timezone) { eventCalendar.timeZone = zone }
+        return admits(account: account, item: item,
+                      start: Self.startDate(startValue, timezone: timezone, calendar: eventCalendar),
+                      allDay: startValue?.count == 10, now: now, calendar: eventCalendar)
+    }
+
     func admits(account: String, item: Int, start: Date?, allDay: Bool,
                 now: Date, calendar: Calendar = .current) -> Bool {
         if let start {
