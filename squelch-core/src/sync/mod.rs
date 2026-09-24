@@ -5926,6 +5926,82 @@ mod tests {
         );
     }
 
+    /// The live bug: a spent background cap parked a hand-requested re-triage
+    /// of one email until midnight. One message is foreground and pays from
+    /// the global cap only; a window request still waits for the background.
+    #[tokio::test]
+    async fn single_message_retriage_runs_past_a_spent_background_budget() {
+        use crate::store::agent_triage::AgentTriageStore;
+        for single in [true, false] {
+            let (store, account) = store_at_cursor(Some(100));
+            let id = ingest_into(
+                &store,
+                account,
+                &fixture(
+                    account,
+                    "manual-mail",
+                    "From: alice@example.com\r\nSubject: Hello\r\n\r\nA note",
+                    false,
+                ),
+                Utc::now(),
+            );
+            while let Some(job) = store
+                .claim_agent_job(account, "investigation", Utc::now(), 120)
+                .unwrap()
+            {
+                store.complete_agent_job(&job).unwrap();
+            }
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let app = Router::new().route(
+                "/",
+                axum::routing::post(move || {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    async { StatusCode::SERVICE_UNAVAILABLE }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let llm = ResolvedLlm {
+                url: format!("http://{}/", listener.local_addr().unwrap()),
+                api_key: "test".into(),
+                provider: Stage2Provider::OpenAI,
+            };
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let engine = engine(store.clone(), account, "http://127.0.0.1:1");
+            let day = Utc::now().format("%Y-%m-%d").to_string();
+            let background = vec![(
+                "__agent_background__".to_string(),
+                engine
+                    .config
+                    .triage
+                    .agent
+                    .effective_background_daily_run_cap(),
+            )];
+            while store
+                .reserve_agent_budget(account, &day, &background)
+                .unwrap()
+            {}
+            store
+                .retriage_reset(account, single.then_some(id), 7)
+                .unwrap();
+            let job = store
+                .claim_agent_job(account, "investigation", Utc::now(), 120)
+                .unwrap()
+                .unwrap();
+            assert!(job.trigger.starts_with("manual:"));
+            engine.process_agent_job(job, &llm, &day).await;
+            let parked = store.retriage_progress(account).unwrap().budget_parked;
+            if single {
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "the model was asked");
+                assert_eq!(parked, 0);
+            } else {
+                assert_eq!(calls.load(Ordering::Relaxed), 0);
+                assert_eq!(parked, 1, "a window request waits for the background");
+            }
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn expired_provider_circuit_admits_one_probe_and_recloses() {
         let (store, account) = store_at_cursor(Some(100));

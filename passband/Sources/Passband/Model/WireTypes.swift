@@ -1430,6 +1430,11 @@ struct RetriageProgress: Codable, Sendable, Hashable {
     /// The oldest live stamp: when the counted run began. Absent exactly when
     /// `total` is 0.
     var started_at: String?
+    /// Jobs of the run the daemon has deferred because a daily triage budget
+    /// ran out, and the earliest time one of them runs again. Optional because
+    /// an older daemon does not send them; absent reads as "not paused".
+    var budget_parked: Int?
+    var budget_resumes_at: String?
 }
 
 struct ShredStats: Codable, Sendable, Hashable {

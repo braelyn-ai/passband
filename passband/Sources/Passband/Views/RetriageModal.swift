@@ -41,7 +41,7 @@ struct RetriageModal: View {
             Image(systemName: "arrow.trianglehead.2.clockwise")
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(Palette.accent)
-                .symbolEffect(.rotate, isActive: run.watching)
+                .symbolEffect(.rotate, isActive: run.watching && !run.paused)
             Text(title)
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(Palette.ink)
@@ -57,6 +57,8 @@ struct RetriageModal: View {
         // telling somebody the counter is stuck while the daemon is visibly
         // working is the wrong half of the truth.
         if store.catchUp != nil { return "Waiting for your mailbox" }
+        // Same reasoning: a spent budget is WHY the counter stopped.
+        if run.paused { return "Re-triage paused" }
         if run.stalled { return "Re-triage: not moving" }
         return "Re-triage in progress"
     }
@@ -128,6 +130,12 @@ struct RetriageModal: View {
                     + "(\(sync.done) of \(sync.total) messages). Triage starts when it "
                     + "finishes, and this re-triage is queued behind it, not lost.",
                 tone: Palette.inkFaintest)
+            closeButton("Close")
+        } else if run.paused {
+            note(
+                RetriageRun.pauseNote(resumesAt: Fmt.date(run.resumesAt))
+                    + " It carries on by itself; closing this stops the watching, not the run.",
+                tone: Palette.warn)
             closeButton("Close")
         } else if run.stalled {
             // Still polling — the run may simply be behind a slow cycle — but

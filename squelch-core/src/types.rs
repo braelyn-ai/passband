@@ -972,6 +972,14 @@ pub struct RetriageProgress {
     /// The OLDEST live stamp: when the run being counted began. `None` exactly
     /// when `total` is 0.
     pub started_at: Option<DateTime<Utc>>,
+    /// Jobs of `total` the worker has deferred past now because a daily
+    /// triage budget ran out. Non-zero means the run is paused, not stuck.
+    #[serde(default)]
+    pub budget_parked: i64,
+    /// The earliest time a parked job becomes claimable again. `None` exactly
+    /// when `budget_parked` is 0.
+    #[serde(default)]
+    pub budget_resumes_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
