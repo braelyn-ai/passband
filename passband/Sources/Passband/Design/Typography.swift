@@ -70,14 +70,19 @@ enum Typo {
 /// The key-hint chip the whole app uses to teach its keymap in place.
 struct Kbd: View {
     let label: String
-    init(_ label: String) { self.label = label }
+    /// Font size; padding scales with it so a larger cap keeps its shape.
+    var size: CGFloat = 10
+    init(_ label: String, size: CGFloat = 10) {
+        self.label = label
+        self.size = size
+    }
 
     var body: some View {
         Text(label)
-            .font(Typo.mono(10, weight: .medium))
+            .font(Typo.mono(size, weight: .medium))
             .foregroundStyle(Palette.inkFaint)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1.5)
+            .padding(.horizontal, 5 * size / 10)
+            .padding(.vertical, 1.5 * size / 10)
             .background(
                 RoundedRectangle(cornerRadius: 4, style: .continuous)
                     .fill(Palette.hairline.opacity(0.6))

@@ -5,6 +5,8 @@ import SwiftUI
 struct PracticeProductTour: View {
     @Environment(AppStore.self) private var store
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.displayScale) private var displayScale
     @State private var frame: CGRect = .zero
     @State private var cardHeight: CGFloat = 270
 
@@ -84,7 +86,7 @@ struct PracticeProductTour: View {
                 .font(Typo.serif(28, weight: .medium))
                 .foregroundStyle(Palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(guideExplanation)
+            explanationText(guideExplanation)
                 .font(.system(size: 15))
                 .lineSpacing(3)
                 .foregroundStyle(Palette.inkDim)
@@ -177,6 +179,35 @@ struct PracticeProductTour: View {
         #endif
     }
 
+    /// The copy with each `{key}` drawn as the same keycap the hint row uses.
+    /// Text cannot host a bordered view, but it can interpolate an Image, so
+    /// the cap is rasterized and the sentence still wraps as one paragraph.
+    private func explanationText(_ copy: String) -> Text {
+        var text = Text(verbatim: "")
+        var rest = Substring(copy)
+        while let open = rest.firstIndex(of: "{"),
+              let close = rest[open...].firstIndex(of: "}") {
+            let key = String(rest[rest.index(after: open)..<close])
+            text = Text("\(text)\(Text(verbatim: String(rest[..<open])))\(inlineKeycap(key))")
+            rest = rest[rest.index(after: close)...]
+        }
+        return Text("\(text)\(Text(verbatim: String(rest)))")
+    }
+
+    private func inlineKeycap(_ key: String) -> Text {
+        let renderer = ImageRenderer(content: Kbd(key, size: 11)
+            .environment(\.colorScheme, colorScheme))
+        renderer.scale = displayScale
+        #if os(macOS)
+        let image = renderer.nsImage.map { Image(nsImage: $0) }
+        #else
+        let image = renderer.uiImage.map { Image(uiImage: $0) }
+        #endif
+        guard let image else { return Text(verbatim: key) }
+        // Center the cap on the x-height of the 15pt copy around it.
+        return Text(image).baselineOffset(-2.5).accessibilityLabel(key == "esc" ? "Escape" : key)
+    }
+
     private func guideKeyHint(_ key: String, _ label: String) -> some View {
         HStack(spacing: 8) {
             Kbd(key).scaleEffect(1.15)
@@ -210,7 +241,7 @@ struct PracticeProductTour: View {
             }
         }
         if readingRecord {
-            return "Here’s the original email. Press Escape when you’re ready to head back."
+            return "Here’s the original email. Press {esc} when you’re ready to head back."
         }
         if step == .undo && undoWasRestored {
             return "Maya’s message is back on your board. You’ve tried both finishing a message and bringing it back."
