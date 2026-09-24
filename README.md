@@ -124,12 +124,28 @@ verdicts, `squelchd_llm_config_failures_total` for rejected model requests, and
 manual re-triage gauges are omitted if the store cannot be read. No message IDs,
 account addresses, or error bodies are exposed as labels.
 
-Gmail sync paces reads and retries quota refusals on the same request with
-exponential cooldowns (60 seconds to five minutes, honoring longer `Retry-After`
-headers, up to eight retries). This preserves catch-up position during cooldowns;
-exhausted retries or other errors still return to the outer sync retry loop.
-Catch-up logs progress every 50 fetched messages. On startup, triage waits for a
-successful sync; re-fetching mail does not by itself reset existing verdicts.
+Gmail reads are paced by method cost with 20% quota headroom. The default
+`standard` profile follows Google's May 2026 quotas (6,000 units/user/minute;
+`messages.get` costs 20). For a project whose Cloud console confirms the retained
+15,000-unit/minute quota and 5-unit message reads, set
+`SQUELCH_GMAIL_QUOTA_PROFILE=legacy` (or `[sync] gmail_quota_profile = "legacy"`).
+See [Google's quota reference](https://developers.google.com/workspace/gmail/api/reference/quota).
+This makes label/profile reads cheap and avoids a blanket per-request sleep.
+
+Only initial backfill and catch-up opt into quota retries. A call retries at most
+twice, starting at one second; each wait is capped at 30 seconds. `Retry-After`
+within that ceiling is honored. Longer instructions return an error to the outer
+scheduler instead of holding the call open. Cosmetic unread counts, metadata
+sweeps, spam browsing, and incremental polls return quota errors immediately.
+Recovered quota pauses increment `squelchd_gmail_quota_retries_total`; the Gmail
+error counter records only terminal failed calls. Catch-up retains its current
+message during these short retries and logs progress every 50 fetched messages.
+On startup, triage waits for a successful sync; re-fetching mail does not by itself
+reset existing verdicts.
+
+Manual re-triage progress uses a covering index over the account's 24-hour request
+window and indexed equality probes into durable jobs. Metrics and the client
+progress endpoint share this query; neither scans the full triage table.
 
 
 The same listener answers `GET /healthz`, for an orchestrator that needs to know when this daemon is actually serving: `200 ok` once the sync engine is running and the embedder init has settled, `503` before that and `503` again if either stops. Two states and one word, deliberately — anything that reaches the port reads the answer, so it says nothing about the mailbox behind it. The daemon binds its doors before it finishes starting, so that a first-run model download cannot make them unreachable, which is exactly why "the port accepts" is not the same question.

@@ -135,6 +135,13 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // stamp would force the whole mailbox through the LLM passes on the next
     // tick — the exact opposite of what the age-based stale skip is for.
     add_column_if_missing(conn, "triage", "retriage_at", "TEXT")?;
+    if has_columns(conn, "triage", &["account_id", "message_id", "retriage_at"])? {
+        // Partial, covering range lookup: untouched mail never enters the index.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_triage_retriage_window
+             ON triage(account_id,retriage_at,message_id) WHERE retriage_at IS NOT NULL;",
+        )?;
+    }
 
     // MAY THIS MESSAGE EVER NOTIFY, and from when. NULL on every pre-existing
     // row and NOT backfilled, and the NULL is the whole safety property: a
