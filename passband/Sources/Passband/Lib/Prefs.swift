@@ -149,7 +149,9 @@ final class Prefs {
             Key.settingsSection: SettingsSection.general.rawValue,
             Key.developerMode: false,
             Key.tourCompleted: false,
-            Key.theme: ThemeChoice.system.rawValue,
+            // Dark by default: the app (and its onboarding scene) is designed
+            // night-first. A stored choice, including an explicit Auto, wins.
+            Key.theme: ThemeChoice.dark.rawValue,
             Key.zoom: 1.0,
             Key.threadStyle: ThreadStyleDefault.auto.rawValue,
             Key.searchIncludeRelated: false,
@@ -165,7 +167,7 @@ final class Prefs {
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _lastSeenReleaseNotes = defaults.string(forKey: Key.lastSeenReleaseNotes)
-        _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
+        _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .dark
         _zoom = Zoom.clamp(defaults.double(forKey: Key.zoom))
         _threadStyle =
             ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto
