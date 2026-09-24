@@ -1204,9 +1204,7 @@ mod tests {
         let context = store.load_agent_context(&job).unwrap();
         let decision = MessageDecision {
             summary: "Lamp shipped".into(),
-            // A RECORD HIT needs the placement; without it the row is only ever
-            // served by the carrier-row loop and the first path goes untested.
-            destinations: vec![squelch_core::triage::decision::MessageDestination::Records],
+            // Record proposals own record membership independently of destinations.
             records: vec![RecordProposal::Delivery {
                 carrier: Some("ups".into()),
                 tracking_number: Some("1Z999AA10123456784".into()),
@@ -1303,7 +1301,6 @@ mod tests {
         let context = store.load_agent_context(&job).unwrap();
         let carrierless = MessageDecision {
             summary: "Delivery question".into(),
-            destinations: vec![squelch_core::triage::decision::MessageDestination::Records],
             records: vec![RecordProposal::Delivery {
                 carrier: None,
                 tracking_number: Some("1Z999AA10123456784".into()),
