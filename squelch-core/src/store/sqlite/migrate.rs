@@ -449,6 +449,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         clear_stale_no_extractor_markers(conn)?;
     }
 
+    // A one-message re-triage requested while its job was leased waits as a
+    // follow-up; this carries its foreground lane to the re-run. Older rows
+    // were all background requests, which is the default: no backfill.
+    add_column_if_missing(
+        conn,
+        "agent_triage_followups",
+        "foreground",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+
     // Blind recipients on a local draft. Pre-existing rows had none, and '' is
     // the honest reading, which is also the column default: no backfill.
     add_column_if_missing(conn, "drafts", "bcc_addr", "TEXT NOT NULL DEFAULT ''")?;

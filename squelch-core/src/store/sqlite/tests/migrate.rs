@@ -1632,3 +1632,27 @@ fn event_auth_flag_migration_defaults_legacy_rows_without_inferring_urgency() {
         "legacy urgency alone does not prove authentication"
     );
 }
+
+#[test]
+fn migrate_adds_a_background_foreground_flag_to_preexisting_followups() {
+    // An install whose follow-ups predate the lane flag. Every such row was a
+    // background request, so the column arrives as 0, and a re-open is a no-op.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE agent_triage_followups(
+             job_id INTEGER PRIMARY KEY, kind TEXT NOT NULL, trigger TEXT NOT NULL,
+             arrival_eligible INTEGER NOT NULL DEFAULT 0);
+         INSERT INTO agent_triage_followups VALUES(7,'triage','manual:x',0);",
+    )
+    .unwrap();
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap();
+    let lane: i64 = conn
+        .query_row(
+            "SELECT foreground FROM agent_triage_followups WHERE job_id=7",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(lane, 0);
+}

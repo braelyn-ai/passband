@@ -463,6 +463,73 @@ fn reasking_for_one_message_unparks_a_budget_deferral_only() {
     }
 }
 
+/// A click that lands while the message's job is LEASED is stored as a
+/// follow-up. Whichever way the running job ends, the re-run it leaves behind
+/// is the human's one-message request, so it must be foreground; a window
+/// request's follow-up stays background.
+#[test]
+fn a_one_message_request_during_a_lease_keeps_its_foreground_lane() {
+    use crate::store::agent_triage::AgentTriageStore;
+    let later = Utc::now() + chrono::Duration::hours(6);
+    for (single, ending) in [
+        (true, "complete"),
+        (false, "complete"),
+        (true, "budget"),
+        (false, "budget"),
+        (true, "cooldown"),
+    ] {
+        let (store, account) = store();
+        let id = settled_message(&store, account);
+        // A window request runs in the background and is mid-flight.
+        store.retriage_reset(account, None, 7).unwrap();
+        let running = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap()
+            .unwrap();
+        assert!(!running.foreground);
+        // Distinct manual stamps: the request identity is the timestamp.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .retriage_reset(account, single.then_some(id), 7)
+            .unwrap();
+        match ending {
+            "complete" => {
+                store.complete_agent_job(&running).unwrap();
+            }
+            "budget" => {
+                store
+                    .defer_agent_job(&running, later, "daily_budget_exhausted")
+                    .unwrap();
+            }
+            _ => {
+                store
+                    .defer_agent_job(&running, later, "provider_cooldown")
+                    .unwrap();
+            }
+        }
+        let row = manual_job_row(&store, id);
+        assert_eq!(
+            row.3 == 1,
+            single,
+            "{single}/{ending}: the re-run's lane follows the request"
+        );
+        let claimed = store
+            .claim_agent_job(account, "investigation", Utc::now(), 60)
+            .unwrap();
+        match (single, ending) {
+            (_, "complete") | (true, "budget") => {
+                let job = claimed.expect("the re-run is claimable now");
+                assert_eq!(job.foreground, single, "{single}/{ending}");
+                assert!(job.trigger.starts_with("manual:"));
+            }
+            _ => assert!(
+                claimed.is_none(),
+                "{single}/{ending}: a window stays parked and genuine backoff is kept"
+            ),
+        }
+    }
+}
+
 #[test]
 fn retriage_progress_reports_budget_parked_jobs_and_when_they_resume() {
     use crate::store::agent_triage::AgentTriageStore;

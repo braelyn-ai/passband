@@ -1472,7 +1472,10 @@ CREATE TABLE IF NOT EXISTS agent_triage_followups (
     job_id INTEGER PRIMARY KEY REFERENCES agent_triage_jobs(id) ON DELETE CASCADE,
     kind TEXT NOT NULL,
     trigger TEXT NOT NULL,
-    arrival_eligible INTEGER NOT NULL DEFAULT 0
+    arrival_eligible INTEGER NOT NULL DEFAULT 0,
+    -- A human asked for this one message while its job was running, so the
+    -- re-run keeps the foreground lane (migrate.rs adds it to older DBs).
+    foreground INTEGER NOT NULL DEFAULT 0
 );
 -- FYE is a thread-level human choice, so a sibling cannot undo the correction.
 CREATE TABLE IF NOT EXISTS agent_thread_preferences (

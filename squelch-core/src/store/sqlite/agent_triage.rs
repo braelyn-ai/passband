@@ -442,9 +442,13 @@ fn queue_investigation(
             "access"
         };
         if state == "leased" {
-            conn.execute("INSERT INTO agent_triage_followups(job_id,kind,trigger,arrival_eligible) VALUES(?1,?2,?3,?4)
+            // A human's one-message request keeps its foreground lane through
+            // the wait, whichever way the running job ends.
+            let lane = requested_foreground && kind == "triage";
+            conn.execute("INSERT INTO agent_triage_followups(job_id,kind,trigger,arrival_eligible,foreground) VALUES(?1,?2,?3,?4,?5)
                 ON CONFLICT(job_id) DO UPDATE SET kind=CASE WHEN kind='triage' OR excluded.kind='triage' THEN 'triage' ELSE 'access' END,
-                trigger=excluded.trigger,arrival_eligible=MAX(arrival_eligible,excluded.arrival_eligible)",params![id,kind,trigger,eligible])?;
+                trigger=excluded.trigger,arrival_eligible=MAX(arrival_eligible,excluded.arrival_eligible),
+                foreground=MAX(foreground,excluded.foreground)",params![id,kind,trigger,eligible,lane])?;
             return Ok(());
         }
         if ((state == "completed" && existing_trigger != trigger)
@@ -495,6 +499,25 @@ fn queue_investigation(
 }
 
 fn absorb_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
+    // The job goes back to the queue carrying the follow-up. A human's
+    // one-message request makes it foreground, and, exactly as a re-ask on a
+    // queued job does, lifts a daily-budget park (never other backoff).
+    let requested: bool = conn
+        .query_row(
+            "SELECT foreground FROM agent_triage_followups WHERE job_id=?1",
+            [job.id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if requested {
+        conn.execute("INSERT INTO agent_job_lanes(job_id,foreground) VALUES(?1,1) ON CONFLICT(job_id) DO UPDATE SET foreground=1",[job.id])?;
+        conn.execute(
+            "UPDATE agent_triage_jobs SET available_at=?2,last_error=NULL
+             WHERE id=?1 AND state='queued' AND last_error='daily_budget_exhausted'",
+            params![job.id, Utc::now().to_rfc3339()],
+        )?;
+    }
     conn.execute("UPDATE agent_triage_jobs SET
         kind=CASE WHEN kind='triage' OR (SELECT kind FROM agent_triage_followups WHERE job_id=?1)='triage' THEN 'triage' ELSE kind END,
         trigger=COALESCE((SELECT trigger FROM agent_triage_followups WHERE job_id=?1),trigger),
@@ -508,18 +531,18 @@ fn absorb_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
 }
 
 fn release_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
-    let followup: Option<(String, String, bool)> = conn
+    let followup: Option<(String, String, bool, bool)> = conn
         .query_row(
-            "SELECT kind,trigger,arrival_eligible FROM agent_triage_followups WHERE job_id=?1",
+            "SELECT kind,trigger,arrival_eligible,foreground FROM agent_triage_followups WHERE job_id=?1",
             [job.id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
     conn.execute(
         "DELETE FROM agent_triage_followups WHERE job_id=?1",
         [job.id],
     )?;
-    if let Some((kind, trigger, eligible)) = followup {
+    if let Some((kind, trigger, eligible, requested)) = followup {
         let revision: i64 = conn.query_row(
             "SELECT input_revision FROM agent_triage_jobs WHERE id=?1",
             [job.id],
@@ -533,8 +556,8 @@ fn release_followup(conn: &Connection, job: &AgentJob) -> Result<()> {
             &kind,
             &trigger,
             eligible,
-            false,
-            false,
+            requested,
+            requested,
         )?;
     }
     Ok(())
