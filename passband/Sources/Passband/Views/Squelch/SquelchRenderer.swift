@@ -30,7 +30,7 @@ struct SquelchSceneState {
     /// crossfades instead of cutting.
     var light: Float = 0
 
-    static let waveSpeed: Float = 2.4
+    static let waveSpeed: Float = 1.5
     static let xMax: Float = 13
 
     /// Advance the fronts. `engaged` is the switch; everything else follows.
@@ -55,7 +55,8 @@ struct SquelchSceneState {
 
 final class SquelchRenderer {
     static let bands = 104
-    static let segments = 720
+    static let segments = 1400
+    static let samples = 4
 
     let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -67,6 +68,7 @@ final class SquelchRenderer {
     private let testDepth: MTLDepthStencilState
     private let noDepth: MTLDepthStencilState
     private var depthTexture: MTLTexture?
+    private var colorTexture: MTLTexture?
 
     let colorFormat: MTLPixelFormat
 
@@ -85,6 +87,7 @@ final class SquelchRenderer {
             d.fragmentFunction = library.makeFunction(name: fragment)
             d.colorAttachments[0].pixelFormat = colorFormat
             d.depthAttachmentPixelFormat = .depth32Float
+            d.rasterSampleCount = Self.samples
             if additive {
                 let a = d.colorAttachments[0]!
                 a.isBlendingEnabled = true
@@ -129,16 +132,27 @@ final class SquelchRenderer {
     func encode(_ state: SquelchSceneState, into buffer: MTLCommandBuffer, target: MTLTexture) {
         let width = target.width, height = target.height
         if depthTexture?.width != width || depthTexture?.height != height {
-            let d = MTLTextureDescriptor.texture2DDescriptor(
-                pixelFormat: .depth32Float, width: width, height: height, mipmapped: false)
-            d.usage = .renderTarget
-            d.storageMode = .private
-            depthTexture = device.makeTexture(descriptor: d)
+            // 4x MSAA: without it the edges where near bands hide far ones
+            // crawl as the field scrolls. On Apple GPUs both attachments live
+            // in tile memory only, so the samples never touch RAM.
+            let memoryless = device.supportsFamily(.apple1)
+            func attachment(_ format: MTLPixelFormat) -> MTLTexture? {
+                let d = MTLTextureDescriptor.texture2DDescriptor(
+                    pixelFormat: format, width: width, height: height, mipmapped: false)
+                d.textureType = .type2DMultisample
+                d.sampleCount = Self.samples
+                d.usage = .renderTarget
+                d.storageMode = memoryless ? .memoryless : .private
+                return device.makeTexture(descriptor: d)
+            }
+            depthTexture = attachment(.depth32Float)
+            colorTexture = attachment(colorFormat)
         }
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].texture = colorTexture
+        pass.colorAttachments[0].resolveTexture = target
         pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].storeAction = .multisampleResolve
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.depthAttachment.texture = depthTexture
         pass.depthAttachment.loadAction = .clear
@@ -260,8 +274,14 @@ float vnoise(float2 p) {
 }
 float fbm(float2 p) {
     float s = 0.0, a = 0.55;
-    for (int k = 0; k < 5; k++) { s += a * vnoise(p); p = p * 2.07 + float2(17.1, 3.7); a *= 0.52; }
-    return s;
+    // Four octaves, the last at half weight: the finest detail has to stay
+    // under what one line segment can sample, or it crawls as it scrolls.
+    for (int k = 0; k < 4; k++) {
+        s += a * vnoise(p) * (k == 3 ? 0.5 : 1.0);
+        p = p * 2.07 + float2(17.1, 3.7);
+        a *= 0.52;
+    }
+    return s * 1.12;
 }
 
 float bandZ(float i, constant U& u) { return (i / (u.field.x - 1.0) - 0.5) * BAND_SPAN; }
@@ -292,11 +312,32 @@ float gain(float i, float s, constant U& u) {
 
 // Broadband noise, a function of the retarded coordinate s = x - c t so it
 // travels as one field. Bursts ride along with it.
-float noiseY(float i, float s, constant U& u) {
+float noiseAmp(float i, float s, constant U& u) {
     float n = i / (u.field.x - 1.0);
     float hump = exp(-pow((n - 0.5) * 2.6, 2.0));
     float burst = 0.3 + 0.9 * smoothstep(-0.15, 0.7, vnoise(float2(s * 0.16, i * 0.31)));
-    return (0.16 + 0.95 * hump) * burst * fbm(float2(s * 2.7, i * 1.93));
+    return (0.16 + 0.95 * hump) * burst;
+}
+// The noise itself. Each octave's temporal frequency (spatial frequency times
+// how fast it slides) is capped well under the display rate: when every octave
+// advected at the wave speed, the finest detail slid ~its own width per frame
+// and strobed, and anything
+// much above ~3 Hz across a hundred dense lines is tiring to look at. The broad shapes still flow downstream at full speed; the fine
+// grain drifts slower and churns in place, which reads as noise, not as lag.
+float noiseY(float i, float x, float t, constant U& u) {
+    float c = u.filter.y;
+    float s = x - c * t;
+    float sum = 0.0, a = 0.55, f = 2.7;
+    float2 off = float2(0.0, i * 1.93);
+    for (int k = 0; k < 4; k++) {
+        float v = min(c, 3.0 / f);             // cap: f * v <= 3 cycles/s
+        float2 p = float2(x * f - t * f * v, off.y) + float2(off.x, 0.0);
+        sum += a * vnoise(p) * (k == 3 ? 0.5 : 1.0);
+        off = off * 2.07 + float2(17.1, 3.7);
+        a *= 0.52;
+        f *= 2.07;
+    }
+    return noiseAmp(i, s, u) * sum * 1.12;
 }
 
 // The signal: wave packets on a carrier, one per stretch of stream per band.
@@ -327,7 +368,7 @@ Sample field(float i, float x, constant U& u) {
     float s = x - u.filter.y * t;
     float g = gain(i, s, u);
     float m = filtered(x, u);
-    float noise = noiseY(i, s, u);
+    float noise = noiseY(i, x, t, u);
     float sig = signalY(i, s);
     float raw = noise + g * sig * 0.8;
     float clean = g * sig * 1.35;
@@ -335,21 +376,24 @@ Sample field(float i, float x, constant U& u) {
 
     float n = i / (u.field.x - 1.0);
     float env = packetEnv(i, s) * g;
-    float busy = abs(noise);
+    // Brightness follows the burst envelope, never the instantaneous sample:
+    // tying it to |noise| made every line twinkle along its length.
+    float busy = saturate(noiseAmp(i, s, u) * 0.75);
 
     // Night: a muted spectrum, warm lows to cool highs; the passband in
     // passband blue with the packets running hot.
     float3 noiseG = mix(float3(0.55, 0.34, 0.62), float3(0.22, 0.52, 0.66), n) * (0.42 + 0.4 * busy);
     float3 passG = float3(0.30, 0.62, 1.00) * (0.9 + 0.5 * g) + float3(1.0, 0.86, 0.62) * env * 2.2;
-    float3 glow = mix(noiseG, mix(float3(0.08, 0.11, 0.16), passG, g), m);
+    float3 glow = mix(noiseG, mix(float3(0.06, 0.085, 0.12), passG, g), m);
 
     // Paper: the same spectrum as ink, the passband in accent blue deepening
     // to navy through each packet.
-    float3 noiseI = mix(float3(0.40, 0.27, 0.60), float3(0.12, 0.40, 0.56), n);
-    float noiseA = 0.55 + 0.45 * busy;
-    float3 passI = mix(float3(0.17, 0.50, 0.83), float3(0.05, 0.22, 0.52), saturate(env * 1.4));
-    float3 ink = mix(noiseI, mix(float3(0.50, 0.58, 0.70), passI, g), m);
-    float alpha = mix(noiseA, mix(0.16, 0.95, g), m);
+    // Slate, not black: dense high-contrast stripes make a page vibrate.
+    float3 noiseI = mix(float3(0.42, 0.38, 0.58), float3(0.30, 0.46, 0.56), n);
+    float noiseA = 0.26 + 0.26 * busy;
+    float3 passI = mix(float3(0.17, 0.50, 0.83), float3(0.11, 0.39, 0.68), saturate(env * 1.4));
+    float3 ink = mix(noiseI, mix(float3(0.55, 0.62, 0.72), passI, g), m);
+    float alpha = mix(noiseA, mix(0.07, 0.78, g), m);
 
     // Energy dumped at the gate: out-of-band lines flare where they die.
     float flare = exp(-x * x / 0.06) * u.filter.x * (1.0 - g) * (0.5 + busy);
@@ -370,8 +414,9 @@ float3 backdrop(float2 uv, float t) {
     float bloom = exp(-r * r * 3.0);
     float3 night = mix(float3(0.035, 0.05, 0.085), float3(0.012, 0.016, 0.03), uv.y)
         + float3(0.05, 0.09, 0.16) * bloom;
-    float3 paper = mix(float3(0.965, 0.975, 0.99), float3(0.925, 0.945, 0.972), uv.y)
-        - float3(0.05, 0.03, 0.0) * bloom;
+    // The app's canvas (EDF3FA) rather than white: less glare behind ink.
+    float3 paper = mix(float3(0.93, 0.953, 0.98), float3(0.895, 0.918, 0.95), uv.y)
+        - float3(0.03, 0.018, 0.0) * bloom;
     return mix(night, paper, t);
 }
 
@@ -435,9 +480,11 @@ vertex LineOut line_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
     LineOut o;
     o.pos = ca;
     o.pos.xy += nrm * side * px * 2.0 / u.frame.xy * ca.w;
-    o.glow = a.glow;
+    // Far bands crowd to under a pixel apart and shimmer; let them recede.
+    float recede = mix(1.0, 0.5, smoothstep(12.0, 24.0, ca.w));
+    o.glow = a.glow * recede;
     o.ink = a.ink;
-    o.alpha = a.alpha;
+    o.alpha = a.alpha * recede;
     o.across = side;
     return o;
 }
@@ -449,7 +496,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant U& u [[buffer(0)
     float t = u.filter.z;
     float3 night = in.glow * (core * 1.3 + halo);
     // Ink has no glow to spend, so it gets a crisper core and a thin halo.
-    float a = saturate(in.alpha * (core * 1.35 + halo * 0.45));
+    float a = saturate(in.alpha * (core * 1.2 + halo * 0.5));
     return float4(mix(night, in.ink * a, t), a * t);
 }
 
@@ -480,8 +527,7 @@ fragment float4 gate_fragment(GateOut in [[stage_in]], constant U& u [[buffer(0)
     float g = gain(i, -u.filter.y * u.eye.w, u);
     float slotEdge = exp(-pow((g - 0.5) * 7.0, 2.0));
     float slot = g * 0.10 * (1.0 - q.y) + slotEdge * 0.55;
-    float scan = 0.5 + 0.5 * sin(q.y * 160.0 - u.eye.w * 4.0);
-    float glass = (0.018 + 0.012 * scan) * (1.0 - q.y * 0.7);
+    float glass = 0.024 * (1.0 - q.y * 0.7);
     float lit = 0.1 + 0.9 * e;
     float3 night = (float3(0.35, 0.62, 1.0) * (frame + glass) + float3(0.62, 0.82, 1.0) * slot) * lit;
     float a = saturate((frame * 0.9 + glass * 2.5 + slot * 0.8) * lit);
