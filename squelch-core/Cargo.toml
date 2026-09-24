@@ -74,3 +74,7 @@ axum = { version = "0.8" }
 # wraps a retry ladder whose real duration is minutes. tokio's "full" feature set
 # deliberately leaves test-util out, so it is asked for here.
 tokio = { workspace = true, features = ["test-util"] }
+# The claim-plan regression test times the claiming thread's CPU, not the wall
+# clock: a loaded CI runner stretches wall time past any honest threshold while
+# the work a history scan adds shows up in CPU either way.
+libc = { workspace = true }

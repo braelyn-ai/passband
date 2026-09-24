@@ -3024,6 +3024,7 @@ mod tests {
             }
         });
         let start = std::time::Instant::now();
+        let cpu_start = thread_cpu();
         let arrival = store
             .claim_agent_job(1, "investigation", Utc::now(), 60)
             .unwrap()
@@ -3041,15 +3042,32 @@ mod tests {
             assert_eq!(job.trigger, "migration");
             store.complete_agent_job(&job).unwrap();
         }
+        let cpu = thread_cpu() - cpu_start;
         let elapsed = start.elapsed();
         reader.join().unwrap();
         eprintln!(
-            "200k completed jobs, 1,500 migrations, 100 claims + concurrent reads: {elapsed:?}; mean {:?}",
-            elapsed / 100
+            "200k completed jobs, 1,500 migrations, 100 claims + concurrent reads: {elapsed:?} wall, {cpu:?} cpu; mean {:?} cpu",
+            cpu / 100
         );
-        // A generous debug-build threshold still catches the reported 74–92ms
-        // per-claim history scan. EXPLAIN is the deterministic regression guard.
-        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        // EXPLAIN is the deterministic regression guard. This bound is the
+        // backstop, and it is on the claiming thread's CPU rather than the wall
+        // clock: the full suite on a small CI runner stretched the wall time of
+        // an unchanged claim path to 6s, while the reported 74-92ms per-claim
+        // history scan costs 7-9s of CPU for these 100 claims under any load.
+        // Waiting on the store mutex behind the reader thread burns no CPU.
+        assert!(cpu < std::time::Duration::from_secs(2), "{cpu:?}");
+    }
+
+    /// CPU consumed by the calling thread so far.
+    fn thread_cpu() -> std::time::Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec for the call's duration.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime(CLOCK_THREAD_CPUTIME_ID)");
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
     }
 
     #[test]
