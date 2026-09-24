@@ -26,6 +26,9 @@ const pages: Record<string, string> = {
   "/icon-dark.svg": "icon-dark.svg",
   // Groundless, for the landing page's own dark field.
   "/mark.svg": "mark.svg",
+  // The hero's still frame, for a browser with no WebGL2. Rendered from the
+  // Swift client's own Metal scene, so the fallback is the real thing.
+  "/squelch-poster.jpg": "squelch-poster.jpg",
   // The same mark as raster, for the invite email. No mail client renders SVG.
   "/mark.png": "mark.png",
   "/icon-180.png": "icon-180.png",
