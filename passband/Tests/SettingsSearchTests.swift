@@ -46,7 +46,7 @@ struct SettingsSearchTests {
         first("signature", is: .signature)
         first("theme", is: .appearance)
         first("telemetry", is: .privacy)
-        first("server url", is: .connection)
+        first("server url", is: .account)
         first("read tracking", is: .readTracking)
         first("assistant model", is: .assistant)
         first("dev mode", is: .developer)
@@ -65,28 +65,24 @@ struct SettingsSearchTests {
         first("posthog", is: .privacy)
         first("opt out", is: .privacy)
         first("sign off", is: .signature)
-        first("walkthrough", is: .tour)
-        first("changelog", is: .whatsNew)
+        first("walkthrough", is: .help)
+        first("changelog", is: .help)
         first("refer a friend", is: .account)
         first("mailbox", is: .account)
-        first("how expensive", is: .triageBudget)
-        first("dollars", is: .triageBudget)
         first("bring your own key", is: .assistant)
         first("greeting", is: .you)
-        first("8848", is: .connection)
+        first("8848", is: .account)
     }
 
     /// Two ordinary words that name one specific thing. Both halves match half
     /// the app; said together they must beat everything they are made of.
     static func phrasesBeatTheirParts() {
         first("read tracking", is: .readTracking)
-        first("for your eyes", is: .ranking)
-        first("triage investigation", is: .triageBudget)
         first("do not disturb", is: .notifications)
         // "api key" is the assistant's; "api token" is the daemon's. The two
         // live one word apart and mean entirely different secrets.
         first("api key", is: .assistant)
-        first("api token", is: .connection)
+        first("api token", is: .account)
     }
 
     /// AND, not OR. A query whose terms belong to different cards is a query
@@ -116,21 +112,20 @@ struct SettingsSearchTests {
     /// the filler list is what keeps a question worth as much as a noun.
     static func wholeQuestions() {
         first("how do i turn off images", is: .mail)
-        first("how much does this cost", is: .triageBudget)
         first("what is my name", is: .you)
         first("where do i put my api key", is: .assistant)
         // All filler and nothing else: the words are given back rather than
-        // thrown away, so this is still the triage explainer's question.
-        first("how", is: .triagePipeline)
+        // thrown away, so this is still the practice inbox's question.
+        first("how", is: .help)
     }
 
-    /// Three of the triage budget's settings share one card. A search that
-    /// listed it three times would be reporting on the index rather than
-    /// answering the question.
+    /// The server URL, the API token and the account list share one card. A
+    /// search that listed it three times would be reporting on the index
+    /// rather than answering the question.
     static func oneCardPerHit() {
-        let cards = SettingsSearch.matches("cap")
+        let cards = SettingsSearch.matches("account")
         expect(cards.count == Set(cards).count, "no card appears twice in one result list")
-        expect(cards.contains(.triageBudget), "\"cap\" finds the budget card")
+        expect(cards.contains(.account), "\"account\" finds the account card")
     }
 
     /// The index against the app it indexes.

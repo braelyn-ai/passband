@@ -1,7 +1,7 @@
 // Settings: a routed main view with a left sub-nav whose section is persisted.
-// General (connection, appearance, developer, name), mail, triage (pipeline
-// explainer, caps + spend estimate, ranking blend), assistant (BYOK key, model),
-// account. Escape is the only key bound here, so global 1..5 / ⌘[ ] nav keeps
+// General (name, appearance, notifications, help, developer), mail, assistant
+// (BYOK key, model), privacy, audit, account (the mailboxes, and each one's
+// server + token). Escape is the only key bound here, so global 1..5 / ⌘[ ] nav keeps
 // working and the dispatcher's input guard covers the typed fields.
 //
 // `SettingsView` ITSELF IS THE MAC'S SHELL — a fixed nav column beside a scroll
@@ -122,22 +122,16 @@ struct SettingsView: View {
     @ViewBuilder private func pane(_ section: SettingsSection) -> some View {
         switch section {
         case .general:
-            ConnectionSection()
+            YouSection()
             AppearanceSection()
             NotificationsSection()
-            TourSection()
-            WhatsNewSection()
+            HelpSection()
             DeveloperSection()
-            YouSection()
         case .mail:
             MailSection()
             SearchSection()
             SignatureSection()
             ReadTrackingSection()
-        case .triage:
-            TriagePipelineSection()
-            TriageBudgetSection()
-            RankingSection()
         case .assistant:
             AssistantSection()
         case .privacy:
@@ -301,23 +295,16 @@ struct SettingsCardView: View {
 
     var body: some View {
         switch card {
-        case .connection: ConnectionSection()
         case .appearance: AppearanceSection()
         case .notifications: NotificationsSection()
-        case .tour:
+        case .help:
             // Mac-only, for the reason AccountPage.swift gives: the tour and the
             // what's-new card are hosted by the desktop's ActionLayer, and the
             // phone has nothing that could show one. `SettingsCard.isAvailable`
-            // keeps them out of the results there; this is the compile-time
-            // half of the same fact.
+            // keeps it out of the results there; this is the compile-time half
+            // of the same fact.
             #if os(macOS)
-                TourSection()
-            #else
-                EmptyView()
-            #endif
-        case .whatsNew:
-            #if os(macOS)
-                WhatsNewSection()
+                HelpSection()
             #else
                 EmptyView()
             #endif
@@ -327,18 +314,14 @@ struct SettingsCardView: View {
         case .search: SearchSection()
         case .signature: SignatureSection()
         case .readTracking: ReadTrackingSection()
-        case .triagePipeline: TriagePipelineSection()
-        case .triageBudget: TriageBudgetSection()
-        case .ranking: RankingSection()
         case .assistant: AssistantSection()
         case .privacy: PrivacySection()
         // The ledger, drawn as a card like everything else — searching for
         // "who archived this" lands you on the live log, not a link to it.
         case .audit: AuditSection()
-        // The one card that is really three (accounts, the live account,
-        // invites): AccountSection owns its own stack, so a hit on "invite"
-        // brings the whole account pane rather than a card that does not exist
-        // on its own.
+        // The one card that is really two (accounts, invites): AccountSection
+        // owns its own stack, so a hit on "invite" or "api token" brings the
+        // whole account pane rather than a card that does not exist on its own.
         case .account: AccountSection()
         }
     }
@@ -528,23 +511,54 @@ struct SearchSortPicker: View {
     }
 }
 
-struct InlineRow<Content: View>: View {
-    let key: String
-    /// `.top` for controls taller than one line, so the key doesn't float
-    /// against the middle of the stack.
-    var alignment: VerticalAlignment = .center
-    @ViewBuilder var content: Content
+/// ONE SETTING: what it is on the left, with a line on what it does under it,
+/// and the control on the right, where the eye goes to act.
+///
+/// The detail line replaces the paragraph-long hints the cards used to end
+/// with. A hint below a row reads as a footnote to the whole card; a line
+/// under the row's own name reads as that row's answer, and has to be short
+/// enough to be one.
+///
+/// STACKED ON THE PHONE. A 390pt line cannot hold a name and a four-way
+/// segmented control side by side, so the control drops under its label there.
+struct SettingsRow<Control: View>: View {
+    let title: String
+    var detail: String?
+    @ViewBuilder var control: Control
 
     var body: some View {
-        HStack(alignment: alignment, spacing: 14) {
-            Text(key)
-                .font(Typo.rowSub)
-                .foregroundStyle(Palette.inkDim)
-                .frame(width: 96, alignment: .leading)
-            content
-            Spacer(minLength: 0)
-        }
+        #if os(iOS)
+            VStack(alignment: .leading, spacing: 8) {
+                label
+                control
+            }
+        #else
+            HStack(alignment: .center, spacing: 18) {
+                label
+                control
+            }
+        #endif
     }
+
+    private var label: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(Typo.row)
+                .foregroundStyle(Palette.ink)
+            if let detail {
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.inkFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The rule between two rows of one card.
+struct RowDivider: View {
+    var body: some View { Hairline().padding(.vertical, 1) }
 }
 
 // MARK: - the sections
@@ -561,83 +575,24 @@ struct InlineRow<Content: View>: View {
 
 // MARK: - general
 
-struct ConnectionSection: View {
-    @Environment(AppStore.self) private var store
-    @State private var url = ""
-    @State private var token = ""
-    @State private var editingToken = false
-    @State private var busy = false
-    @State private var result: Result<Void, String>?
-    @FocusState private var urlFocused: Bool
-
-    private enum Result<T, E> { case ok, err(E) }
+/// The name the sitrep greets you by. On the Mac the greeting's own pencil
+/// edits it too; the phone's sitrep has no greeting, so this is its only door.
+struct YouSection: View {
+    @Environment(Prefs.self) private var prefs
 
     var body: some View {
-        SectionCard(label: "Connection") {
-            Field(label: "server url") {
-                TextField("http://127.0.0.1:8848", text: $url)
+        @Bindable var prefs = prefs
+        SectionCard(label: "You") {
+            SettingsRow(title: "Name", detail: "What the sitrep greeting calls you.") {
+                TextField("your name", text: $prefs.userName)
                     .textFieldStyle(.plain)
                     .autocorrectionDisabled()
-                    .focused($urlFocused)
-                    .onSubmit { urlFocused = false }
-                    .onChange(of: url) { _, _ in result = nil }
+                    .fieldWell()
+                    #if os(macOS)
+                        .frame(width: 220)
+                    #endif
             }
-            .onChange(of: urlFocused) { _, nowFocused in
-                if !nowFocused { Task { await commitIfChanged() } }
-            }
-            SecretField(
-                label: "api token", placeholder: "SQUELCH_API_TOKEN",
-                hasStored: !(store.settings?.apiToken ?? "").isEmpty,
-                load: { store.settings?.apiToken },
-                onCommit: { _ in await commitIfChanged() },
-                text: $token, editing: $editingToken
-            )
-            .onChange(of: token) { _, _ in result = nil }
-            HStack(spacing: 10) {
-                // Not "Save" — clicking away already did that. This re-checks a
-                // connection that worked yesterday.
-                Button(busy ? "testing…" : "Test") { Task { await testSave() } }
-                    .buttonStyle(.glassProminent)
-                    .tint(Palette.accent)
-                    .disabled(busy || url.trimmed.isEmpty || token.trimmed.isEmpty)
-                switch result {
-                case .ok:
-                    StatusDot(color: Palette.positive, label: "connected · saved")
-                case .err(let message):
-                    Text(message).font(Typo.micro).foregroundStyle(Palette.danger)
-                case nil:
-                    EmptyView()
-                }
-            }
-            // "your keychain" and not "your macOS keychain": the same card is on
-            // screen on a phone now, where the store behind it is the iOS one.
-            SettingsHint(
-                "Saved as soon as you leave the field. The token lives in your keychain and is sent only as a bearer header, never logged."
-            )
         }
-        .onAppear {
-            url = store.settings?.serverURL ?? ""
-            token = store.settings?.apiToken ?? ""
-        }
-    }
-
-    /// Blur saves the pair, but only on a real change and only through
-    /// `revalidate`, which proves the credentials against /client/stats before
-    /// writing them — so blur-to-save can't strand you at the connect gate.
-    private func commitIfChanged() async {
-        let (u, t) = (url.trimmed, token.trimmed)
-        guard !u.isEmpty, !t.isEmpty else { return }
-        guard u != store.settings?.serverURL || t != store.settings?.apiToken else { return }
-        await testSave()
-    }
-
-    private func testSave() async {
-        busy = true
-        result = nil
-        let outcome = await store.revalidate(
-            serverURL: url.trimmed, apiToken: token.trimmed)
-        busy = false
-        result = outcome.ok ? .ok : .err(outcome.error ?? "failed")
     }
 }
 
@@ -647,12 +602,14 @@ struct AppearanceSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Appearance") {
-            InlineRow(key: "theme") {
+            SettingsRow(
+                title: "Theme",
+                detail: "Auto follows the system. Press \\ anywhere to flip light and dark."
+            ) {
                 GlassSegmented(
                     options: ThemeChoice.allCases.map { ($0, $0.label) },
                     selection: $prefs.theme)
             }
-            SettingsHint("Auto follows the system appearance. \\ flips light/dark from anywhere.")
         }
     }
 }
@@ -673,26 +630,26 @@ struct NotificationsSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Notifications") {
-            InlineRow(key: "sound") {
+            SettingsRow(
+                title: "Sound",
+                detail: "Plays on urgent and deadline banners. Other mail arrives silently."
+            ) {
                 GlassSegmented(
                     options: NotificationSound.allCases.map { ($0, $0.label) },
                     selection: $prefs.notificationSound)
             }
-            SettingsHint(
-                "Chimes on urgent and deadline banners. Surfaced mail stays silent either way."
-            )
-            InlineRow(key: "test") {
-                Button("post a banner") {
+            RowDivider()
+            // Three states, because two of them look identical from the outside:
+            // a banner that never came because the grant is off, and one that
+            // never came because a focus mode ate it. Only the first is visible
+            // from in here, so the second is what the posted line points at.
+            SettingsRow(title: "Test banner", detail: hint) {
+                Button("Post one") {
                     Task { delivered = await Notifier.shared.postTest() }
                 }
                 .buttonStyle(.glass)
                 .controlSize(.small)
             }
-            // Three states, because two of them look identical from the outside:
-            // a banner that never came because the grant is off, and one that
-            // never came because a focus mode ate it. Only the first is visible
-            // from in here, so the second is what the posted line points at.
-            SettingsHint(hint)
         }
         .onChange(of: prefs.notificationSound) { _, choice in preview(choice) }
     }
@@ -700,7 +657,7 @@ struct NotificationsSection: View {
     private var hint: String {
         switch delivered {
         case .none:
-            return "Posts one now, from Passband itself. Every banner carries the sender's own mark."
+            return "Checks that banners from Passband reach you."
         case .some(true):
             return "Posted. If nothing appeared, a focus mode or Do Not Disturb is holding it."
         case .some(false):
@@ -720,40 +677,32 @@ struct NotificationsSection: View {
     }
 }
 
-/// Try the guided practice inbox again, then return to the live summary.
-struct TourSection: View {
-    @Environment(AppStore.self) private var store
-
-    var body: some View {
-        SectionCard(label: "Tour") {
-            InlineRow(key: "walkthrough") {
-                Button("try the practice inbox") { store.tour.replay(store: store) }
-                    .buttonStyle(.glass)
-                    .controlSize(.small)
-            }
-            SettingsHint(
-                "Try example emails, explore the categories, and practice a sender rule before returning to your inbox."
-            )
-        }
-    }
-}
-
-/// The release notes on demand. The card itself is shown once per version and
+/// The two things you can ask the app to show you again: the practice inbox,
+/// and the release notes. The what's-new card is shown once per version and
 /// then never again, which is the right behaviour and also means the one place
 /// somebody can go looking for it afterwards has to exist.
-struct WhatsNewSection: View {
+struct HelpSection: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
-        SectionCard(label: "What's new") {
-            InlineRow(key: "release notes") {
-                Button("what's new in this version") { store.whatsNew.replay() }
+        SectionCard(label: "Help") {
+            SettingsRow(
+                title: "Practice inbox",
+                detail: "Try the categories and a sender rule on example mail, then come back."
+            ) {
+                Button("Open") { store.tour.replay(store: store) }
                     .buttonStyle(.glass)
                     .controlSize(.small)
             }
-            SettingsHint(
-                "What the version you are running brought, in the app and in the daemon behind it."
-            )
+            RowDivider()
+            SettingsRow(
+                title: "What's new",
+                detail: "What this version brought, in the app and in the daemon behind it."
+            ) {
+                Button("Show") { store.whatsNew.replay() }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+            }
         }
     }
 }
@@ -767,29 +716,14 @@ struct DeveloperSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Developer") {
-            InlineRow(key: "dev mode") {
+            SettingsRow(
+                title: "Dev mode",
+                detail: "Adds re-triage buttons to the sitrep and open emails. Re-triaging spends model budget."
+            ) {
                 Toggle("dev mode", isOn: $prefs.developerMode)
                     .toggleStyle(.switch)
                     .labelsHidden()
                     .tint(Palette.accent)
-            }
-            SettingsHint(
-                "Adds re-triage buttons (sitrep masthead + open email) that re-run the triage pipeline. Re-triaging spends model budget."
-            )
-        }
-    }
-}
-
-struct YouSection: View {
-    @Environment(Prefs.self) private var prefs
-
-    var body: some View {
-        @Bindable var prefs = prefs
-        SectionCard(label: "You") {
-            Field(label: "name") {
-                TextField("shown in the sitrep greeting", text: $prefs.userName)
-                    .textFieldStyle(.plain)
-                    .autocorrectionDisabled()
             }
         }
     }
@@ -810,21 +744,23 @@ struct MailSection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Mail") {
-            InlineRow(key: "images") {
+            SettingsRow(
+                title: "Remote images",
+                detail: "Tracking pixels are removed either way, and images load with no referrer."
+            ) {
                 GlassSegmented(
                     options: [(true, "Always"), (false, "On demand")],
                     selection: $prefs.loadRemoteImages)
             }
-            SettingsHint(
-                "Tracking pixels are removed either way, and images load with no referrer.")
-            InlineRow(key: "threads") {
+            RowDivider()
+            SettingsRow(
+                title: "Threads",
+                detail: "Automatic shows short back and forth as chat bubbles and the rest as email cards. Press b in a thread to switch just that one."
+            ) {
                 GlassSegmented(
                     options: ThreadStyleDefault.allCases.map { ($0, $0.label) },
                     selection: $prefs.threadStyle)
             }
-            SettingsHint(
-                "Automatic draws short back and forth threads as chat and everything else as email. Email stacks every message as its own card. Chat draws the thread as bubbles, with the ones you sent on the right. Any thread can be switched on its own while you read it (b), and it keeps that answer."
-            )
         }
     }
 }
@@ -842,10 +778,12 @@ struct MailSection: View {
 struct SearchSection: View {
     var body: some View {
         SectionCard(label: "Search") {
-            InlineRow(key: "order") { SearchSortPicker() }
-            SettingsHint(
-                "Relevance + recency favors newer mail when matches are close. Best match ranks on the words alone. In the search panel, unfinished mail comes first, and this setting orders results within each status group."
-            )
+            SettingsRow(
+                title: "Result order",
+                detail: "Relevance + recency favors newer mail when matches are close. Best match ranks on the words alone. Unfinished mail always comes first."
+            ) {
+                SearchSortPicker()
+            }
         }
     }
 }
@@ -882,7 +820,7 @@ struct SignatureSection: View {
                 }
             #endif
             SettingsHint(
-                "Added under new messages and replies as you draft them. It is part of the body, so you can edit or delete it per email. Leave this empty for no signature."
+                "Added under new messages and replies as you draft them, so you can still edit it per email. Leave it empty for none."
             )
         }
         .task(id: prefs.signature) { await refreshPreview() }
@@ -974,7 +912,10 @@ struct ReadTrackingSection: View {
     var body: some View {
         SectionCard(label: "Read tracking") {
             if store.trackingAvailable {
-                InlineRow(key: "track by default") {
+                SettingsRow(
+                    title: "Track by default",
+                    detail: "Mail you send carries an invisible pixel, so the reader shows when it was opened. A weak signal: Gmail's image proxy can open it early, and those opens say \"via proxy\"."
+                ) {
                     Toggle(
                         "track by default",
                         isOn: Binding(
@@ -986,9 +927,6 @@ struct ReadTrackingSection: View {
                     .tint(Palette.accent)
                     .disabled(busy)
                 }
-                SettingsHint(
-                    "Puts an invisible 1×1 image in mail you send, so the reader shows when it was opened. It is a weak signal, not proof of reading: Gmail fetches images through its own proxy and can load the pixel before anybody looks at the message. Those opens are labelled \"via proxy\"."
-                )
             } else {
                 SettingsHint(
                     "Not configured. The daemon needs a publicly reachable address to serve the pixel from: set `[tracking] base_url` (or SQUELCH_TRACK_URL) and restart squelchd. Until then every send goes out untracked."
@@ -1014,37 +952,6 @@ struct ReadTrackingSection: View {
                 self.error = errText(error, "could not save")
             }
             busy = false
-        }
-    }
-}
-
-// MARK: - triage
-
-/// Explain the two independent decisions without exposing implementation knobs.
-struct TriagePipelineSection: View {
-    var body: some View {
-        SectionCard(label: "How triage works") {
-            SettingsHint("Notifications arrive quickly. Triage then reads the context and decides what needs your attention or belongs in Reading, and extracts Calendar, Shipping, Billing, and Receipt records. An email can belong in more than one place.")
-            SettingsHint("Your sender preferences guide those decisions. Exceptional messages can still surface when they deserve your attention.")
-            SettingsHint("Authentication mail always qualifies for a notification. Codes and sign-in or reset links stay private from connected agents.")
-        }
-    }
-}
-
-struct TriageBudgetSection: View {
-    var body: some View {
-        SectionCard(label: "While triage is working") {
-            SettingsHint("You can open a notification immediately. Mail remains readable while triage finishes or retries.")
-        }
-    }
-}
-
-/// Ranking is configured by the server, alongside the agent's other tuning
-/// settings, so every device presents the same ordered list.
-struct RankingSection: View {
-    var body: some View {
-        SectionCard(label: "For your eyes") {
-            SettingsHint("Ordered using urgency, what needs you, personal relevance, and recency. Your devices share the same order.")
         }
     }
 }
@@ -1109,22 +1016,21 @@ struct AssistantSection: View {
             // be worse than no picker.
             #if os(macOS)
                 SectionCard(label: "Deeper search") {
-                    InlineRow(key: "when") {
+                    SettingsRow(title: "When", detail: prefs.deeperSearch.blurb) {
                         GlassSegmented(
                             options: DeeperSearchChoice.allCases.map { ($0, $0.label) },
                             selection: $prefs.deeperSearch)
                     }
-                    SettingsHint(prefs.deeperSearch.blurb)
                     if prefs.deeperSearch != .off {
-                        InlineRow(key: "model") {
+                        RowDivider()
+                        SettingsRow(
+                            title: "Model",
+                            detail: "Separate from the chat's, because this one runs on every question-shaped search."
+                        ) {
                             GlassSegmented(
                                 options: AssistantModel.allCases.map { ($0, $0.shortLabel) },
                                 selection: $prefs.searchLaneModel)
                         }
-                        SettingsHint(
-                            "Which model reads your mail when a search goes deeper. Separate "
-                                + "from the chat's, because this one runs on every "
-                                + "question-shaped search rather than when you ask.")
                     }
                 }
             #endif
@@ -1137,11 +1043,12 @@ struct AssistantSection: View {
         @Bindable var prefs = prefs
         return SectionCard(label: "Assistant") {
             if store.relayAvailable {
-                InlineRow(key: "chats via") {
+                SettingsRow(title: "Chats via") {
                     GlassSegmented(
                         options: AssistantTransport.allCases.map { ($0, $0.label) },
                         selection: $prefs.assistantTransport)
                 }
+                RowDivider()
             }
             if byokMode {
                 byokFields
@@ -1154,12 +1061,12 @@ struct AssistantSection: View {
                 )
             }
 
-            InlineRow(key: "model") {
+            RowDivider()
+            SettingsRow(title: "Model", detail: prefs.assistantModel.label) {
                 GlassSegmented(
                     options: AssistantModel.allCases.map { ($0, $0.shortLabel) },
                     selection: $prefs.assistantModel)
             }
-            SettingsHint(prefs.assistantModel.label)
         }
     }
 
@@ -1243,13 +1150,18 @@ struct PrivacySection: View {
     var body: some View {
         @Bindable var prefs = prefs
         SectionCard(label: "Developer Telemetry") {
-            InlineRow(key: "telemetry") {
+            SettingsRow(
+                title: "Telemetry",
+                detail: "Anonymous usage data that helps improve Passband."
+            ) {
                 GlassSegmented(
                     options: TelemetryLevel.allCases.map { ($0, $0.label) },
                     selection: $prefs.telemetry)
             }
+            // The full disclosure stays, word for word in substance: this is
+            // the one card whose fine print IS the setting.
             SettingsHint(
-                "Anonymous usage telemetry that helps improve Passband. No level ever includes email data or anything derived from it: no subjects, senders, bodies, labels, or assistant questions. Minimal sends app opens, screen views, and anonymous counters (emails sent, triage volume, corrections, connection health). Full adds which actions are used. None sends nothing."
+                "No level ever includes email data or anything derived from it: no subjects, senders, bodies, labels, or assistant questions. Minimal sends app opens, screen views, and anonymous counters (emails sent, triage volume, corrections, connection health). Full adds which actions are used. None sends nothing."
             )
         }
     }
@@ -1267,7 +1179,6 @@ struct PrivacySection: View {
 /// (see `AccountRecord.displayHost`).
 struct AccountSection: View {
     @Environment(AppStore.self) private var store
-    @State private var usage: UsageResponse?
 
     private var accounts: [AccountRecord] { AccountManager.shared.accounts }
 
@@ -1300,18 +1211,13 @@ struct AccountSection: View {
                 // chords; the phone has the selector this pane sits under.
                 #if os(macOS)
                     SettingsHint(
-                        "⌘1 through ⌘9 switch accounts in the order listed here. Tokens live in your keychain, one pair of slots per account."
+                        "⌘1 through ⌘9 switch accounts in the order listed here. Credentials edits the live account's server and token."
                     )
                 #else
                     SettingsHint(
-                        "The selector at the top of Account switches between them. Tokens live in your keychain, one pair of slots per account."
+                        "The selector at the top of Account switches between them. Credentials edits the live account's server and token."
                     )
                 #endif
-            }
-            SectionCard(label: "Live account") {
-                meta("server", store.settings?.serverURL ?? "—")
-                meta("triage model", usage?.model ?? "—")
-                meta("provider", usage?.provider ?? "—")
             }
             // SHARING, and it renders only when this daemon can actually do it.
             // A self-hosted daemon has no control plane to mint a code at, so
@@ -1333,20 +1239,100 @@ struct AccountSection: View {
                 }
             }
         }
-        // Usage is decorative here; errors are ignored.
-        .task { usage = try? await APIClient.shared.getUsage(days: 1) }
+    }
+}
+
+/// THE LIVE ACCOUNT'S SERVER AND TOKEN, edited in place under its row. This
+/// was the Connection card at the top of General until the Accounts pane took
+/// over adding and removing mailboxes; it is still the only way to hand an
+/// EXISTING account a rotated token or a moved daemon without removing it,
+/// which would cost its name and its ⌘number.
+///
+/// Active account only, because `revalidate` is: it proves the pair and then
+/// swaps the live client, and there is no live client to swap for an account
+/// that is not on screen. Make it active first.
+struct CredentialsEditor: View {
+    @Environment(AppStore.self) private var store
+    @State private var url = ""
+    @State private var token = ""
+    @State private var editingToken = false
+    @State private var busy = false
+    @State private var result: Result<Void, String>?
+    @FocusState private var urlFocused: Bool
+
+    private enum Result<T, E> { case ok, err(E) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Field(label: "server url") {
+                TextField("http://127.0.0.1:8848", text: $url)
+                    .textFieldStyle(.plain)
+                    .autocorrectionDisabled()
+                    .focused($urlFocused)
+                    .onSubmit { urlFocused = false }
+                    .onChange(of: url) { _, _ in result = nil }
+            }
+            .onChange(of: urlFocused) { _, nowFocused in
+                if !nowFocused { Task { await commitIfChanged() } }
+            }
+            SecretField(
+                label: "api token", placeholder: "SQUELCH_API_TOKEN",
+                hasStored: !(store.settings?.apiToken ?? "").isEmpty,
+                load: { store.settings?.apiToken },
+                onCommit: { _ in await commitIfChanged() },
+                text: $token, editing: $editingToken
+            )
+            .onChange(of: token) { _, _ in result = nil }
+            HStack(spacing: 10) {
+                // Not "Save" — clicking away already did that. This re-checks a
+                // connection that worked yesterday.
+                Button(busy ? "testing…" : "Test") { Task { await testSave() } }
+                    .buttonStyle(.glassProminent)
+                    .tint(Palette.accent)
+                    .disabled(busy || url.trimmed.isEmpty || token.trimmed.isEmpty)
+                switch result {
+                case .ok:
+                    StatusDot(color: Palette.positive, label: "connected · saved")
+                case .err(let message):
+                    Text(message).font(Typo.micro).foregroundStyle(Palette.danger)
+                case nil:
+                    EmptyView()
+                }
+            }
+            // "your keychain" and not "your macOS keychain": the same fields are
+            // on screen on a phone, where the store behind them is the iOS one.
+            SettingsHint(
+                "Saved when you leave a field, once the daemon accepts it. The token lives in your keychain and is sent only as a bearer header, never logged."
+            )
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Palette.canvas.opacity(0.5))
+        )
+        .onAppear {
+            url = store.settings?.serverURL ?? ""
+            token = store.settings?.apiToken ?? ""
+        }
     }
 
-    private func meta(_ key: String, _ value: String) -> some View {
-        HStack(spacing: 14) {
-            Text(key)
-                .font(Typo.rowSub).foregroundStyle(Palette.inkFaint)
-                .frame(width: 110, alignment: .leading)
-            Text(value)
-                .font(Typo.mono(11)).foregroundStyle(Palette.inkDim)
-                .textSelection(.enabled)
-            Spacer()
-        }
+    /// Blur saves the pair, but only on a real change and only through
+    /// `revalidate`, which proves the credentials against /client/stats before
+    /// writing them — so blur-to-save can't strand you at the connect gate.
+    private func commitIfChanged() async {
+        let (u, t) = (url.trimmed, token.trimmed)
+        guard !u.isEmpty, !t.isEmpty else { return }
+        guard u != store.settings?.serverURL || t != store.settings?.apiToken else { return }
+        await testSave()
+    }
+
+    private func testSave() async {
+        busy = true
+        result = nil
+        let outcome = await store.revalidate(
+            serverURL: url.trimmed, apiToken: token.trimmed)
+        busy = false
+        result = outcome.ok ? .ok : .err(outcome.error ?? "failed")
     }
 }
 
@@ -1363,11 +1349,14 @@ struct AccountRow: View {
     let isOnly: Bool
 
     /// The edit buffer. Committed on blur and on Enter — the same "clicking
-    /// away saves" rule the connection fields above follow.
+    /// away saves" rule the credentials fields follow.
     @State private var label = ""
     /// Remove is two presses. A mis-click here deletes a token that only the
     /// daemon can reissue, so the first press asks and the second does it.
     @State private var confirming = false
+    /// The server + token fields are open under this row. Only ever drawn on
+    /// the active row; see `CredentialsEditor`.
+    @State private var editingCredentials = false
     @FocusState private var labelFocused: Bool
 
     private var removeLabel: String {
@@ -1376,7 +1365,13 @@ struct AccountRow: View {
     }
 
     var body: some View {
-        layout
+        VStack(alignment: .leading, spacing: 10) {
+            layout
+            if editingCredentials && isActive {
+                CredentialsEditor()
+                    .padding(.bottom, 6)
+            }
+        }
             // Seeded per account id, so a removal that re-uses this row's slot in
             // the list cannot leave the previous account's name in the field.
             .task(id: account.id) { label = account.label }
@@ -1469,7 +1464,12 @@ struct AccountRow: View {
     }
 
     @ViewBuilder private var verbs: some View {
-        if !isActive {
+        if isActive {
+            Button(editingCredentials ? "done" : "credentials") {
+                editingCredentials.toggle()
+            }
+            .buttonStyle(.textAction)
+        } else {
             Button("make active") {
                 Task { await AccountManager.shared.switchTo(account.id) }
             }
