@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type MouseEvent,
   type PointerEvent,
 } from "react";
 import { CARRIERS, createScope, markerPoint, type ScopeLayout } from "./scope";
@@ -144,7 +145,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .pb-hero { margin: 0; font-family: var(--serif); font-weight: 500;
   font-size: clamp(2.4rem, 4.6vw, 3.4rem); line-height: 1.02; letter-spacing: -0.012em; }
 .pb-sub { margin: 0; font-size: 1rem; line-height: 1.6; color: var(--dim); max-width: 27rem; }
-.pb-fine { margin: -0.6rem 0 0; font-size: 0.8rem; color: var(--faintest); }
+/* Reserves the open rig's height, so the vertically centred copy above never
+   moves when the button opens. The fine print rides under whichever control
+   is showing and the unused room sits below it, where it reads as margin. */
+.pb-slot { min-height: 8.2rem; display: flex; flex-direction: column; align-items: flex-start; gap: 0.65rem; }
+.pb-slot .pb-cta { margin-top: 0; }
+/* The rig arrives where the button was, rising out of the slot rather than
+   popping in, so the press reads as the button opening up. */
+.pb-slot .pb-rig { animation: pb-rig-in 0.45s cubic-bezier(0.2, 0.8, 0.2, 1); }
+@keyframes pb-rig-in { from { opacity: 0; transform: translateY(6px); } }
+.pb-fine { margin: 0; font-size: 0.8rem; color: var(--faintest); }
 .pb-copy .pb-rig { margin-top: 0; }
 .pb-confirm { margin: 0; color: var(--ink); font-size: 1rem; overflow-wrap: anywhere; }
 .pb-status { margin: 0; color: var(--faint); font-size: 0.9rem; line-height: 1.5; max-width: 26rem; }
@@ -173,14 +183,42 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .pb-h2 em { font-style: normal; color: var(--accent-ink); }
 .pb-intro { margin: 0 0 clamp(2rem, 5vw, 3.25rem); color: var(--dim); font-size: 1.05rem;
   line-height: 1.6; max-width: 34rem; }
-.pb-pair { display: grid; grid-template-columns: minmax(0, 0.58fr) minmax(0, 1.42fr); gap: clamp(1rem, 2.5vw, 1.75rem);
-  align-items: stretch; }
+.pb-pair { display: grid; grid-template-columns: minmax(0, 0.58fr) auto minmax(0, 1.42fr);
+  gap: clamp(0.75rem, 1.6vw, 1.25rem); align-items: stretch; }
 @media (max-width: 900px) { .pb-pair { grid-template-columns: minmax(0, 1fr); } }
+/* THE GATE between the two panels: a lit filament with the squelch sitting on
+   it, the same passband blue the scope's filter curve draws in. The before is
+   everything upstream of it and the after is what comes out, so the divider is
+   the product rather than a gap. Horizontal once the panels stack. */
+.pb-gate { position: relative; width: 3.25rem; display: grid; place-items: center;
+  margin-top: 2rem; /* level with the windows, below the captions */ }
+.pb-gate::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px;
+  background: linear-gradient(transparent, rgba(78, 155, 234, 0.75) 25%, rgba(78, 155, 234, 0.75) 75%, transparent);
+  box-shadow: 0 0 14px 1px rgba(78, 155, 234, 0.45); }
+.pb-gate span { position: relative; width: 2.6rem; height: 2.6rem; border-radius: 50%; display: grid;
+  place-items: center; color: var(--accent-ink); background: #0d1624;
+  box-shadow: inset 0 0 0 1px rgba(78, 155, 234, 0.55), 0 0 26px -2px rgba(78, 155, 234, 0.55); }
+.pb-gate svg { width: 1.05rem; height: 1.05rem; }
+@media (max-width: 900px) {
+  .pb-gate { width: auto; height: 3.25rem; margin: 0.25rem 0; }
+  .pb-gate::before { top: 50%; bottom: auto; left: 0; right: 0; width: auto; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(78, 155, 234, 0.75) 25%, rgba(78, 155, 234, 0.75) 75%, transparent); }
+  .pb-gate svg { transform: rotate(90deg); }
+}
 .pb-panel { margin: 0; display: flex; flex-direction: column; gap: 0.8rem; min-width: 0; }
 .pb-panel figcaption { display: flex; align-items: baseline; gap: 0.6rem; font-size: 0.82rem; color: var(--faint); }
 .pb-panel figcaption b { font-size: 0.7rem; letter-spacing: 0.14em; text-transform: uppercase;
   font-weight: 600; color: var(--faintest); }
+.pb-panel figcaption b { font-size: 0.78rem; }
 .pb-after figcaption b { color: var(--accent); }
+.pb-after figcaption { color: var(--dim); }
+/* Before is drained: grey, dim, a world with no signal in it. Only its unread
+   count keeps its colour, which is the point of it. After is lit: edged in
+   passband blue with the glow of the gate it came through. */
+.pb-before .pb-window { filter: saturate(0.25) brightness(0.82); background: #0c1017; }
+.pb-after .pb-window { border-color: rgba(78, 155, 234, 0.45);
+  box-shadow: 0 0 0 1px rgba(78, 155, 234, 0.12), 0 0 60px -12px rgba(78, 155, 234, 0.35),
+    0 30px 80px -20px rgba(0, 0, 0, 0.7); }
 .pb-window { position: relative; flex: 1; border-radius: 14px; overflow: hidden; min-height: 30rem;
   border: 1px solid var(--hair-strong); background: var(--canvas);
   box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.04); }
@@ -329,6 +367,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 
 @media (prefers-reduced-motion: reduce) {
   .pb-beat, .pb-cue { transition-duration: 0.01ms; }
+  .pb-slot .pb-rig { animation: none; }
   .pb-cue::after { animation: none; }
 }
 `;
@@ -939,15 +978,41 @@ function SubmitButton({ busy }: { busy: boolean }) {
 // list, so this page can never become a membership oracle.
 const WAITLIST_URL = "https://signup.passband.app/waitlist";
 
-// Old links to the waitlist still land here: the server answers every unknown
-// path with the page, and this path puts the caret in the rig on arrival.
+// The path the waitlist state answers to. A real URL, deep-linkable and
+// shareable, even though reaching it from the button never loads a document.
 const WAITLIST_PATH = "/waitlist";
 
-// The waitlist rig, pinned under the story's copy through both beats. The
-// beats crossfade above it and it never moves, so a half-typed address stays
-// exactly where it was while the scene resolves behind it.
+// THE HERO'S ONE ACTION, until it is pressed; then the rig takes its slot.
+//
+// STILL AN ANCHOR with a real `href`, even though the click is handled: it is a
+// link to a URL that exists, so cmd-click, middle-click, and "copy link" all
+// have to keep meaning what they mean.
+function JoinButton({
+  onClick,
+}: {
+  onClick: (event: MouseEvent<HTMLAnchorElement>) => void;
+}) {
+  const { chrome, handlers } = useMeter();
+  return (
+    <a className="pb-cta" href={WAITLIST_PATH} onClick={onClick} {...handlers}>
+      {chrome}
+      <span className="pb-cta-label">join the waitlist</span>
+      <Arrow />
+    </a>
+  );
+}
+
+// The waitlist rig, in the slot the button held. The beats crossfade above it
+// and it never moves, so a half-typed address stays exactly where it was while
+// the scope resolves behind it.
 function Waitlist() {
   const { chrome, handlers } = useMeter();
+  const nameRef = useRef<HTMLInputElement>(null);
+  // The button that opened this is gone from under the cursor, so the first
+  // field takes the focus it left behind: press join, start typing. Not
+  // autoFocus: that scrolls the field into view, which from the closing
+  // button would cut the smooth scroll back up short.
+  useEffect(() => nameRef.current?.focus({ preventScroll: true }), []);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
@@ -1004,6 +1069,7 @@ function Waitlist() {
     <>
       <form className="pb-rig" onSubmit={submit} {...handlers}>
         <input
+          ref={nameRef}
           className="pb-rig-field pb-rig-name"
           type="text"
           name="name"
@@ -1242,12 +1308,6 @@ function AppMock() {
 
 // MARK: - the page
 
-// Where the rig's caret goes: from the closing button, and on arrival at the
-// old /waitlist address.
-function focusRig() {
-  document.querySelector<HTMLInputElement>(".pb-rig-name")?.focus({ preventScroll: true });
-}
-
 // Where the analyzer draws, as fractions of the stage. Wide screens tune the
 // band to the right of the copy; narrow ones centre it under the copy, low.
 function scopeLayout(): ScopeLayout {
@@ -1313,8 +1373,6 @@ export function App() {
     const io = new IntersectionObserver(([entry]) => scene?.setVisible(entry.isIntersecting));
     io.observe(stageRef.current!);
 
-    if (location.pathname === WAITLIST_PATH) focusRig();
-
     return () => {
       removeEventListener("scroll", onScroll);
       removeEventListener("resize", onResize);
@@ -1323,10 +1381,34 @@ export function App() {
     };
   }, []);
 
+  // THE WAITLIST IS A STATE OF THIS PAGE, not a document of its own: the URL
+  // changes, so the link stays real and back still goes back, but nothing
+  // remounts and the scope behind it never restarts.
+  const [joining, setJoining] = useState(() => location.pathname === WAITLIST_PATH);
+  useEffect(() => {
+    const sync = () => setJoining(location.pathname === WAITLIST_PATH);
+    addEventListener("popstate", sync);
+    return () => removeEventListener("popstate", sync);
+  }, []);
+  const open = (next: boolean) => {
+    if (next === joining) return;
+    history.pushState(null, "", next ? WAITLIST_PATH : "/");
+    setJoining(next);
+  };
+  const go = (next: boolean) => (event: MouseEvent<HTMLAnchorElement>) => {
+    // Anything but a plain left click is asking for a new document: a new
+    // tab, a new window, a saved link. Let the browser have those.
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    open(next);
+  };
+
+  // The closing button goes back up to the hero and opens the rig there, so
+  // there is only ever one form on the page.
   const backToTop = () => {
     const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
     scrollTo({ top: 0, behavior: smooth ? "smooth" : "auto" });
-    focusRig();
+    open(true);
   };
 
   return (
@@ -1364,7 +1446,7 @@ export function App() {
           <span className="pb-read-r" aria-hidden="true">SQUELCH&nbsp;<b ref={readoutRef}>0%</b></span>
 
           <header className="pb-top">
-            <a className="pb-brand" href="/">
+            <a className="pb-brand" href="/" onClick={go(false)}>
               <img src="/mark.svg" alt="" width={42} height={23} />
               <span>passband</span>
             </a>
@@ -1392,8 +1474,10 @@ export function App() {
                 </p>
               </div>
             </div>
-            <Waitlist />
-            <p className="pb-fine">For Gmail, on Mac and iPhone. Invite-only while in preview.</p>
+            <div className="pb-slot">
+              {joining ? <Waitlist /> : <JoinButton onClick={go(true)} />}
+              <p className="pb-fine">For Gmail, on Mac and iPhone. Invite-only while in preview.</p>
+            </div>
           </div>
 
           <div className="pb-cue" aria-hidden="true">scroll</div>
@@ -1418,6 +1502,14 @@ export function App() {
               <FakeInbox />
             </div>
           </figure>
+          <div className="pb-gate" aria-hidden="true">
+            <span>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6"
+                strokeLinecap="round" strokeLinejoin="round">
+                <path d="M2.5 8h11m0 0L9.5 4m4 4-4 4" />
+              </svg>
+            </span>
+          </div>
           <figure className="pb-panel pb-after">
             <figcaption><b>After</b> what Passband shows you</figcaption>
             <div className="pb-window">
