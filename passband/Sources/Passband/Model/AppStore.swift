@@ -1713,6 +1713,18 @@ final class AppStore {
         setView(.settings)
     }
 
+    /// Asks the active account's row to open its server + token fields. Read
+    /// and cleared by `AccountRow`, the one place those fields live.
+    var credentialsRequested = false
+
+    /// Where a rejected token sends you: the Account pane with the live
+    /// account's credentials already open, so the fix is the first thing on
+    /// screen rather than a verb you have to know to press.
+    func openCredentials() {
+        credentialsRequested = true
+        openSettings(.account)
+    }
+
     /// Switch to the Emails view showing one PAGE — the header's noise count and
     /// the sitrep's noise affordances are both this.
     func openMail(_ mode: MailMode) {

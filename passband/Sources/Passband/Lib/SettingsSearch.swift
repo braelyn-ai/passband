@@ -1,4 +1,4 @@
-// Finding a setting by describing it, rather than by knowing which of six
+// Finding a setting by describing it, rather than by knowing which of the
 // panes somebody filed it under.
 //
 // THE INDEX IS A SEPARATE ARTEFACT FROM THE UI, and it has to be: the words a
@@ -23,13 +23,12 @@ import Foundation
 /// bucket of entries. Keeping the three in one file is what lets the whole lot
 /// compile into a headless test with no app around it.
 enum SettingsSection: String, CaseIterable, Sendable {
-    case general, mail, triage, assistant, privacy, audit, account
+    case general, mail, assistant, privacy, audit, account
 
     var label: String {
         switch self {
         case .general: "General"
         case .mail: "Mail"
-        case .triage: "Triage"
         case .assistant: "Assistant"
         case .privacy: "Privacy"
         case .audit: "Audit"
@@ -50,9 +49,8 @@ enum SettingsSection: String, CaseIterable, Sendable {
 ///
 /// The raw values are stable ids; `label` mirrors what `SectionCard` prints.
 enum SettingsCard: String, CaseIterable, Sendable {
-    case connection, appearance, notifications, tour, whatsNew, developer, you
+    case you, appearance, notifications, help, developer
     case mail, search, signature, readTracking
-    case triagePipeline, triageBudget, ranking
     case assistant
     case privacy
     case audit
@@ -60,10 +58,9 @@ enum SettingsCard: String, CaseIterable, Sendable {
 
     var section: SettingsSection {
         switch self {
-        case .connection, .appearance, .notifications, .tour, .whatsNew, .developer, .you:
+        case .you, .appearance, .notifications, .help, .developer:
             .general
         case .mail, .search, .signature, .readTracking: .mail
-        case .triagePipeline, .triageBudget, .ranking: .triage
         case .assistant: .assistant
         case .privacy: .privacy
         case .audit: .audit
@@ -71,15 +68,15 @@ enum SettingsCard: String, CaseIterable, Sendable {
         }
     }
 
-    /// Whether this card renders at all on the platform in hand. The tour and
-    /// the what's-new card are driven by the desktop's ActionLayer, which has
-    /// no iOS host: the phone's settings never mount them, so a phone search
-    /// must never offer them either.
+    /// Whether this card renders at all on the platform in hand. The help
+    /// card's tour and what's-new are driven by the desktop's ActionLayer,
+    /// which has no iOS host: the phone's settings never mount it, so a phone
+    /// search must never offer it either.
     var isAvailable: Bool {
         #if os(macOS)
             true
         #else
-            self != .tour && self != .whatsNew
+            self != .help
         #endif
     }
 
@@ -87,20 +84,15 @@ enum SettingsCard: String, CaseIterable, Sendable {
     /// remembers the heading and not the control still gets there.
     var label: String {
         switch self {
-        case .connection: "Connection"
+        case .you: "You"
         case .appearance: "Appearance"
         case .notifications: "Notifications"
-        case .tour: "Tour"
-        case .whatsNew: "What's new"
+        case .help: "Help"
         case .developer: "Developer"
-        case .you: "You"
         case .mail: "Mail"
         case .search: "Search"
         case .signature: "Signature"
         case .readTracking: "Read tracking"
-        case .triagePipeline: "How triage works"
-        case .triageBudget: "While triage is working"
-        case .ranking: "For your eyes"
         case .assistant: "Assistant"
         case .privacy: "Developer Telemetry"
         case .audit: "Audit log"
@@ -134,28 +126,10 @@ enum SettingsSearch {
     /// EVERY setting in the app, once each. A control with no entry here is a
     /// control nobody can find by describing it, which is why the coverage
     /// assertion in the test suite fails a card that gains one and no words.
-    static let entries: [SettingsEntry] = generalEntries + mailEntries + triageEntries
+    static let entries: [SettingsEntry] = generalEntries + mailEntries
         + assistantEntries + privacyEntries + auditEntries + accountEntries
 
     private static let generalEntries: [SettingsEntry] = [
-        SettingsEntry(
-            card: .connection,
-            title: "Server URL",
-            blurb: "The address of the squelchd daemon this app talks to.",
-            keywords: [
-                "server", "url", "address", "host", "hostname", "daemon", "backend",
-                "connect", "connection", "endpoint", "port", "localhost", "8848", "ip",
-                "reconnect", "offline", "cannot connect",
-            ]),
-        SettingsEntry(
-            card: .connection,
-            title: "API token",
-            blurb: "The bearer token that proves this app may talk to your daemon.",
-            keywords: [
-                "api token", "token", "auth", "authentication", "bearer", "credential",
-                "secret", "password", "login", "sign in", "keychain", "squelch_api_token",
-                "unauthorized", "401",
-            ]),
         SettingsEntry(
             card: .appearance,
             title: "Theme",
@@ -184,7 +158,7 @@ enum SettingsSearch {
                 "do not disturb", "focus", "alerts",
             ]),
         SettingsEntry(
-            card: .tour,
+            card: .help,
             title: "Replay the tour",
             blurb: "Opens the guided practice inbox, then returns to your live inbox.",
             keywords: [
@@ -193,7 +167,7 @@ enum SettingsSearch {
                 "how it works",
             ]),
         SettingsEntry(
-            card: .whatsNew,
+            card: .help,
             title: "Release notes",
             blurb: "What the version you are running brought, in the app and in the daemon.",
             keywords: [
@@ -261,54 +235,6 @@ enum SettingsSearch {
             keywords: [
                 "read tracking", "read receipts", "receipts", "tracking", "track", "pixel",
                 "opens", "opened", "seen", "was it read", "delivery", "confirmation",
-            ]),
-    ]
-
-    private static let triageEntries: [SettingsEntry] = [
-        SettingsEntry(
-            card: .triagePipeline,
-            title: "How triage works",
-            blurb: "Fast notifications and agent decisions for For your eyes, Reading, and Records.",
-            keywords: [
-                "triage", "how triage works", "pipeline", "stages", "stage 1", "stage 2",
-                "escalation", "escalate", "seal", "sealed", "sender rules", "rules",
-                "model", "models", "heuristic", "explainer", "diagram", "sorting",
-                "filtering", "why was this filed",
-            ]),
-        SettingsEntry(
-            card: .triageBudget,
-            title: "Pending triage",
-            blurb: "Mail stays readable while triage works within its processing budget.",
-            keywords: [
-                "stage 1", "stage one", "daily cap", "cap", "caps", "limit", "limits",
-                "budget", "quota", "throttle", "per day", "global cap", "calls",
-            ]),
-        SettingsEntry(
-            card: .triageBudget,
-            title: "Triage investigation",
-            blurb: "The agent can read more context before deciding where mail belongs.",
-            keywords: [
-                "stage 2", "stage two", "escalation cap", "per thread", "per sender",
-                "thread cap", "sender cap", "global cap", "daily cap", "caps", "limit",
-                "budget", "quota",
-            ]),
-        SettingsEntry(
-            card: .triageBudget,
-            title: "Processing budget",
-            blurb: "Processing budgets are managed with your account; mail remains readable while waiting.",
-            keywords: [
-                "cost", "costs", "spend", "spending", "price", "pricing", "estimate",
-                "money", "dollars", "bill", "billing", "budget", "expensive", "monthly",
-                "per month", "tokens", "usage",
-            ]),
-        SettingsEntry(
-            card: .ranking,
-            title: "For your eyes ranking",
-            blurb: "Urgency, action needed, personal relevance, and recency determine a shared order.",
-            keywords: [
-                "ranking", "rank", "order", "ordering", "sort", "sorting", "for your eyes",
-                "sitrep", "urgency", "severity", "importance", "priority", "deadline",
-                "time", "due", "blend", "slider", "weight",
             ]),
     ]
 
@@ -400,20 +326,31 @@ enum SettingsSearch {
     private static let accountEntries: [SettingsEntry] = [
         SettingsEntry(
             card: .account,
+            title: "Server URL",
+            blurb: "The address of the squelchd daemon this app talks to.",
+            keywords: [
+                "server", "url", "address", "host", "hostname", "daemon", "backend",
+                "connect", "connection", "endpoint", "port", "localhost", "8848", "ip",
+                "reconnect", "offline", "cannot connect",
+            ]),
+        SettingsEntry(
+            card: .account,
+            title: "API token",
+            blurb: "The bearer token that proves this app may talk to your daemon.",
+            keywords: [
+                "api token", "token", "auth", "authentication", "bearer", "credential",
+                "credentials", "token rejected",
+                "secret", "password", "login", "sign in", "keychain", "squelch_api_token",
+                "unauthorized", "401",
+            ]),
+        SettingsEntry(
+            card: .account,
             title: "Accounts",
             blurb: "The mailboxes this install knows about, and the chords that switch them.",
             keywords: [
                 "account", "accounts", "mailbox", "mailboxes", "add account",
                 "remove account", "delete account", "switch account", "multiple accounts",
                 "second account", "rename", "sign out", "log out", "disconnect", "gmail",
-            ]),
-        SettingsEntry(
-            card: .account,
-            title: "Live account",
-            blurb: "Which daemon, provider, and triage model the account on screen is running.",
-            keywords: [
-                "live account", "current account", "provider", "triage model", "server",
-                "which model", "status", "info",
             ]),
         SettingsEntry(
             card: .account,
@@ -434,10 +371,10 @@ enum SettingsSearch {
         hits(query).map(\.card)
     }
 
-    /// Ranked cards WITH their scores. Cards, not entries: three keyword sets
-    /// can point at the same card (a triage cap, an escalation cap, the spend
-    /// estimate all live on one), and a result list that showed it three times
-    /// would be a worse answer, not a fuller one.
+    /// Ranked cards WITH their scores. Cards, not entries: several keyword
+    /// sets can point at the same card (the server URL, the API token and the
+    /// account list all live on one), and a result list that showed it three
+    /// times would be a worse answer, not a fuller one.
     static func hits(_ query: String) -> [SettingsHit] {
         let terms = terms(of: query)
         guard !terms.isEmpty else { return [] }
@@ -547,7 +484,7 @@ enum SettingsSearch {
     /// Words somebody types on the way to the word they mean. They are dropped
     /// from the QUERY only, never from the index, and only when something else
     /// survives — "how much does this cost" has to answer the same as "cost",
-    /// while "how" on its own is still a fair search for "how triage works".
+    /// while "how" on its own is still a fair search for "how it works".
     ///
     /// This matters because matching is AND: without it, one throwaway word in
     /// a sentence-shaped query zeroes every card, and the person who typed a
