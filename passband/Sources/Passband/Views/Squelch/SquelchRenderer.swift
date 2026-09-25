@@ -2,9 +2,14 @@
 // into a squelch gate, with only the passband coming out the other side.
 //
 // Everything is procedural. The shader ships as source and compiles at first
-// use (build.sh is bare swiftc with no Metal toolchain step), every vertex is
-// derived from its vertex and instance ids, and there are no buffers, meshes or
-// textures. The whole scene costs the bundle its own source text.
+// use (build.sh is bare swiftc with no Metal toolchain step), and there are no
+// meshes or textures: the whole scene costs the bundle its own source text.
+//
+// Each frame, a compute pass evaluates the wave field once per (band, x)
+// sample into a scratch buffer, and every later pass reads it. Before that,
+// each vertex re-derived the field itself, six evaluations per sample across
+// the curtain and both sides of the line strip, and the frame was
+// vertex-bound past the 120 Hz budget on an M1.
 //
 // Pass order: background, then opaque "curtains" hanging under every band that
 // write depth (the Unknown Pleasures hidden-line trick, so near bands occlude
@@ -29,13 +34,26 @@ struct SquelchSceneState {
     /// 0 = night (additive glow), 1 = paper (ink). Eased, so a theme change
     /// crossfades instead of cutting.
     var light: Float = 0
+    /// 0..1 over the first half second, so the waves rise out of the backdrop
+    /// instead of popping in on the first presented frame.
+    var reveal: Float = 0
 
     static let waveSpeed: Float = 2.4
     static let xMax: Float = 13
 
+    /// Jump straight to where a beat comes to rest.
+    mutating func settle(engaged: Bool, light isLight: Bool) {
+        engage = engaged ? 1 : 0
+        camera = engaged ? 1 : 0
+        filterLo = 0
+        filterHi = engaged ? Self.xMax + 4 : 0
+        light = isLight ? 1 : 0
+    }
+
     /// Advance the fronts. `engaged` is the switch; everything else follows.
     mutating func step(dt: Float, engaged: Bool, light isLight: Bool) {
         time += dt
+        reveal = min(1, reveal + dt / 0.5)
         light += ((isLight ? 1 : 0) - light) * (1 - exp(-dt * 5))
         let c = Self.waveSpeed
         let ease = 1 - exp(-dt * 2.6)
@@ -53,7 +71,18 @@ struct SquelchSceneState {
     }
 }
 
-final class SquelchRenderer {
+/// The multisampled attachments one drawable size needs. Owned per view, so
+/// two scenes on screen at once (a restart mid-transition) never share them.
+final class SquelchTargets {
+    fileprivate var depth: MTLTexture?
+    fileprivate var color: MTLTexture?
+    init() {}
+}
+
+/// Immutable after init apart from the GPU-side scratch buffer, which the
+/// queue's hazard tracking orders between command buffers, so any thread may
+/// encode with it.
+final class SquelchRenderer: @unchecked Sendable {
     static let bands = 104
     static let segments = 1400
     static let samples = 4
@@ -67,8 +96,8 @@ final class SquelchRenderer {
     private let writeDepth: MTLDepthStencilState
     private let testDepth: MTLDepthStencilState
     private let noDepth: MTLDepthStencilState
-    private var depthTexture: MTLTexture?
-    private var colorTexture: MTLTexture?
+    private let fieldKernel: MTLComputePipelineState
+    private let samplesBuffer: MTLBuffer
 
     let colorFormat: MTLPixelFormat
 
@@ -115,8 +144,15 @@ final class SquelchRenderer {
               let gate = pipeline("gate_vertex", "gate_fragment", additive: true),
               let writeDepth = depth(write: true, test: true),
               let testDepth = depth(write: false, test: true),
-              let noDepth = depth(write: false, test: false)
+              let noDepth = depth(write: false, test: false),
+              let kernel = library.makeFunction(name: "field_kernel"),
+              let fieldKernel = try? device.makeComputePipelineState(function: kernel),
+              // One Sample (four float3-aligned fields, 64 bytes) per point.
+              let samplesBuffer = device.makeBuffer(
+                length: Self.bands * (Self.segments + 1) * 64, options: .storageModePrivate)
         else { return nil }
+        self.fieldKernel = fieldKernel
+        self.samplesBuffer = samplesBuffer
         self.background = background
         self.curtains = curtains
         self.glow = glow
@@ -129,9 +165,10 @@ final class SquelchRenderer {
     func makeCommandBuffer() -> MTLCommandBuffer? { queue.makeCommandBuffer() }
 
     /// Encode one frame into `target`. The caller commits (and presents).
-    func encode(_ state: SquelchSceneState, into buffer: MTLCommandBuffer, target: MTLTexture) {
+    func encode(_ state: SquelchSceneState, into buffer: MTLCommandBuffer, target: MTLTexture,
+                targets: SquelchTargets) {
         let width = target.width, height = target.height
-        if depthTexture?.width != width || depthTexture?.height != height {
+        if targets.depth?.width != width || targets.depth?.height != height {
             // 4x MSAA: without it the edges where near bands hide far ones
             // crawl as the field scrolls. On Apple GPUs both attachments live
             // in tile memory only, so the samples never touch RAM.
@@ -145,29 +182,39 @@ final class SquelchRenderer {
                 d.storageMode = memoryless ? .memoryless : .private
                 return device.makeTexture(descriptor: d)
             }
-            depthTexture = attachment(.depth32Float)
-            colorTexture = attachment(colorFormat)
+            targets.depth = attachment(.depth32Float)
+            targets.color = attachment(colorFormat)
         }
+        var u = uniforms(state, width: Float(width), height: Float(height))
+        let size = MemoryLayout<SquelchUniforms>.stride
+
+        guard let compute = buffer.makeComputeCommandEncoder() else { return }
+        compute.setComputePipelineState(fieldKernel)
+        compute.setBytes(&u, length: size, index: 0)
+        compute.setBuffer(samplesBuffer, offset: 0, index: 1)
+        compute.dispatchThreads(
+            MTLSize(width: Self.segments + 1, height: Self.bands, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
+        compute.endEncoding()
+
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = colorTexture
+        pass.colorAttachments[0].texture = targets.color
         pass.colorAttachments[0].resolveTexture = target
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].storeAction = .multisampleResolve
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
-        pass.depthAttachment.texture = depthTexture
+        pass.depthAttachment.texture = targets.depth
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.storeAction = .dontCare
         pass.depthAttachment.clearDepth = 1
         guard let enc = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
-
-        var u = uniforms(state, width: Float(width), height: Float(height))
-        let size = MemoryLayout<SquelchUniforms>.stride
         let stripVertices = (Self.segments + 1) * 2
 
         enc.setDepthStencilState(noDepth)
         enc.setRenderPipelineState(background)
         enc.setVertexBytes(&u, length: size, index: 0)
         enc.setFragmentBytes(&u, length: size, index: 0)
+        enc.setVertexBuffer(samplesBuffer, offset: 0, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
 
         enc.setDepthStencilState(writeDepth)
@@ -203,7 +250,7 @@ final class SquelchRenderer {
             eye: SIMD4<Float>(eye, s.time),
             frame: SIMD4<Float>(width, height, s.filterLo, s.filterHi),
             field: SIMD4<Float>(Float(Self.bands), Float(Self.segments), -17, SquelchSceneState.xMax),
-            filter: SIMD4<Float>(s.engage, SquelchSceneState.waveSpeed, s.light, 0))
+            filter: SIMD4<Float>(s.engage, SquelchSceneState.waveSpeed, s.light, s.reveal))
     }
 }
 
@@ -213,7 +260,7 @@ private struct SquelchUniforms {
     var eye: SIMD4<Float>     // xyz camera, w time
     var frame: SIMD4<Float>   // viewport px w/h, filter lo/hi
     var field: SIMD4<Float>   // bands, segments, x min, x max
-    var filter: SIMD4<Float>  // engage, wave speed, light
+    var filter: SIMD4<Float>  // engage, wave speed, light, reveal
 }
 
 private func mix(_ a: SIMD3<Float>, _ b: SIMD3<Float>, t: Float) -> SIMD3<Float> { a + (b - a) * t }
@@ -393,6 +440,15 @@ Sample field(float i, float x, constant U& u) {
     return { float3(x, y, bandZ(i, u)), glow * fade, ink, alpha * fade };
 }
 
+// One thread per (x sample, band): the only place the field is evaluated.
+kernel void field_kernel(uint2 gid [[thread_position_in_grid]], constant U& u [[buffer(0)]],
+                         device Sample* out [[buffer(1)]]) {
+    uint row = uint(u.field.y) + 1;
+    if (gid.x >= row || gid.y >= uint(u.field.x)) return;
+    float x = mix(u.field.z, u.field.w, float(gid.x) / u.field.y);
+    out[gid.y * row + gid.x] = field(float(gid.y), x, u);
+}
+
 // Night and paper, t = 0..1 between them.
 float3 backdrop(float2 uv, float t) {
     // uv 0..1, y down. A faint bloom toward the gate side.
@@ -427,13 +483,18 @@ fragment float4 bg_fragment(BgOut in [[stage_in]], constant U& u [[buffer(0)]]) 
 struct CurtainOut { float4 pos [[position]]; };
 
 vertex CurtainOut curtain_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                                 constant U& u [[buffer(0)]]) {
-    float i = float(iid);
-    float j = float(vid >> 1);
-    float x = mix(u.field.z, u.field.w, j / u.field.y);
-    Sample s = field(i, x, u);
-    float3 p = s.p;
-    if (vid & 1) p.y = -4.0; else p.y -= 0.035;
+                                 constant U& u [[buffer(0)]],
+                                 const device Sample* samples [[buffer(1)]]) {
+    // Nearest band first (the camera sits on the +z side), so the depth test
+    // rejects every curtain fragment already hidden behind a nearer one
+    // instead of shading ~100 overlapping layers back to front.
+    uint band = uint(u.field.x) - 1 - iid;
+    uint row = uint(u.field.y) + 1;
+    float3 p = samples[band * row + (vid >> 1)].p;
+    // Deep enough to hide any farther band's lowest trough (~-1.2; the camera
+    // looks down, so a farther point sits higher on screen) and no deeper:
+    // every extra unit is thin triangles the tiler has to bin.
+    if (vid & 1) p.y = -1.6; else p.y -= 0.035;
     CurtainOut o;
     o.pos = u.viewProj * float4(p, 1.0);
     return o;
@@ -448,18 +509,20 @@ fragment float4 curtain_fragment(CurtainOut in [[stage_in]], constant U& u [[buf
 struct LineOut { float4 pos [[position]]; float3 glow; float3 ink; float alpha; float across; };
 
 vertex LineOut line_vertex(uint vid [[vertex_id]], uint iid [[instance_id]],
-                           constant U& u [[buffer(0)]]) {
-    float i = float(iid);
-    float j = float(vid >> 1);
+                           constant U& u [[buffer(0)]],
+                           const device Sample* samples [[buffer(1)]]) {
+    uint row = uint(u.field.y) + 1;
+    uint j = vid >> 1;
     float side = (vid & 1) ? 1.0 : -1.0;
-    float dx = (u.field.w - u.field.z) / u.field.y;
-    float x = u.field.z + j * dx;
-    Sample a = field(i, x, u);
-    Sample b = field(i, x + dx * 0.5, u);
+    // The screen-space tangent comes from the next sample (the previous one,
+    // reversed, at the end of the strip).
+    bool last = j + 1 >= row;
+    Sample a = samples[iid * row + j];
+    Sample b = samples[iid * row + (last ? j - 1 : j + 1)];
     float4 ca = u.viewProj * float4(a.p, 1.0);
     float4 cb = u.viewProj * float4(b.p, 1.0);
     float2 sa = ca.xy / ca.w * u.frame.xy, sb = cb.xy / cb.w * u.frame.xy;
-    float2 d = normalize(sb - sa + 1e-5);
+    float2 d = normalize((sb - sa) * (last ? -1.0 : 1.0) + 1e-5);
     float2 nrm = float2(-d.y, d.x);
     // Width in pixels, a touch thicker up close. The glow tail needs room.
     float px = clamp(34.0 / ca.w, 2.2, 7.0) * (u.frame.y / 900.0);
@@ -483,7 +546,7 @@ fragment float4 line_fragment(LineOut in [[stage_in]], constant U& u [[buffer(0)
     float3 night = in.glow * (core * 1.3 + halo);
     // Ink has no glow to spend, so it gets a crisper core and a thin halo.
     float a = saturate(in.alpha * (core * 1.2 + halo * 0.5));
-    return float4(mix(night, in.ink * a, t), a * t);
+    return float4(mix(night, in.ink * a, t), a * t) * u.filter.w;
 }
 
 // MARK: gate
@@ -518,6 +581,6 @@ fragment float4 gate_fragment(GateOut in [[stage_in]], constant U& u [[buffer(0)
     float3 night = (float3(0.35, 0.62, 1.0) * (frame + glass) + float3(0.62, 0.82, 1.0) * slot) * lit;
     float a = saturate((frame * 0.9 + glass * 2.5 + slot * 0.8) * lit);
     float t = u.filter.z;
-    return float4(mix(night, float3(0.17, 0.50, 0.83) * a, t), a * t);
+    return float4(mix(night, float3(0.17, 0.50, 0.83) * a, t), a * t) * u.filter.w;
 }
 """#
