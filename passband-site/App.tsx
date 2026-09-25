@@ -167,11 +167,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 @keyframes pb-cue { 0%, 100% { transform: scaleY(0.4); transform-origin: top; } 50% { transform: scaleY(1); transform-origin: top; } }
 .pb-stage[data-scrolled] .pb-cue { opacity: 0; }
 
+/* PHONES: the words at the top, the scope in the middle, the waitlist at the
+   bottom under the thumb. The copy column stretches the stage's height and
+   splits: the beats hold the top, the slot the foot, and the scope draws in
+   the gap between them (scopeLayout measures it). The scrim darkens only
+   behind the words and the form, never the trace. */
 @media (max-width: 820px) {
   .pb-scrim { background:
-    linear-gradient(180deg, rgba(9,13,22,0.95) 0%, rgba(9,13,22,0.7) 42%, rgba(9,13,22,0) 72%),
-    linear-gradient(180deg, rgba(9,13,22,0) 78%, rgba(9,13,22,0.9) 100%); }
-  .pb-copy { top: 5.2rem; transform: none; gap: 1.25rem; }
+    linear-gradient(180deg, rgba(9,13,22,0.92) 0%, rgba(9,13,22,0.55) 26%, rgba(9,13,22,0) 36%),
+    linear-gradient(180deg, rgba(9,13,22,0) 70%, rgba(9,13,22,0.85) 82%); }
+  .pb-copy { top: 5.2rem; bottom: 3rem; transform: none; gap: 1.25rem; justify-content: space-between; }
   .pb-nav a:not(.pb-keep) { display: none; }
   .pb-cue, .pb-mkrs, .pb-read-l { display: none; }
 }
@@ -334,24 +339,15 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
 .pb-ship-top b { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .pb-ship .pb-chip.eta { --c: var(--faint); align-self: flex-start; }
 
-/* Phones: the same app, laid out the way its own narrow window does it. The
-   rail stops being a pinned column and stacks under the work surface, and the
-   side rail goes, so the mock is scaled for 560pt instead of 1120pt. */
-@container (max-width: 640px) {
-  .pb-app { --pt: calc(100cqw / 520); grid-template-columns: minmax(0, 1fr); }
-  .pb-side, .pb-app-tools .pb-retriage { display: none; }
-  .pb-page { grid-template-columns: minmax(0, 1fr); padding: 6pt 16pt 16pt; row-gap: 12pt; }
-  .pb-reading { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .pb-reading .pb-read:nth-child(3) { display: none; }
-  .pb-rail { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10pt; }
-  .pb-rec-cal { display: none; }
-}
+/* No phone layout, on purpose: a phone gets the same window at the same
+   aspect ratio, just smaller. An accurate picture of the app beats a legible
+   one of a layout the app never draws. */
 
 /* THE TRUST ROW. Three facts, no icons: the claims are specific enough to
    carry themselves, and an icon beside each is how a list becomes slop. */
 .pb-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(1.5rem, 4vw, 3.5rem);
   border-top: 1px solid var(--hair); padding-top: clamp(2rem, 4vw, 3rem); }
-@media (max-width: 760px) { .pb-facts { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 760px) { .pb-facts { grid-template-columns: minmax(0, 1fr); row-gap: 2rem; } }
 .pb-fact h3 { margin: 0 0 0.55rem; font-size: 0.98rem; font-weight: 600; }
 .pb-fact p { margin: 0; color: var(--dim); font-size: 0.93rem; line-height: 1.6; }
 .pb-fact a { color: var(--accent-ink); text-decoration: none; }
@@ -1310,11 +1306,27 @@ function AppMock() {
 
 // Where the analyzer draws, as fractions of the stage. Wide screens tune the
 // band to the right of the copy; narrow ones centre it under the copy, low.
+//
+// On a phone the scope sits BETWEEN the copy and the waitlist, so its band is
+// measured off them rather than guessed: the trace's baseline just above the
+// slot, full scale reaching just under the beats. Phone heights vary too much
+// for fixed fractions to clear both on every one.
 function scopeLayout(): ScopeLayout {
-  const wide = innerWidth > 820;
-  return wide
-    ? { center: 0.7, base: 0.82, scale: 0.5, spread: 1 }
-    : { center: 0.5, base: 0.9, scale: 0.28, spread: 1.9 };
+  if (innerWidth > 820) return { center: 0.7, base: 0.82, scale: 0.5, spread: 1 };
+  const stage = document.querySelector(".pb-stage")?.getBoundingClientRect();
+  const beats = document.querySelector(".pb-beats")?.getBoundingClientRect();
+  const slot = document.querySelector(".pb-slot")?.getBoundingClientRect();
+  if (!stage || !beats || !slot || stage.height < 1) {
+    return { center: 0.5, base: 0.7, scale: 0.3, spread: 1.9 };
+  }
+  const top = beats.bottom - stage.top + 12;
+  const bottom = slot.top - stage.top - 18;
+  return {
+    center: 0.5,
+    base: bottom / stage.height,
+    scale: Math.max(0.08, (bottom - top) / stage.height),
+    spread: 1.9,
+  };
 }
 
 // The carriers' names in the marker table, in the scope's order.
@@ -1365,7 +1377,10 @@ export function App() {
       setLayout(scopeLayout());
       onScroll();
     };
-    onScroll();
+    // The phone layout is measured off the copy, which only has its real
+    // height once mounted and again once the serif has loaded.
+    onResize();
+    document.fonts?.ready.then(onResize);
     addEventListener("scroll", onScroll, { passive: true });
     addEventListener("resize", onResize);
 
