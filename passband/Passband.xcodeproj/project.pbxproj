@@ -17,7 +17,6 @@
 		06A25AF5C7267CEFDF3A17E1 /* AgentConnect.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4C3328B6DF9AFEF4D1FAF7B /* AgentConnect.swift */; };
 		07461CBC4F5237E689A02449 /* ImageSchemeHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05270E444AAA1678F50EC0F0 /* ImageSchemeHandler.swift */; };
 		0819F995AB3EF176520A700A /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8860DE0FE5AA0366C7BE9922 /* JSONValue.swift */; };
-		094298C40321D7AF590A2FC0 /* AgentConnectNudge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5B1FA11D9F38014E06C42FC /* AgentConnectNudge.swift */; };
 		0942E5062DD260DCC44FFEA0 /* TrackerToggle.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2556C9BFD81BFC2EEAFB3B0 /* TrackerToggle.swift */; };
 		0A10F1733FF17A416C100485 /* WhatsNew.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22634771F8C0BE048B034866 /* WhatsNew.swift */; };
 		0A7C428163BED54C681D2CD8 /* newsreader-var.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 7AC123D7E906293F404D8353 /* newsreader-var.ttf */; };
@@ -533,7 +532,6 @@
 		A31EE886D87910F0348A94AB /* SitrepPoller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SitrepPoller.swift; sourceTree = "<group>"; };
 		A4C3328B6DF9AFEF4D1FAF7B /* AgentConnect.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConnect.swift; sourceTree = "<group>"; };
 		A59C3D57DD2BAE3A8D3297AB /* RehearsalNewsletterLogo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RehearsalNewsletterLogo.swift; sourceTree = "<group>"; };
-		A5B1FA11D9F38014E06C42FC /* AgentConnectNudge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentConnectNudge.swift; sourceTree = "<group>"; };
 		A5B25E3187C89277DBE8DEF3 /* ThreadStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThreadStyle.swift; sourceTree = "<group>"; };
 		A77BC580144CC1AF7B5B8AEF /* MarkdownStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownStyle.swift; sourceTree = "<group>"; };
 		A9FAE568A595DDCE359FFA33 /* MarkdownTextViewiOS.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTextViewiOS.swift; sourceTree = "<group>"; };
@@ -646,7 +644,6 @@
 			children = (
 				9B11AE47A064BB58DD81A6DB /* ActionLayer.swift */,
 				09312A1F80127B91A8FDC394 /* AgentCards.swift */,
-				A5B1FA11D9F38014E06C42FC /* AgentConnectNudge.swift */,
 				0B934097D54904EB956A1B16 /* AgentsSection.swift */,
 				4D74815E3375EAC96A4841CF /* AskBar.swift */,
 				15D14DE02E72E63FE53D5C8D /* AttachmentStrip.swift */,
@@ -1125,7 +1122,6 @@
 				E5DC83A762609363C2ED15CB /* Actions.swift in Sources */,
 				9A9AA77AC829165E466C9597 /* AgentCards.swift in Sources */,
 				06A25AF5C7267CEFDF3A17E1 /* AgentConnect.swift in Sources */,
-				094298C40321D7AF590A2FC0 /* AgentConnectNudge.swift in Sources */,
 				8584D208439539843BAE4481 /* AgentTools.swift in Sources */,
 				B3215470A61F7820D9D7C348 /* AgentsSection.swift in Sources */,
 				ADCD91460923247021793032 /* Analytics.swift in Sources */,

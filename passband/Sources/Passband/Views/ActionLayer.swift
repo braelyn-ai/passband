@@ -37,24 +37,6 @@ struct ActionLayer: View {
             .padding(.leading, 74)
             .padding(.bottom, 18)
 
-            // THE AGENT OFFER, bottom-right: the one corner of the board no
-            // other surface claims. Only over the board itself, and never
-            // beside a composer or a reader, whose own controls live down here.
-            if AgentConnect.shared.nudgeVisible, store.activeView == .sitrep,
-                store.threadId == nil, store.compose == nil,
-                !store.whatsNew.active, !store.tour.active
-            {
-                VStack(spacing: 0) {
-                    Spacer(minLength: 0)
-                    HStack(spacing: 0) {
-                        Spacer(minLength: 0)
-                        AgentConnectNudge().fixedSize()
-                    }
-                }
-                .padding(.trailing, 18)
-                .padding(.bottom, 18)
-            }
-
             if let request = store.ruleEditor {
                 RuleEditor(request: request) { store.closeRuleEditor() }
             }
@@ -90,7 +72,6 @@ struct ActionLayer: View {
             if let run = store.retriage { RetriageModal(run: run) }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-        .animation(Motion.toast, value: AgentConnect.shared.nudgeVisible)
         .keyBindings(.list, [
             KeyBinding("t", "tune sender") {
                 if let u = store.selectedUpdate { Actions.tune(sender: u.sender) }

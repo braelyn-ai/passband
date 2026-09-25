@@ -9,8 +9,8 @@
 // probe below asks it the way an agent would: an MCP `initialize`, with NO
 // Authorization header, because an agent will not have one either.
 //
-// Settings' Agents pane and the corner nudge both read `AgentConnect.shared`;
-// the nudge only ever offers a door the probe has seen open.
+// Settings' Agents pane reads `AgentConnect.shared`. It is a shared object
+// rather than view state so the answer outlives leaving the pane.
 
 import Foundation
 import Observation
@@ -145,19 +145,10 @@ enum AgentKind: String, CaseIterable, Identifiable, Sendable {
 final class AgentConnect {
     static let shared = AgentConnect()
 
-    /// Env escape hatch for development and screenshots, matching the tour's
-    /// and what's-new's: raises the nudge past its stamp AND past the probe.
-    static let forced = ProcessInfo.processInfo.environment["PASSBAND_FORCE_AGENT_NUDGE"] == "1"
-
     /// The last probe's answer, and the server it was asked of. Keyed so that
     /// switching accounts cannot show one daemon's answer under another's URL.
     private(set) var status: AgentDoorStatus = .unknown
     private(set) var statusFor: String?
-
-    /// Whether the corner card is up.
-    private(set) var nudgeVisible = false
-
-    private var nudgeArmed = false
 
     // MARK: - the endpoint
 
@@ -248,37 +239,5 @@ final class AgentConnect {
         } catch {
             return .unreachable
         }
-    }
-
-    // MARK: - the nudge
-
-    /// Called when the first sync of the session lands. Every clause is a
-    /// reason not to interrupt; the last one is that the door has to actually
-    /// be open, because a card promising a connection the daemon will refuse
-    /// is an ad for a dead end.
-    func maybeNudge(serverURL: String?) {
-        guard !RehearsalMode.isEnabled, !nudgeArmed, !nudgeVisible else { return }
-        guard Self.forced || !Prefs.shared.agentNudgeDone else { return }
-        guard Prefs.shared.tourCompleted else { return }
-        nudgeArmed = true
-        Task {
-            // Let the board land first. A card that arrives with the window
-            // reads as part of the launch; one that arrives after reads as a
-            // suggestion.
-            try? await Task.sleep(for: .seconds(4))
-            await check(serverURL: serverURL)
-            guard Self.forced || status == .open else {
-                nudgeArmed = false
-                return
-            }
-            nudgeVisible = true
-        }
-    }
-
-    /// "Not now", or the card's job being done some other way. Once: the pane
-    /// in Settings is where it lives after this.
-    func dismissNudge() {
-        nudgeVisible = false
-        Prefs.shared.agentNudgeDone = true
     }
 }

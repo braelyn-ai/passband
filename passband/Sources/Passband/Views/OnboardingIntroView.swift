@@ -214,7 +214,7 @@ private struct IntroEntrance: ViewModifier {
 /// Verbatim transparent exports from brand/png, with ink and lit variants.
 /// Native image decoding works in the CLI Mac bundle and the iOS bundle.
 @MainActor
-enum IntroBrand {
+private enum IntroBrand {
     static let mark = load("passband-mark")
     static let lightMark = load("passband-mark-light")
 

@@ -34,10 +34,6 @@ struct AgentsSection: View {
         .task(id: endpoint) {
             await connect.check(serverURL: store.settings?.serverURL)
         }
-        // Reaching the pane is the nudge's whole job, however it happened.
-        .onAppear {
-            if connect.nudgeVisible { connect.dismissNudge() }
-        }
     }
 
     // MARK: - where the door is
