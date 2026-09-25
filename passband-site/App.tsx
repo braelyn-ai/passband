@@ -6,7 +6,7 @@ import {
   type FormEvent,
   type PointerEvent,
 } from "react";
-import { createSquelch } from "./squelch";
+import { CARRIERS, createScope, markerPoint, type ScopeLayout } from "./scope";
 
 // The "before" panel is a procedurally repeated fake inbox: the drudgery
 // Passband exists to kill. Snippets are written long so rows run the full
@@ -77,10 +77,42 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
    happens. The height is the length of the scrub. */
 .pb-story { position: relative; height: 260vh; }
 .pb-stage { position: sticky; top: 0; height: 100vh; height: 100svh; overflow: hidden; }
-.pb-scene, .pb-poster { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-.pb-poster { object-fit: cover; object-position: 70% 50%; display: none; }
-.pb-stage[data-fallback] .pb-poster { display: block; }
-.pb-stage[data-fallback] .pb-scene { display: none; }
+.pb-scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+/* The analyzer's graticule: ten divisions across, eight down, faded out at the
+   edges so the screen has no hard border to sit inside. */
+.pb-grat { position: absolute; inset: 0; pointer-events: none;
+  background-image:
+    repeating-linear-gradient(90deg, rgba(130, 186, 245, 0.07) 0 1px, transparent 1px 10%),
+    repeating-linear-gradient(180deg, rgba(130, 186, 245, 0.07) 0 1px, transparent 1px 12.5%);
+  -webkit-mask-image: radial-gradient(ellipse 75% 70% at 62% 55%, #000 30%, transparent 85%);
+          mask-image: radial-gradient(ellipse 75% 70% at 62% 55%, #000 30%, transparent 85%); }
+/* Markers: numbered like an analyzer's, riding the carriers' peaks. They come
+   up only once the squelch has closed, which is when there is something to
+   point at. */
+.pb-mkr { position: absolute; z-index: 1; transform: translate(-50%, calc(-100% - 12px)); pointer-events: none;
+  font: 600 11px/1 ui-monospace, "SF Mono", Menlo, monospace; color: var(--accent-ink);
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  opacity: 0; transition: opacity 0.5s ease; }
+.pb-mkr::after { content: ""; border: 5px solid transparent; border-top: 6px solid var(--accent); border-bottom: 0; }
+.pb-stage[data-locked] .pb-mkr { opacity: 1; }
+.pb-mkr:nth-of-type(2) { transition-delay: 0.08s; } .pb-mkr:nth-of-type(3) { transition-delay: 0.16s; }
+.pb-mkrs { position: absolute; z-index: 2; right: var(--gutter); top: 17%; width: 19rem;
+  font: 500 12px/1.2 ui-monospace, "SF Mono", Menlo, monospace; color: var(--dim);
+  border: 1px solid rgba(130, 186, 245, 0.2); border-radius: 10px; background: rgba(9, 13, 22, 0.7);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  opacity: 0; transform: translateY(6px); transition: opacity 0.6s ease 0.2s, transform 0.6s ease 0.2s; }
+.pb-stage[data-locked] .pb-mkrs { opacity: 1; transform: none; }
+.pb-mkrs div { display: grid; grid-template-columns: 1.6rem 1fr auto; gap: 0.6rem; padding: 0.55rem 0.8rem;
+  border-top: 1px solid rgba(130, 186, 245, 0.1); }
+.pb-mkrs div:first-child { border-top: 0; font-size: 10px; letter-spacing: 0.1em; color: var(--faintest); }
+.pb-mkrs b { color: var(--accent-ink); font-weight: 600; }
+.pb-mkrs span:last-child { text-align: right; }
+.pb-mkrs .late { color: var(--danger); } .pb-mkrs .soon { color: var(--warn); }
+/* The readouts along the screen's foot. SQUELCH is live: it is the scroll. */
+.pb-read-l, .pb-read-r { position: absolute; z-index: 2; bottom: 1.4rem;
+  font: 500 11px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.08em; color: var(--faintest); }
+.pb-read-l { left: var(--gutter); } .pb-read-r { right: var(--gutter); }
+.pb-read-r b { color: var(--accent-ink); font-weight: 600; display: inline-block; min-width: 4ch; text-align: right; }
 /* The scrim, the web twin of the intro's: the backdrop's own colour, so it
    melts into the scene rather than tinting it. From the leading edge on wide
    screens, from the top on narrow ones where the copy sits above the waves. */
@@ -131,7 +163,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--s
     linear-gradient(180deg, rgba(9,13,22,0) 78%, rgba(9,13,22,0.9) 100%); }
   .pb-copy { top: 5.2rem; transform: none; gap: 1.25rem; }
   .pb-nav a:not(.pb-keep) { display: none; }
-  .pb-cue { display: none; }
+  .pb-cue, .pb-mkrs, .pb-read-l { display: none; }
 }
 
 /* BEFORE / AFTER. */
@@ -1216,36 +1248,66 @@ function focusRig() {
   document.querySelector<HTMLInputElement>(".pb-rig-name")?.focus({ preventScroll: true });
 }
 
+// Where the analyzer draws, as fractions of the stage. Wide screens tune the
+// band to the right of the copy; narrow ones centre it under the copy, low.
+function scopeLayout(): ScopeLayout {
+  const wide = innerWidth > 820;
+  return wide
+    ? { center: 0.7, base: 0.82, scale: 0.5, spread: 1 }
+    : { center: 0.5, base: 0.9, scale: 0.28, spread: 1.9 };
+}
+
+// The carriers' names in the marker table, in the scope's order.
+const MARKERS: Array<[who: string, status: string, tone: string]> = [
+  ["Parkline Properties", "past due", "late"],
+  ["Dr. Ortiz's Office", "today", "soon"],
+  ["Jamie Chen", "due Fri", "soon"],
+];
+
 export function App() {
   const storyRef = useRef<HTMLElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [beat, setBeat] = useState(0);
   const [scrolled, setScrolled] = useState(false);
-  const [fallback, setFallback] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const readoutRef = useRef<HTMLElement>(null);
+  const [layout, setLayout] = useState<ScopeLayout>(() => scopeLayout());
 
   useEffect(() => {
     const canvas = canvasRef.current;
     const story = storyRef.current;
     if (!canvas || !story) return;
     const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const scene = createSquelch(canvas, { reduceMotion });
-    if (!scene) setFallback(true);
+    const scene = createScope(canvas, {
+      reduceMotion,
+      layout: scopeLayout,
+      // Written straight to the DOM: it changes every frame, and a re-render
+      // per frame would buy nothing.
+      onReadout: (squelch) => {
+        if (readoutRef.current) readoutRef.current.textContent = `${Math.round(squelch * 100)}%`;
+      },
+    });
 
     // Progress through the story, 0 at the top to 1 where the stage releases.
-    // The beat flips at the same point the gate closes, so the words and the
-    // waves change their minds together.
+    // The copy turns as the filter starts to close; the markers come up once
+    // it has closed, when there is something left to point at.
     const onScroll = () => {
       const rect = story.getBoundingClientRect();
       const travel = Math.max(1, rect.height - innerHeight);
       const p = Math.min(1, Math.max(0, -rect.top / travel));
       scene?.setProgress(p);
-      setBeat(p > 0.22 ? 1 : 0);
+      setBeat(p > 0.3 ? 1 : 0);
+      setLocked(p > 0.58);
       setScrolled(p > 0.03);
+    };
+    const onResize = () => {
+      setLayout(scopeLayout());
+      onScroll();
     };
     onScroll();
     addEventListener("scroll", onScroll, { passive: true });
-    addEventListener("resize", onScroll);
+    addEventListener("resize", onResize);
 
     // Nothing to draw once the stage has scrolled away.
     const io = new IntersectionObserver(([entry]) => scene?.setVisible(entry.isIntersecting));
@@ -1255,7 +1317,7 @@ export function App() {
 
     return () => {
       removeEventListener("scroll", onScroll);
-      removeEventListener("resize", onScroll);
+      removeEventListener("resize", onResize);
       io.disconnect();
       scene?.destroy();
     };
@@ -1275,13 +1337,31 @@ export function App() {
         <div
           ref={stageRef}
           className="pb-stage"
-          data-fallback={fallback || undefined}
+          data-locked={locked || undefined}
           data-scrolled={scrolled || undefined}
         >
-          {/* Only when WebGL2 is missing: a hidden <img> still downloads. */}
-          {fallback && <img className="pb-poster" src="/squelch-poster.jpg" alt="" />}
           <canvas ref={canvasRef} className="pb-scene" aria-hidden="true" />
+          <div className="pb-grat" />
+          {CARRIERS.map((_, i) => {
+            const { x, y } = markerPoint(i, layout);
+            return (
+              <span key={i} className="pb-mkr" style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
+                aria-hidden="true">{i + 1}</span>
+            );
+          })}
           <div className="pb-scrim" />
+          <div className="pb-mkrs" aria-label="What made it through">
+            <div><span>MKR</span><span>SENDER</span><span>STATUS</span></div>
+            {MARKERS.map(([who, status, tone], i) => (
+              <div key={who}>
+                <b>{i + 1}</b>
+                <span>{who}</span>
+                <span className={tone}>{status}</span>
+              </div>
+            ))}
+          </div>
+          <span className="pb-read-l" aria-hidden="true">SPAN&nbsp;&nbsp;your inbox&nbsp;&nbsp;·&nbsp;&nbsp;4,312 msgs</span>
+          <span className="pb-read-r" aria-hidden="true">SQUELCH&nbsp;<b ref={readoutRef}>0%</b></span>
 
           <header className="pb-top">
             <a className="pb-brand" href="/">
