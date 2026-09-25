@@ -292,12 +292,16 @@ struct MainShell: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                // The composer: a working surface in the layout, NOT an overlay
-                // — no scrim, no blur, the page beside it stays live.
-                if store.compose != nil {
-                    ComposePane()
+                // The composer's STRIP: a working surface in the layout, NOT an
+                // overlay — no scrim, no blur, the page beside it shrinks and
+                // stays live. The pane itself is drawn in its own layer below,
+                // so that opening it out to full screen moves ONE view rather
+                // than swapping in a second one (which would drop the caret,
+                // the focus and the editor's undo stack on every toggle).
+                if store.compose != nil && !store.composeExpanded {
+                    Color.clear
                         .frame(width: composeWidth)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        .allowsHitTesting(false)
                 }
             }
 
@@ -363,7 +367,7 @@ struct MainShell: View {
                     // Same reservation for the compose pane: `c` from the reader
                     // opens it in the layout BELOW this layer, and the reader
                     // insetting past it is what keeps it visible.
-                    if store.compose != nil {
+                    if store.compose != nil && !store.composeExpanded {
                         Color.clear
                             .frame(width: composeWidth)
                             .allowsHitTesting(false)
@@ -373,6 +377,30 @@ struct MainShell: View {
                 // crossfade shows two surfaces at once on a surface the reader
                 // enters and leaves constantly, which reads as lag.
                 .zIndex(20)
+            }
+
+            // THE COMPOSER, in both of its sizes. Side-by-side it sits in the
+            // strip reserved above, UNDER the side panels and the reader (which
+            // insets past it), exactly where it sat when it lived in the
+            // layout. Opened out it takes everything right of the rail, over
+            // the page and an open reader alike, with the mail in a centred
+            // column (ComposePane holds the measure). The rail stays, as it
+            // does for the reader. Same view in both: only its frame and its
+            // layer change.
+            if store.compose != nil {
+                HStack(spacing: 0) {
+                    if store.composeExpanded {
+                        Color.clear
+                            .frame(width: SidebarRail.railWidth)
+                            .allowsHitTesting(false)
+                    } else {
+                        Spacer(minLength: 0)
+                    }
+                    ComposePane()
+                        .frame(width: store.composeExpanded ? nil : composeWidth)
+                }
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+                .zIndex(store.composeExpanded ? 25 : 5)
             }
             }
             .blur(radius: store.modalOverlayOpen ? 9 : 0)
@@ -392,6 +420,7 @@ struct MainShell: View {
         // The BOOL, never the ComposeState: the state changes on every
         // keystroke, and animating that would smear typing.
         .animation(.smooth(duration: 0.22), value: store.compose != nil)
+        .animation(.smooth(duration: 0.22), value: store.composeExpanded)
         // threadId is deliberately NOT animated HERE — opening a thread is a
         // jump. The one motion it has is the done+next flight, and that one is
         // animated at the call site, where the direction is known.

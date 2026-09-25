@@ -302,6 +302,13 @@ struct ThreadViewer: View {
         .onChange(of: store.openThreadRefreshToken) { _, _ in
             Task { await refreshInPlace() }
         }
+        // A HELD REPLY LANDED and the daemon already has the sent copy. The
+        // send outlives the composer (see `AppStore.sendWithUndo`), so this is
+        // how the reply shows up in the thread it answers.
+        .onChange(of: store.lastSendEcho) { _, echo in
+            guard echo?.threadId == threadId else { return }
+            Task { await reloadAfterSend() }
+        }
         .onChange(of: store.focusedMessageView) { _, direct in
             guard store.threadId == threadId, let direct, direct.thread_id == threadId else { return }
             adopt(direct, opening: true)
@@ -376,11 +383,12 @@ struct ThreadViewer: View {
                     composer
                 }
                 .frame(width: cardWidth, height: reader.size.height)
+                .clipShape(RoundedRectangle(cornerRadius: stacked ? Self.stackRadius : 0, style: .continuous))
                 // The card's own opaque floor, so it covers the peek as it
-                // slides over it. Only the stack needs one: the reader already
-                // has a backdrop under everything.
-                .background { if stacked { ReaderBackdrop() } }
-                .clipped()
+                // slides over it, and its edge, so the gap between the two reads
+                // as a gap. Only the stack needs either: the reader already has a
+                // backdrop under everything. AFTER the clip, so the shadow lands.
+                .background { if stacked { StackCardSurface(radius: Self.stackRadius) } }
                 // With a stack the card flies and the window stays; without one
                 // RootView flies the whole reader, and this must not fly it twice.
                 .offset(flight.offset(in: CGSize(
@@ -389,16 +397,23 @@ struct ThreadViewer: View {
                 .opacity(flight.opacity)
                 .background(alignment: .topLeading) {
                     if stacked, let next = store.nextQueuedThread {
-                        ReadingStackPeek(row: next)
+                        // THE SAME SURFACE AS THE CARD: done+next mounts the next
+                        // thread exactly here and walks it in, so a peek dressed
+                        // any differently would pop as it becomes the card.
+                        ReadingStackPeek(row: next, visibleWidth: Self.stackPeekWidth - Self.stackGap)
                             .id(next.thread_id)
                             .frame(width: cardWidth, height: reader.size.height, alignment: .topLeading)
-                            .clipped()
+                            .clipShape(RoundedRectangle(cornerRadius: Self.stackRadius, style: .continuous))
+                            .background { StackCardSurface(radius: Self.stackRadius) }
                             .offset(x: cardWidth + Self.stackGap)
                             .allowsHitTesting(false)
                             .accessibilityHidden(true)
                     }
                 }
                 .frame(width: reader.size.width, height: reader.size.height, alignment: .leading)
+                // The table the cards sit on. Without it the gap and the peek
+                // are the same colour as the card, and the stack is invisible.
+                .background(stacked ? Palette.canvas : .clear)
                 .clipped()
             }
         }
@@ -407,6 +422,7 @@ struct ThreadViewer: View {
         /// and the air between the two.
         private static let stackPeekWidth: CGFloat = 56
         private static let stackGap: CGFloat = 12
+        private static let stackRadius: CGFloat = 12
     #endif
 
     /// MOUNTED UNCONDITIONALLY, and gated on `store.inlineReply` INSIDE. Reading
@@ -421,8 +437,7 @@ struct ThreadViewer: View {
     /// composer closes.
     private var composer: some View {
         InlineReply(
-            messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "",
-            onEchoed: { Task { await reloadAfterSend() } })
+            messages: thread?.messages ?? [], threadSubject: thread?.subject ?? "")
     }
 
     // MARK: - chrome
@@ -2055,6 +2070,8 @@ extension View {
     /// is what makes the measured height the right answer.
     struct ReadingStackPeek: View {
         let row: AttentionUpdate
+        /// How much of the peek shows past the current card.
+        let visibleWidth: CGFloat
         @State private var preview: ClientThreadView?
 
         var body: some View {
@@ -2077,6 +2094,14 @@ extension View {
                 .readerColumn()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // WHO IS NEXT, in the only part of the peek anyone can see: the
+            // column above is centred, so its own heading sits far past the
+            // strip that shows beside the current card.
+            .overlay(alignment: .topLeading) {
+                Avatar(sender: row.senderString, size: 24)
+                    .padding(.leading, (visibleWidth - 24) / 2)
+                    .padding(.top, 16)
+            }
             .clipped()
             .task(id: row.thread_id) {
                 let loaded = try? await ThreadPrefetch.shared.fetch(row.thread_id)
@@ -2086,6 +2111,20 @@ extension View {
         }
     }
 #endif
+
+/// One card of a Reading stack: the reader's page with an edge and a lift, so
+/// it stands off the canvas it sits on and off the card underneath it.
+private struct StackCardSurface: View {
+    let radius: CGFloat
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        ReaderBackdrop()
+            .clipShape(shape)
+            .overlay { shape.strokeBorder(Palette.hairline, lineWidth: 1) }
+            .shadow(color: .black.opacity(0.10), radius: 10, x: 2)
+    }
+}
 
 /// The sender identity shared by the loaded card and its peek placeholder.
 private struct MessageSenderHeading: View {
