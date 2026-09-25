@@ -1476,7 +1476,7 @@ export function App() {
             </div>
             <div className="pb-slot">
               {joining ? <Waitlist /> : <JoinButton onClick={go(true)} />}
-              <p className="pb-fine">For Gmail, on Mac and iPhone. Invite-only while in preview.</p>
+              <p className="pb-fine">For Gmail, on Mac and iPhone.</p>
             </div>
           </div>
 
