@@ -26,10 +26,12 @@ struct AgentsSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             doorCard
-            if let endpoint {
+            // Not for a server with no agent door at all (a hosted mailbox,
+            // today): a ready-to-paste command for a 404 is a trap.
+            if let endpoint, status != .notServed {
                 setupCard(endpoint)
+                reachCard
             }
-            reachCard
         }
         .task(id: endpoint) {
             await connect.check(serverURL: store.settings?.serverURL)
@@ -100,11 +102,10 @@ struct AgentsSection: View {
             SettingsHint("Any agent that can reach this address can connect.")
         case .hostRefused:
             let host = AgentConnect.host(of: endpoint) ?? "your-host"
-            let line = "SQUELCH_MCP_ALLOWED_HOSTS=\(host)"
             SettingsHint(
-                "Your daemon is up, but it only answers agents that call it localhost. Add this to the daemon's environment and restart it:"
+                "Your daemon is up, but it doesn't answer agents that call it by this name. Add this host to SQUELCH_MCP_ALLOWED_HOSTS in the daemon's environment (comma-separated, keeping anything already there) and restart it:"
             )
-            CodeBlock(text: line)
+            CodeBlock(text: host)
         case .notServed:
             SettingsHint(
                 "Nothing answers at /mcp on this server. Hosted Passband doesn't open the agent door yet. A self-hosted daemon does."

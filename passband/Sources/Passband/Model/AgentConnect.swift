@@ -150,6 +150,11 @@ final class AgentConnect {
     private(set) var status: AgentDoorStatus = .unknown
     private(set) var statusFor: String?
 
+    /// Bumped by every check, so only the newest one may write its answer.
+    /// Keying on the endpoint alone is not enough: A, then B, then A again
+    /// leaves the first A probe looking current when it lands.
+    private var generation = 0
+
     // MARK: - the endpoint
 
     /// `<server>/mcp`, from the address this app already talks to. Nil with no
@@ -173,14 +178,21 @@ final class AgentConnect {
         return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
     }
 
+    /// Whether mcp-remote needs `--allow-http` for this URL. Its exemption is
+    /// narrower than `isLoopback`: only `localhost` and `127.0.0.1`, so an
+    /// `http://[::1]` address still needs the flag.
     nonisolated static func isPlainHTTPToRemoteHost(_ url: String) -> Bool {
-        url.lowercased().hasPrefix("http://") && !isLoopback(url)
+        guard url.lowercased().hasPrefix("http://") else { return false }
+        let host = host(of: url)?.lowercased()
+        return host != "localhost" && host != "127.0.0.1"
     }
 
     // MARK: - the probe
 
     /// Ask the door. Safe to call repeatedly; the newest call's answer wins.
     func check(serverURL: String?) async {
+        generation &+= 1
+        let mine = generation
         guard !RehearsalMode.isEnabled, let endpoint = Self.endpoint(serverURL: serverURL) else {
             status = .unknown
             statusFor = nil
@@ -189,8 +201,9 @@ final class AgentConnect {
         status = .checking
         statusFor = endpoint
         let found = await Self.probe(endpoint)
-        // A newer check for a different server may have started meanwhile.
-        guard statusFor == endpoint else { return }
+        // A newer check started meanwhile, or this one was cancelled (the
+        // pane went away): either way this answer is not the one to show.
+        guard generation == mine, let found else { return }
         status = found
     }
 
@@ -204,7 +217,8 @@ final class AgentConnect {
     /// One MCP `initialize`, the first thing any agent sends. Deliberately NOT
     /// through APIClient: that would attach the app's bearer token, and a door
     /// that only opens for the token is a door no agent can use.
-    nonisolated static func probe(_ endpoint: String) async -> AgentDoorStatus {
+    /// Nil when the probe was cancelled, which is not an answer about the door.
+    nonisolated static func probe(_ endpoint: String) async -> AgentDoorStatus? {
         guard let url = URL(string: endpoint) else { return .unreachable }
         var req = URLRequest(url: url, timeoutInterval: 8)
         req.httpMethod = "POST"
@@ -237,6 +251,7 @@ final class AgentConnect {
             default: return .unreachable
             }
         } catch {
+            if Task.isCancelled || (error as? URLError)?.code == .cancelled { return nil }
             return .unreachable
         }
     }
