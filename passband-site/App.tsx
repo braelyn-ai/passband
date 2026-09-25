@@ -1298,7 +1298,7 @@ function AppMock() {
             <ZoneHead glyph="receipt" title="Receipts" count={3} />
             <div className="pb-rec-row"><b>Blue Bottle</b><span>$6.50</span></div>
             <div className="pb-rec-row"><b>DoorDash</b><span>$23.18</span></div>
-            <div className="pb-rec-row"><b>Maple Books</b><span>$24.00</span></div>
+            <div className="pb-rec-row"><b>Berghain</b><span>€25.00</span></div>
           </section>
         </aside>
       </div>
