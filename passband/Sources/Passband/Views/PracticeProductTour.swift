@@ -179,31 +179,38 @@ struct PracticeProductTour: View {
         #endif
     }
 
-    /// The copy with each `{key}` drawn as the same keycap the hint row uses.
+    /// The copy with each `{key}` drawn as the same keycap the hint row uses,
+    /// and `**Section**` runs set in full ink at semibold, so a section name
+    /// reads as a place in the app against the dimmed sentence around it.
     /// Text cannot host a bordered view, but it can interpolate an Image, so
     /// the cap is rasterized and the sentence still wraps as one paragraph.
     private func explanationText(_ copy: String) -> Text {
         var text = Text(verbatim: "")
+        var run = ""
+        var bold = false
+        func flush() {
+            guard !run.isEmpty else { return }
+            let piece = Text(verbatim: run)
+            text = Text("\(text)\(bold ? piece.fontWeight(.semibold).foregroundStyle(Palette.ink) : piece)")
+            run = ""
+        }
         var rest = Substring(copy)
-        while let open = rest.firstIndex(of: "{"),
-              let close = rest[open...].firstIndex(of: "}") {
-            let key = String(rest[rest.index(after: open)..<close])
-            text = Text("\(text)\(styledRun(rest[..<open]))\(inlineKeycap(key))")
-            rest = rest[rest.index(after: close)...]
+        while let first = rest.first {
+            if rest.hasPrefix("**") {
+                flush()
+                bold.toggle()
+                rest = rest.dropFirst(2)
+            } else if first == "{", let close = rest.firstIndex(of: "}") {
+                flush()
+                let key = String(rest[rest.index(after: rest.startIndex)..<close])
+                text = Text("\(text)\(inlineKeycap(key))")
+                rest = rest[rest.index(after: close)...]
+            } else {
+                run.append(first)
+                rest = rest.dropFirst()
+            }
         }
-        return Text("\(text)\(styledRun(rest))")
-    }
-
-    /// `**Section**` runs set in full ink at semibold, so a section name reads
-    /// as a place in the app against the dimmed sentence around it.
-    private func styledRun(_ run: Substring) -> Text {
-        var text = Text(verbatim: "")
-        for (index, part) in run.components(separatedBy: "**").enumerated() {
-            let piece = Text(verbatim: part)
-            text = index.isMultiple(of: 2)
-                ? Text("\(text)\(piece)")
-                : Text("\(text)\(piece.fontWeight(.semibold).foregroundStyle(Palette.ink))")
-        }
+        flush()
         return text
     }
 

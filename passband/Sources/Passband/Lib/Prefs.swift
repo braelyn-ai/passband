@@ -93,7 +93,8 @@ enum NotificationSound: String, CaseIterable, Sendable {
 // (Lib/DeeperSearch.swift), which is pure so test.sh can assert what `off`
 // does to a lane that is already running. This file is only its storage.
 
-/// Two palettes selected explicitly; `system` follows the OS and is the default.
+/// Two palettes selected explicitly, or `system` to follow the OS. Dark is the
+/// default (see the registered defaults in `Prefs.init`).
 enum ThemeChoice: String, CaseIterable, Sendable {
     case system, light, dark
 

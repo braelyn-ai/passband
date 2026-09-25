@@ -14,7 +14,7 @@ struct OnboardingIntroView: View {
     private var organized: Bool { page > 0 }
 
     var body: some View {
-        if SquelchSceneView.renderer != nil {
+        if !SquelchScene.shared.isUnavailable {
             squelchLayout
         } else {
             cardLayout
@@ -237,10 +237,10 @@ struct OnboardingIntroView: View {
     }
 }
 
-/// The scene's own backdrop color (the shader's top gradient stop, night and
-/// paper), so the scrim behind the copy melts into it rather than tinting it.
+/// The scene's own backdrop color, so the scrim behind the copy melts into it
+/// rather than tinting it.
 private enum IntroNight {
-    static let backdrop = Color(light: 0xF6F9FC, dark: 0x090D16)
+    static let backdrop = SquelchSceneView.backdrop
 }
 
 /// A single quiet entrance per view identity. No timers or repeating motion;

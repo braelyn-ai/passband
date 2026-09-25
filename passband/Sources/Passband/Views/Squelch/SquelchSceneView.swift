@@ -15,28 +15,61 @@ import os
 import QuartzCore
 import SwiftUI
 
+/// The renderer, built once per process OFF the main thread. On a cold Metal
+/// shader cache (a first install, which is exactly when onboarding runs) the
+/// compile takes ~160 ms on an M1, and building it lazily in the intro's first
+/// body froze the opening frame.
+@MainActor @Observable
+final class SquelchScene {
+    static let shared = SquelchScene()
+
+    private(set) var renderer: SquelchRenderer?
+    /// No usable Metal device, or the shader failed to build: callers fall
+    /// back to the static intro.
+    private(set) var isUnavailable = false
+    @ObservationIgnored private var warming = false
+
+    /// Idempotent. Safe to call as early as launch.
+    func warm() {
+        guard !warming else { return }
+        warming = true
+        Task.detached(priority: .userInitiated) {
+            let built = SquelchRenderer()
+            await MainActor.run {
+                self.renderer = built
+                self.isUnavailable = built == nil
+            }
+        }
+    }
+}
+
 struct SquelchSceneView: View {
     /// Whether the squelch is closed: noise stops at the gate, passband leaves.
     let engaged: Bool
 
+    /// The shader's top backdrop stop, night and paper. Shown until the
+    /// renderer is ready, and the color scrims over the scene blend into.
+    nonisolated static let backdrop = Color(light: 0xEDF3FA, dark: 0x090D16)
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.colorScheme) private var colorScheme
-
-    /// Compiled lazily on first ask. nil means no usable Metal device (or the
-    /// shader failed to build), and callers fall back to the static intro.
-    @MainActor static let renderer: SquelchRenderer? = SquelchRenderer()
+    private var scene: SquelchScene { .shared }
 
     var body: some View {
-        if let renderer = Self.renderer {
-            SquelchLayerRepresentable(
-                renderer: renderer,
-                inputs: .init(engaged: engaged, light: colorScheme == .light, reduceMotion: reduceMotion))
-                .accessibilityElement()
-                .accessibilityLabel(engaged
-                    ? "Radio noise stops at a glowing gate. Only a narrow band of clear signal passes through."
-                    : "A wide field of radio noise pours through a dormant gate.")
-                .accessibilityAddTraits(.isImage)
+        ZStack {
+            Self.backdrop
+            if let renderer = scene.renderer {
+                SquelchLayerRepresentable(
+                    renderer: renderer,
+                    inputs: .init(engaged: engaged, light: colorScheme == .light, reduceMotion: reduceMotion))
+            }
         }
+        .onAppear { scene.warm() }
+        .accessibilityElement()
+        .accessibilityLabel(engaged
+            ? "Radio noise stops at a glowing gate. Only a narrow band of clear signal passes through."
+            : "A wide field of radio noise pours through a dormant gate.")
+        .accessibilityAddTraits(.isImage)
     }
 }
 
@@ -62,6 +95,8 @@ final class SquelchDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Send
     private var link: CAMetalDisplayLink?
     // Main thread only.
     private var runLoop: CFRunLoop?
+    /// Signalled when the current render thread's run loop has returned.
+    private var exited: DispatchSemaphore?
 
     init(renderer: SquelchRenderer, inputs initial: SquelchInputs) {
         self.renderer = renderer
@@ -81,11 +116,24 @@ final class SquelchDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Send
         if changed { onRenderThread { $0.link?.isPaused = false } }
     }
 
+    /// Main thread. The drawable changed size: a paused (Reduce Motion) scene
+    /// must draw its settled frame again or it shows the old one stretched.
+    func redraw() {
+        inputs.withLock { $0.generation += 1 }
+        onRenderThread { $0.link?.isPaused = false }
+    }
+
     /// Main thread.
     func start(layer: CAMetalLayer) {
         guard runLoop == nil else { return }
+        // One render thread at a time. A stop queues its teardown on the old
+        // run loop; without this wait a quick restart (the view re-parented)
+        // could run two threads over the same state, or the old teardown
+        // could invalidate the NEW link. The old loop exits within a frame.
+        exited?.wait()
         var loop: CFRunLoop?
         let ready = DispatchSemaphore(value: 0)
+        let done = DispatchSemaphore(value: 0)
         let thread = Thread { [self] in
             let link = CAMetalDisplayLink(metalLayer: layer)
             link.delegate = self
@@ -96,12 +144,14 @@ final class SquelchDriver: NSObject, CAMetalDisplayLinkDelegate, @unchecked Send
             loop = CFRunLoopGetCurrent()
             ready.signal()
             CFRunLoopRun()  // until stop() invalidates the link and stops the loop
+            done.signal()
         }
         thread.name = "passband.squelch-render"
         thread.qualityOfService = .userInteractive
         thread.start()
         ready.wait()
         runLoop = loop
+        exited = done
     }
 
     /// Main thread.
@@ -174,11 +224,20 @@ final class SquelchLayerView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
 
+    private var closeObserver: NSObjectProtocol?
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window != nil {
+        if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+        closeObserver = nil
+        if let window {
             resize()
             driver.start(layer: metalLayer)
+            // A closing window does not always take its views out first, and
+            // a live display link would keep the render thread going for good.
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [driver] _ in MainActor.assumeIsolated { driver.stop() } }
         } else {
             driver.stop()
         }
@@ -198,7 +257,10 @@ final class SquelchLayerView: NSView {
         let scale = window?.backingScaleFactor ?? 2
         metalLayer.contentsScale = scale
         let size = CGSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1))
-        if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
+        if metalLayer.drawableSize != size {
+            metalLayer.drawableSize = size
+            driver.redraw()
+        }
     }
 }
 
@@ -252,7 +314,10 @@ final class SquelchLayerView: UIView {
         let scale = window?.screen.scale ?? traitCollection.displayScale
         metalLayer.contentsScale = scale
         let size = CGSize(width: max(bounds.width * scale, 1), height: max(bounds.height * scale, 1))
-        if metalLayer.drawableSize != size { metalLayer.drawableSize = size }
+        if metalLayer.drawableSize != size {
+            metalLayer.drawableSize = size
+            driver.redraw()
+        }
     }
 }
 
