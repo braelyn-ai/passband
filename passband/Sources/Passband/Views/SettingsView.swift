@@ -1253,6 +1253,10 @@ struct AccountSection: View {
 /// that is not on screen. Make it active first.
 struct CredentialsEditor: View {
     @Environment(AppStore.self) private var store
+    /// Closes the editor. Called only after a pending edit has been saved: the
+    /// fields save on blur, and a Done that unmounted them first would drop
+    /// whatever was still being typed.
+    let onDone: () -> Void
     @State private var url = ""
     @State private var token = ""
     @State private var editingToken = false
@@ -1290,6 +1294,15 @@ struct CredentialsEditor: View {
                     .buttonStyle(.glassProminent)
                     .tint(Palette.accent)
                     .disabled(busy || url.trimmed.isEmpty || token.trimmed.isEmpty)
+                Button("Done") {
+                    Task {
+                        await commitIfChanged()
+                        if case .err = result { return }
+                        onDone()
+                    }
+                }
+                .buttonStyle(.glass)
+                .disabled(busy)
                 switch result {
                 case .ok:
                     StatusDot(color: Palette.positive, label: "connected · saved")
@@ -1368,13 +1381,24 @@ struct AccountRow: View {
         VStack(alignment: .leading, spacing: 10) {
             layout
             if editingCredentials && isActive {
-                CredentialsEditor()
+                CredentialsEditor { editingCredentials = false }
                     .padding(.bottom, 6)
             }
         }
             // Seeded per account id, so a removal that re-uses this row's slot in
             // the list cannot leave the previous account's name in the field.
             .task(id: account.id) { label = account.label }
+            // A row that stops being the live one closes its fields: they edit
+            // the live account, and would reopen on the way back otherwise.
+            .onChange(of: isActive) { _, now in
+                if !now { editingCredentials = false }
+            }
+            // A rejected token lands here with the fields already open.
+            .onChange(of: store.credentialsRequested, initial: true) { _, requested in
+                guard requested, isActive else { return }
+                editingCredentials = true
+                store.credentialsRequested = false
+            }
             .onChange(of: labelFocused) { _, nowFocused in
                 guard !nowFocused else { return }
                 AccountManager.shared.rename(account.id, to: label.trimmed)
@@ -1465,10 +1489,11 @@ struct AccountRow: View {
 
     @ViewBuilder private var verbs: some View {
         if isActive {
-            Button(editingCredentials ? "done" : "credentials") {
-                editingCredentials.toggle()
+            // Opens only. Closing is the editor's own Done, which saves first.
+            if !editingCredentials {
+                Button("credentials") { editingCredentials = true }
+                    .buttonStyle(.textAction)
             }
-            .buttonStyle(.textAction)
         } else {
             Button("make active") {
                 Task { await AccountManager.shared.switchTo(account.id) }

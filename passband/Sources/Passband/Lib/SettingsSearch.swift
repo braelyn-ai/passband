@@ -339,6 +339,7 @@ enum SettingsSearch {
             blurb: "The bearer token that proves this app may talk to your daemon.",
             keywords: [
                 "api token", "token", "auth", "authentication", "bearer", "credential",
+                "credentials", "token rejected",
                 "secret", "password", "login", "sign in", "keychain", "squelch_api_token",
                 "unauthorized", "401",
             ]),

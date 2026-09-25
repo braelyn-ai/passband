@@ -72,6 +72,8 @@ struct SettingsSearchTests {
         first("bring your own key", is: .assistant)
         first("greeting", is: .you)
         first("8848", is: .account)
+        // The verb on the live account's row, typed back at the search.
+        first("credentials", is: .account)
     }
 
     /// Two ordinary words that name one specific thing. Both halves match half
