@@ -17,7 +17,7 @@
 // entered by tapping a person.
 //
 // The panes here hold THE SAME STRUCTS the Mac's Views/SettingsView.swift lays
-// out: ConnectionSection, SignatureSection, TriageBudgetSection and the rest are
+// out: AppearanceSection, SignatureSection, AccountSection and the rest are
 // one declaration each, composed by whichever shell is on screen. That is the
 // whole design. A settings screen is the surface most likely to be reimplemented
 // "just for the phone", and the moment it is, the two copies start disagreeing
@@ -46,7 +46,7 @@ struct AccountPage: View {
     /// beside the pane is a map, and a map you can read at a glance has no
     /// reason to lead with anything.
     private static let order: [SettingsSection] = [
-        .account, .general, .mail, .triage, .assistant, .agents, .privacy, .audit,
+        .account, .general, .mail, .assistant, .agents, .privacy, .audit,
     ]
 
     private var accounts: [AccountRecord] { AccountManager.shared.accounts }
@@ -210,26 +210,21 @@ struct AccountPage: View {
             VStack(alignment: .leading, spacing: 16) {
                 switch section {
                 case .general:
-                    ConnectionSection()
+                    YouSection()
                     AppearanceSection()
                     NotificationsSection()
-                    // NO TourSection, and NO WhatsNewSection, for the same
-                    // reason: both render through the desktop's ActionLayer,
-                    // which has no iOS host yet. Either button would set state
-                    // (`tour.active`, `whatsNew.notes`) that no surface here is
-                    // able to show or dismiss. The phone's what's-new is the
-                    // App Store's release notes until that host exists.
+                    // NO HelpSection: both of its buttons render through the
+                    // desktop's ActionLayer, which has no iOS host yet. Either
+                    // would set state (`tour.active`, `whatsNew.notes`) that no
+                    // surface here is able to show or dismiss. The phone's
+                    // what's-new is the App Store's release notes until that
+                    // host exists.
                     DeveloperSection()
-                    YouSection()
                 case .mail:
                     MailSection()
                     SearchSection()
                     SignatureSection()
                     ReadTrackingSection()
-                case .triage:
-                    TriagePipelineSection()
-                    TriageBudgetSection()
-                    RankingSection()
                 case .assistant:
                     AssistantSection()
                 case .agents:
@@ -258,7 +253,6 @@ struct AccountPage: View {
         switch section {
         case .general: "gearshape"
         case .mail: "envelope"
-        case .triage: "arrow.triangle.branch"
         case .assistant: "sparkles"
         case .agents: "point.3.connected.trianglepath.dotted"
         case .privacy: "hand.raised"
@@ -269,9 +263,8 @@ struct AccountPage: View {
 
     private func blurb(_ section: SettingsSection) -> String {
         switch section {
-        case .general: "connection, theme, chime, your name"
+        case .general: "your name, theme, chime"
         case .mail: "images, search order, signature, read tracking"
-        case .triage: "how it works, daily caps, ranking"
         case .assistant: "your own api key, and which model"
         case .agents: "connect OpenClaw, Claude Code and others"
         case .privacy: "what telemetry leaves the app"

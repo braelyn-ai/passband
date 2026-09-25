@@ -42,12 +42,12 @@ struct AgentsSection: View {
 
     private var doorCard: some View {
         SectionCard(label: "Connect an agent") {
-            SettingsHint(
-                "Point an agent you already run at your mailbox. It reads what Passband has triaged, over MCP, and it never holds your Gmail sign-in."
-            )
             if let endpoint {
-                InlineRow(key: "endpoint", alignment: .top) {
-                    VStack(alignment: .leading, spacing: 7) {
+                SettingsRow(
+                    title: "Endpoint",
+                    detail: "Point an agent you already run here. It reads what Passband has triaged, over MCP, and never holds your Gmail sign-in."
+                ) {
+                    VStack(alignment: .trailing, spacing: 7) {
                         HStack(spacing: 8) {
                             Text(endpoint)
                                 .font(Typo.mono(12))
@@ -72,7 +72,7 @@ struct AgentsSection: View {
                 }
                 statusExplanation(endpoint)
             } else {
-                SettingsHint("Connect to a server under General first. The agent door lives on the same one.")
+                SettingsHint("Add an account under Account first. The agent door lives on the same server.")
             }
         }
     }

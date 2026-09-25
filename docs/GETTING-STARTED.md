@@ -227,7 +227,9 @@ cd passband
 ./build.sh release      # or ./build.sh run to build and launch
 ```
 
-Then in the app, open **Settings** and go to **Connection**:
+Then launch the app and connect on its first screen, or, for an account that
+is already set up, open **Settings**, go to **Account**, and press
+**credentials** on the live account's row:
 
 - **server url**: `http://<nas-ip>:8848`, or your tailnet HTTPS URL if you went
   that route. No trailing slash, and include the port.

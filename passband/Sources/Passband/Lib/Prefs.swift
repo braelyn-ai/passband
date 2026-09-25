@@ -517,8 +517,8 @@ enum AssistantModel: String, CaseIterable, Sendable {
 
     var label: String {
         switch self {
-        case .haiku: "Haiku 4.5 — fast & cheap (recommended)"
-        case .opus: "Opus 5 — smartest, pricier"
+        case .haiku: "Haiku 4.5: fast and cheap (recommended)"
+        case .opus: "Opus 5: smartest, pricier"
         }
     }
 
