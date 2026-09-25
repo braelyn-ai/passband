@@ -110,6 +110,38 @@ enum ReleaseNotes {
     /// THE TABLE. Newest first, and the only place a release note is written.
     static let all: [ReleaseNote] = [
         ReleaseNote(
+            version: "0.0.8",
+            date: "2026-09-25",
+            headline: "Biggest update by far. Now we're a real product?",
+            items: [
+                ReleaseItem(.app, "Rebuilt onboarding"),
+                ReleaseItem(.app, "Attach files to emails"),
+                ReleaseItem(.app, "Undo send for 5s"),
+                ReleaseItem(.app, "New email composer"),
+                ReleaseItem(.app, "Completely overhauled search functionality"),
+                ReleaseItem(.app, "Automatic agentic search"),
+                ReleaseItem(.app, "\"Newsletters\" is now named \"Reading\""),
+                ReleaseItem(.app, "Better reading experience"),
+                ReleaseItem(.app, "New compose and search buttons"),
+                ReleaseItem(.app, "Better package tracking"),
+                ReleaseItem(.app, "Zoom with Cmd+, Cmd- and Cmd-0"),
+                ReleaseItem(.app, "Audit log is moved to settings"),
+                ReleaseItem(.daemon, "Rebuilt triage from the ground up"),
+                ReleaseItem(.daemon, "Instant notifications for important emails only"),
+                ReleaseItem(.daemon, "For Your Eyes is ranked with importance AND recency"),
+                ReleaseItem(.daemon, "Shipments record the item name, merchant and order numbers"),
+                ReleaseItem(
+                    .daemon,
+                    "Login-code emails produce \"Your <service> login code is <code>\" pushes when "
+                        + "the code appears verbatim in the email"),
+                ReleaseItem(
+                    .daemon,
+                    "get_inbox_updates and get_thread include the sender's standing instruction "
+                        + "(your sender rule's text) with the mail it applies to"),
+                ReleaseItem(
+                    .daemon, "Plus substantial performance improvements and plenty of bug fixes!"),
+            ]),
+        ReleaseNote(
             version: "0.0.7",
             date: "2026-09-08",
             headline: "Deeper search, gmail spam, and 2FA codes the moment they land.",
