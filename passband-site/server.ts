@@ -30,6 +30,9 @@ const pages: Record<string, string> = {
   "/mark.png": "mark.png",
   "/icon-180.png": "icon-180.png",
   "/icon-512.png": "icon-512.png",
+  // The link-unfurl card, rendered by brand/og/build.sh. Crawlers do not run
+  // the bundle, so every page names it in static meta tags.
+  "/og.png": "og.png",
   // Newsreader, subset to Latin from the same TTF the Swift client bundles.
   "/newsreader-var.woff2": "newsreader-var.woff2",
   // The OAuth "application home page" Google verification is filed against:
