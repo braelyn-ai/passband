@@ -134,6 +134,8 @@ struct SettingsView: View {
             ReadTrackingSection()
         case .assistant:
             AssistantSection()
+        case .agents:
+            AgentsSection()
         case .privacy:
             PrivacySection()
         case .audit:
@@ -315,6 +317,7 @@ struct SettingsCardView: View {
         case .signature: SignatureSection()
         case .readTracking: ReadTrackingSection()
         case .assistant: AssistantSection()
+        case .agents: AgentsSection()
         case .privacy: PrivacySection()
         // The ledger, drawn as a card like everything else — searching for
         // "who archived this" lands you on the live log, not a link to it.
