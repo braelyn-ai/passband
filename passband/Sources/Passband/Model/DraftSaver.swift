@@ -133,13 +133,30 @@ final class DraftSaver {
         for (_, task) in inflight { await task.value }
     }
 
-    /// The send SUCCEEDED, which already deleted this draft server-side. Drop the
-    /// timer and the pending flush with it: the composer closes next, and a flush
-    /// there would faithfully re-create the draft for mail that has gone out.
+    /// The composer's mail has been handed to the send hold
+    /// (`AppStore.sendWithUndo`), whose send will delete this draft
+    /// server-side. Drop the timer and the pending flush with it: the slot
+    /// empties next, and a flush there would faithfully re-create the draft for
+    /// mail that is on its way out.
     func noteSent(_ slot: Slot) {
         pending[slot]?.cancel()
         pending[slot] = nil
         touched.remove(slot)
+    }
+
+    /// Save a composer that no longer sits in any slot: a held send being
+    /// PARKED as a draft because it cannot go out (an account switch during its
+    /// hold, or nowhere left to reopen it). No touched test, because the
+    /// sender pressed send on it, which is as composed as mail gets. Tracked
+    /// with the flushes, so `settle` waits for it. A forward still is not
+    /// saved; see `save`.
+    func saveDetached(_ slot: Slot, _ state: ComposeState) {
+        let ticket = nextFlush
+        nextFlush &+= 1
+        flushes[ticket] = Task { [weak self] in
+            await self?.write(slot, state)
+            self?.flushes[ticket] = nil
+        }
     }
 
     // MARK: - the write
@@ -237,14 +254,26 @@ final class DraftSaver {
     /// the same message — so a stale flush's id could stamp onto a SUCCESSOR
     /// composer, whose send would then carry it and DELETE a draft holding mail
     /// that never went out. The UUID tells every composer from every other.
+    ///
+    /// ONE OTHER PLACE THE COMPOSER CAN BE: in the send hold, off every slot.
+    /// A save that was on the wire when send was pressed lands after the slot
+    /// emptied, and its id is exactly the one the held send must carry, or
+    /// the daemon keeps the draft of mail that went out. So a miss is handed
+    /// to the store, which matches it by the same identity.
     private func adopt(_ id: Int?, slot: Slot, key: UUID) {
         switch slot {
         case .compose:
-            guard var next = store.compose, next.id == key else { return }
+            guard var next = store.compose, next.id == key else {
+                store.noteDetachedDraft(id, composer: key)
+                return
+            }
             next.draftId = id
             store.compose = next
         case .inlineReply:
-            guard var next = store.inlineReply, next.id == key else { return }
+            guard var next = store.inlineReply, next.id == key else {
+                store.noteDetachedDraft(id, composer: key)
+                return
+            }
             next.draftId = id
             store.inlineReply = next
         }

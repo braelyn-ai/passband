@@ -83,6 +83,11 @@ struct RecipientField<F: Hashable>: View {
     /// the cc/bcc toggles there, so they sit on the line that names the field
     /// they unfold rather than floating loose above the stack.
     var accessory: AnyView?
+    /// Draw as a header LINE (label in a left column, no well of its own)
+    /// rather than a captioned well. The pane composer sets it: its fields sit
+    /// together on one card, the way a mail header does, instead of stacking up
+    /// as a form.
+    var inline = false
 
     /// Committed recipients — the pills.
     @State private var pills: [String] = []
@@ -103,23 +108,29 @@ struct RecipientField<F: Hashable>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 8) {
-                    FieldLabel(label)
-                    Spacer(minLength: 0)
-                    accessory
+            if inline {
+                InlineFieldRow(label: label, accessory: accessory) { pillRow }
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        FieldLabel(label)
+                        Spacer(minLength: 0)
+                        accessory
+                    }
+                    pillRow.fieldWell()
                 }
-                pillRow.fieldWell()
             }
 
             // The verbs for the pill under the caret. Only with one selected, so
             // an ordinary addressing pass never sees them.
             if let moves, let selectedPill, let addr = pills[safe: selectedPill] {
                 moveBar(addr, moves)
+                    .modifier(InlineFieldTuck(active: inline))
             }
 
             if suggestionCount > 0 {
                 suggestions
+                    .modifier(InlineFieldTuck(active: inline))
             }
         }
         .keyBindings(.modal, fieldBindings)
@@ -158,7 +169,10 @@ struct RecipientField<F: Hashable>: View {
             TextField(pills.isEmpty ? placeholder : "", text: $fragment)
                 .textFieldStyle(.plain)
                 .focused(focus, equals: field)
-                .frame(minWidth: 120)
+                // Narrower on a header line: the line shares its width with
+                // the groups/cc/bcc accessory, and at 120 the caret dropped to
+                // a line of its own beside plenty of room.
+                .frame(minWidth: inline ? 72 : 120)
                 // Commit-on-separator runs off onChange, not a custom Binding
                 // setter: handing a method reference into Binding(get:set:)
                 // trips an IRGen crash in Swift 6.3 (isolation thunk), and this
@@ -680,6 +694,12 @@ struct RecipientFields<F: Hashable>: View {
     var suggestGroups = false
     var onGroupPicked: ((SendGroup) -> Void)?
     var resolvedGroup: (name: String, count: Int)?
+    /// Header lines on a shared card instead of stacked wells. See
+    /// `RecipientField.inline`.
+    var inline = false
+    /// Something the caller hangs on the `to` line ahead of cc/bcc — the pane
+    /// composer's group picker.
+    var toAccessory: AnyView?
 
     /// Which optional fields the sender has unfolded this session.
     @State private var revealed: Set<RecipientSlot> = []
@@ -693,8 +713,11 @@ struct RecipientFields<F: Hashable>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: inline ? 0 : 8) {
             ForEach(RecipientSlot.allCases.filter(shown), id: \.self) { slot in
+                // On a card the lines are ruled apart; stacked wells have
+                // their own edges.
+                if inline && slot != .to { Hairline() }
                 RecipientField(
                     text: binding(slot), focus: focus, field: field(slot),
                     label: slot.label,
@@ -722,7 +745,8 @@ struct RecipientFields<F: Hashable>: View {
                             focus.wrappedValue = field(slot)
                         },
                         addressed: { recipients.slot(of: $0) != nil }),
-                    accessory: slot == .to ? AnyView(toggles) : nil)
+                    accessory: slot == .to ? AnyView(toggles) : nil,
+                    inline: inline)
             }
         }
     }
@@ -748,6 +772,7 @@ struct RecipientFields<F: Hashable>: View {
     /// is up, so the row doubles as a statement of what this message carries.
     private var toggles: some View {
         HStack(spacing: 8) {
+            toAccessory
             ForEach(Self.optional, id: \.self) { slot in
                 Button(slot.label) { toggle(slot) }
                     .buttonStyle(.plain)
@@ -775,4 +800,61 @@ struct RecipientFields<F: Hashable>: View {
             focus.wrappedValue = field(slot)
         }
     }
+}
+
+// MARK: - header lines
+
+/// One line of a mail header: the label in a fixed left column, the value
+/// beside it, an optional accessory on the right. What the pane composer's
+/// `to`, `cc`, `bcc` and `subject` all are, so the four read as one block
+/// rather than four captioned boxes.
+struct InlineFieldRow<Content: View>: View {
+    let label: String
+    var accessory: AnyView?
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            FieldLabel(label)
+                .frame(width: InlineFieldMetrics.label, alignment: .leading)
+                .padding(.top, InlineFieldMetrics.labelDrop)
+            content
+                .font(.system(size: 13))
+                .foregroundStyle(Palette.ink)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let accessory {
+                accessory
+                    .padding(.top, InlineFieldMetrics.labelDrop)
+                    .padding(.leading, 8)
+            }
+        }
+        .padding(.horizontal, InlineFieldMetrics.inset)
+        .padding(.vertical, 9)
+    }
+}
+
+/// What hangs under a header line (the move bar, the suggestion list) starts in
+/// the VALUE column, under what it is about, not under the label.
+struct InlineFieldTuck: ViewModifier {
+    let active: Bool
+
+    func body(content: Content) -> some View {
+        if active {
+            content
+                .padding(.leading, InlineFieldMetrics.inset + InlineFieldMetrics.label)
+                .padding(.trailing, InlineFieldMetrics.inset)
+                .padding(.bottom, 8)
+        } else {
+            content
+        }
+    }
+}
+
+enum InlineFieldMetrics {
+    /// The card's side inset. The body editor lines its text up on the same
+    /// edge.
+    static let inset: CGFloat = 12
+    static let label: CGFloat = 58
+    /// Drops the micro label onto the 13pt value's text line.
+    static let labelDrop: CGFloat = 3
 }
