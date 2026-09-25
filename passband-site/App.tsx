@@ -7,10 +7,11 @@ import {
   type MouseEvent,
   type PointerEvent,
 } from "react";
+import { CARRIERS, createScope, markerPoint, type ScopeLayout } from "./scope";
 
-// The background is a procedurally repeated fake inbox: the drudgery Passband
-// exists to kill, blurred into wallpaper so the pitch sits on top of it.
-// Snippets are written long so rows run the full viewport width.
+// The "before" panel is a procedurally repeated fake inbox: the drudgery
+// Passband exists to kill. Snippets are written long so rows run the full
+// width of the panel.
 const FAKE_EMAILS: Array<[sender: string, subject: string, snippet: string]> = [
   ["LinkedIn", "You appeared in 9 searches this week", "See who's looking for someone like you. Recruiters from companies you've never heard of are searching for profiles matching yours..."],
   ["Medium Daily Digest", "Stories for you", "10 Habits of Highly Effective Engineers | 12 min read. Why I Quit My Job to Farm Mushrooms | 8 min read. The Death of the..."],
@@ -33,180 +34,362 @@ const FAKE_EMAILS: Array<[sender: string, subject: string, snippet: string]> = [
   ["The Team", "We've updated our Privacy Policy", "We're writing to let you know about some updates to our Privacy Policy and Terms of Service, effective in 30 days..."],
   ["Slack", "You have unread messages in #general", "While you were away, 312 messages were posted in channels you follow, including a heated thread about the office..."],
 ];
+// The same inbox's mail that mattered, buried in the scroll exactly as it would
+// be. These are the rows the "after" panel pulls forward, so the two panels are
+// honestly one mailbox before and after, not two different ones.
+const BURIED: Array<[sender: string, subject: string, snippet: string]> = [
+  ["Jamie Chen", "A quick decision before Friday", "Hey! Two options for the offsite venue, I need your pick by Friday so we can hold the date..."],
+  ["Parkline Properties", "Lease renewal: signature needed", "Your renewal packet is ready. Please review and sign by September 23 to lock in your current rate..."],
+  ["UPS", "Your package is out for delivery", "Keychron Q1 Max. Scheduled delivery: today by 8:00 PM. Track your package for live updates..."],
+  ["Dr. Ortiz's Office", "Please confirm Thursday's appointment", "Reply C to confirm your appointment on Thursday at 2:30 PM, or call us to reschedule..."],
+];
 
-const styles = {
-  page: {
-    position: "relative",
-    minHeight: "100vh",
-    margin: 0,
-    fontFamily: "system-ui, sans-serif",
-    overflow: "hidden",
-    background: "#0f0f10",
-  },
-  inbox: {
-    position: "absolute",
-    // Oversized so the blur doesn't leave washed-out edges at the viewport.
-    inset: "-1.5rem",
-    background: "#0f0f10",
-    overflow: "hidden",
-    zIndex: 0,
-    filter: "blur(4px)",
-  },
-  row: {
-    display: "flex",
-    alignItems: "center",
-    gap: "1rem",
-    padding: "0.65rem 1.25rem",
-    borderBottom: "1px solid #1f1f22",
-    whiteSpace: "nowrap",
-  },
-  sender: {
-    width: "13rem",
-    flexShrink: 0,
-    fontWeight: 600,
-    fontSize: "0.85rem",
-    color: "#d6d6d9",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  },
-  subject: {
-    fontSize: "0.85rem",
-    color: "#c2c2c6",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    flexShrink: 0,
-  },
-  snippet: {
-    fontSize: "0.85rem",
-    color: "#6b6b70",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    flex: 1,
-  },
-  time: {
-    fontSize: "0.75rem",
-    color: "#6b6b70",
-    flexShrink: 0,
-  },
-  frost: {
-    position: "absolute",
-    inset: 0,
-    background: "rgba(10, 10, 12, 0.62)",
-    zIndex: 1,
-  },
-  content: {
-    position: "relative",
-    zIndex: 2,
-    minHeight: "100vh",
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: "1rem",
-  },
-  // The brand's one serif moment, rationed exactly as Typo does it in the
-  // Swift client: Newsreader for the wordmark and nowhere else. Spread
-  // further, a display serif becomes wallpaper. Weight 500 matches
-  // Typo.hero's .medium; the font's opsz axis does the rest on its own.
-  title: {
-    fontFamily: '"Newsreader", ui-serif, Georgia, serif',
-    fontSize: "3.4rem",
-    fontWeight: 500,
-    letterSpacing: "-0.005em",
-    margin: 0,
-    color: "#f5f5f7",
-  },
-  tagline: {
-    margin: 0,
-    color: "#b8b8bd",
-    fontSize: "1.1rem",
-    textAlign: "center",
-    padding: "0 1.5rem",
-  },
-  // The mark and the wordmark become a way home once the page is in its
-  // waitlist state, and stay inert text before that: a link to the page you
-  // are already on is not a link.
-  homeLink: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: "1rem",
-    textDecoration: "none",
-  },
-  // THE SLOT THE BOTTOM OF THE PAGE IS DRAWN INSIDE, and it has a height for
-  // one reason: `content` is a vertically CENTRED column, so the masthead's
-  // position is a function of whatever sits under it. The button and the
-  // one-slot rig happened to differ by 0.2px, which is the only reason "nothing
-  // above it moves" was ever true. The two-slot rig is 46px taller, and half of
-  // that came straight off the top: the mark, the wordmark and the tagline all
-  // lurched upward on every press of "join the waitlist", which is the exact
-  // flicker the pushState-instead-of-navigate architecture below exists to
-  // prevent. Reserving the tallest state's height makes them constants again.
-  //
-  // The whole composition sits a little higher than it did because of it. That
-  // is the cost, it is uniform across every state, and it is the cheaper half
-  // of the trade.
-  slot: {
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    // The tallest state is the rig with a refusal under it, not the rig on its
-    // own, and reserving for anything less means the page still lurches on the
-    // one press that already went wrong.
-    minHeight: "9rem",
-  },
-  // The one line that answers the press. Brighter than the detail under it and
-  // quieter than the tagline above it, which stays the page's loudest line in
-  // every state.
-  //
-  // BOUNDED LIKE THE LINE BENEATH IT now that it interpolates a name somebody
-  // typed. Unbounded it was fine at a fixed nineteen characters and ran off
-  // both edges of the screen the moment a person put an address in the name
-  // field, on a page whose `overflow: hidden` means you cannot scroll to it.
-  confirm: {
-    margin: "0.65rem 0 0",
-    maxWidth: "26rem",
-    overflowWrap: "anywhere",
-    color: "#f5f5f7",
-    fontSize: "1rem",
-    textAlign: "center",
-  },
-  status: {
-    margin: 0,
-    maxWidth: "26rem",
-    color: "#8a8a90",
-    fontSize: "0.9rem",
-    lineHeight: 1.5,
-    textAlign: "center",
-    padding: "0 1.5rem",
-  },
-  corner: {
-    position: "absolute",
-    bottom: "1.25rem",
-    zIndex: 2,
-    display: "flex",
-    gap: "1.25rem",
-  },
-  link: {
-    color: "#8a8a90",
-    fontSize: "0.9rem",
-    textDecoration: "none",
-  },
-} as const;
+// Every colour on the page, lifted from the Swift client's dark palette
+// (Design/Palette.swift) so the site and the app are one product. The page is
+// always night: the scene is the brand, and its glow version is the one worth
+// leading with.
+const PAGE_CSS = `
+:root {
+  --bg: #090D16;
+  --canvas: #0E141D;
+  --card: #121A26;
+  --ink: #E9EEF5;
+  --dim: #A8B4C4;
+  --faint: #808E9F;
+  --faintest: #62707F;
+  --hair: rgba(233, 238, 245, 0.08);
+  --hair-strong: rgba(233, 238, 245, 0.14);
+  --accent: #4E9BEA;
+  --accent-ink: #82BAF5;
+  --warn: #E8AC4C;
+  --positive: #4FC08A;
+  --danger: #FF7A68;
+  --serif: "Newsreader", ui-serif, Georgia, serif;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --gutter: clamp(1rem, 4vw, 2.75rem);
+}
+html { background: var(--bg); color-scheme: dark; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans);
+  -webkit-font-smoothing: antialiased; }
+.pb a { color: inherit; }
+
+/* THE STORY. A tall section with a sticky stage inside it: the scroll through
+   the section is the squelch closing, and the stage holds still while it
+   happens. The height is the length of the scrub. */
+.pb-story { position: relative; height: 260vh; }
+.pb-stage { position: sticky; top: 0; height: 100vh; height: 100svh; overflow: hidden; }
+.pb-scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+/* The analyzer's graticule: ten divisions across, eight down, faded out at the
+   edges so the screen has no hard border to sit inside. */
+.pb-grat { position: absolute; inset: 0; pointer-events: none;
+  background-image:
+    repeating-linear-gradient(90deg, rgba(130, 186, 245, 0.07) 0 1px, transparent 1px 10%),
+    repeating-linear-gradient(180deg, rgba(130, 186, 245, 0.07) 0 1px, transparent 1px 12.5%);
+  -webkit-mask-image: radial-gradient(ellipse 75% 70% at 62% 55%, #000 30%, transparent 85%);
+          mask-image: radial-gradient(ellipse 75% 70% at 62% 55%, #000 30%, transparent 85%); }
+/* Markers: numbered like an analyzer's, riding the carriers' peaks. They come
+   up only once the squelch has closed, which is when there is something to
+   point at. */
+.pb-mkr { position: absolute; z-index: 1; transform: translate(-50%, calc(-100% - 12px)); pointer-events: none;
+  font: 600 11px/1 ui-monospace, "SF Mono", Menlo, monospace; color: var(--accent-ink);
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  opacity: 0; transition: opacity 0.5s ease; }
+.pb-mkr::after { content: ""; border: 5px solid transparent; border-top: 6px solid var(--accent); border-bottom: 0; }
+.pb-stage[data-locked] .pb-mkr { opacity: 1; }
+.pb-mkr:nth-of-type(2) { transition-delay: 0.08s; } .pb-mkr:nth-of-type(3) { transition-delay: 0.16s; }
+.pb-mkrs { position: absolute; z-index: 2; right: var(--gutter); top: 17%; width: 19rem;
+  font: 500 12px/1.2 ui-monospace, "SF Mono", Menlo, monospace; color: var(--dim);
+  border: 1px solid rgba(130, 186, 245, 0.2); border-radius: 10px; background: rgba(9, 13, 22, 0.7);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  opacity: 0; transform: translateY(6px); transition: opacity 0.6s ease 0.2s, transform 0.6s ease 0.2s; }
+.pb-stage[data-locked] .pb-mkrs { opacity: 1; transform: none; }
+.pb-mkrs div { display: grid; grid-template-columns: 1.6rem 1fr auto; gap: 0.6rem; padding: 0.55rem 0.8rem;
+  border-top: 1px solid rgba(130, 186, 245, 0.1); }
+.pb-mkrs div:first-child { border-top: 0; font-size: 10px; letter-spacing: 0.1em; color: var(--faintest); }
+.pb-mkrs b { color: var(--accent-ink); font-weight: 600; }
+.pb-mkrs span:last-child { text-align: right; }
+.pb-mkrs .late { color: var(--danger); } .pb-mkrs .soon { color: var(--warn); }
+/* The readouts along the screen's foot. SQUELCH is live: it is the scroll. */
+.pb-read-l, .pb-read-r { position: absolute; z-index: 2; bottom: 1.4rem;
+  font: 500 11px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0.08em; color: var(--faintest); }
+.pb-read-l { left: var(--gutter); } .pb-read-r { right: var(--gutter); }
+.pb-read-r b { color: var(--accent-ink); font-weight: 600; display: inline-block; min-width: 4ch; text-align: right; }
+/* The scrim, the web twin of the intro's: the backdrop's own colour, so it
+   melts into the scene rather than tinting it. From the leading edge on wide
+   screens, from the top on narrow ones where the copy sits above the waves. */
+.pb-scrim { position: absolute; inset: 0; pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(9,13,22,0.95) 0%, rgba(9,13,22,0.82) 30%, rgba(9,13,22,0.4) 44%, rgba(9,13,22,0) 60%),
+    linear-gradient(180deg, rgba(9,13,22,0) 72%, rgba(9,13,22,0.85) 100%); }
+.pb-top { position: absolute; inset: 0 0 auto; display: flex; align-items: center;
+  justify-content: space-between; padding: 1.4rem var(--gutter); z-index: 2; }
+.pb-brand { display: flex; align-items: center; gap: 0.6rem; text-decoration: none; }
+.pb-brand img { width: 42px; height: auto; }
+.pb-brand span { font-family: var(--serif); font-size: 1.5rem; font-weight: 500; letter-spacing: -0.005em; }
+.pb-nav { display: flex; gap: 1.4rem; font-size: 0.9rem; }
+.pb-nav a, .pb-foot a { color: var(--faint); text-decoration: none; transition: color 0.2s; }
+.pb-nav a:hover, .pb-foot a:hover { color: var(--ink); }
+
+.pb-copy { position: absolute; z-index: 2; left: var(--gutter); top: 50%;
+  transform: translateY(-50%); width: min(30rem, calc(100% - 2 * var(--gutter)));
+  display: flex; flex-direction: column; gap: 1.6rem; }
+/* Both beats share one grid cell, so the cell is the taller beat's height and
+   the rig under it never moves as they trade places. */
+.pb-beats { display: grid; }
+.pb-beat { grid-area: 1 / 1; display: flex; flex-direction: column; gap: 1rem;
+  transition: opacity 0.7s ease, transform 0.7s cubic-bezier(0.2, 0.8, 0.2, 1); }
+.pb-beats[data-beat="0"] .pb-beat-1,
+.pb-beats[data-beat="1"] .pb-beat-0 { opacity: 0; transform: translateY(10px); pointer-events: none; }
+.pb-lede { margin: 0; font-family: var(--serif); font-size: clamp(1.55rem, 2.6vw, 2.1rem);
+  line-height: 1.15; color: var(--dim); }
+.pb-hero { margin: 0; font-family: var(--serif); font-weight: 500;
+  font-size: clamp(2.4rem, 4.6vw, 3.4rem); line-height: 1.02; letter-spacing: -0.012em; }
+.pb-sub { margin: 0; font-size: 1rem; line-height: 1.6; color: var(--dim); max-width: 27rem; }
+/* Reserves the open rig's height, so the vertically centred copy above never
+   moves when the button opens. The fine print rides under whichever control
+   is showing and the unused room sits below it, where it reads as margin. */
+.pb-slot { min-height: 8.2rem; display: flex; flex-direction: column; align-items: flex-start; gap: 0.65rem; }
+.pb-slot .pb-cta { margin-top: 0; }
+/* The rig arrives where the button was, rising out of the slot rather than
+   popping in, so the press reads as the button opening up. */
+.pb-slot .pb-rig { animation: pb-rig-in 0.45s cubic-bezier(0.2, 0.8, 0.2, 1); }
+@keyframes pb-rig-in { from { opacity: 0; transform: translateY(6px); } }
+.pb-fine { margin: 0; font-size: 0.8rem; color: var(--faintest); }
+.pb-copy .pb-rig { margin-top: 0; }
+.pb-confirm { margin: 0; color: var(--ink); font-size: 1rem; overflow-wrap: anywhere; }
+.pb-status { margin: 0; color: var(--faint); font-size: 0.9rem; line-height: 1.5; max-width: 26rem; }
+.pb-status-error { color: var(--danger); }
+.pb-cue { position: absolute; z-index: 2; left: 50%; bottom: 1.4rem; transform: translateX(-50%);
+  font-size: 0.72rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faintest);
+  transition: opacity 0.5s ease; display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
+.pb-cue::after { content: ""; width: 1px; height: 26px;
+  background: linear-gradient(var(--faintest), transparent); animation: pb-cue 2.2s ease-in-out infinite; }
+@keyframes pb-cue { 0%, 100% { transform: scaleY(0.4); transform-origin: top; } 50% { transform: scaleY(1); transform-origin: top; } }
+.pb-stage[data-scrolled] .pb-cue { opacity: 0; }
+
+/* PHONES: the words at the top, the scope in the middle, the waitlist at the
+   bottom under the thumb. The copy column stretches the stage's height and
+   splits: the beats hold the top, the slot the foot, and the scope draws in
+   the gap between them (scopeLayout measures it). The scrim darkens only
+   behind the words and the form, never the trace. */
+@media (max-width: 820px) {
+  .pb-scrim { background:
+    linear-gradient(180deg, rgba(9,13,22,0.92) 0%, rgba(9,13,22,0.55) 26%, rgba(9,13,22,0) 36%),
+    linear-gradient(180deg, rgba(9,13,22,0) 70%, rgba(9,13,22,0.85) 82%); }
+  .pb-copy { top: 5.2rem; bottom: 3rem; transform: none; gap: 1.25rem; justify-content: space-between; }
+  .pb-nav a:not(.pb-keep) { display: none; }
+  .pb-cue, .pb-mkrs, .pb-read-l { display: none; }
+}
+
+/* BEFORE / AFTER. */
+.pb-section { padding: clamp(4.5rem, 10vw, 8rem) var(--gutter); max-width: 84rem; margin: 0 auto; }
+.pb-h2 { margin: 0 0 0.9rem; font-family: var(--serif); font-weight: 500;
+  font-size: clamp(2rem, 3.8vw, 2.9rem); line-height: 1.05; letter-spacing: -0.01em; }
+.pb-h2 em { font-style: normal; color: var(--accent-ink); }
+.pb-intro { margin: 0 0 clamp(2rem, 5vw, 3.25rem); color: var(--dim); font-size: 1.05rem;
+  line-height: 1.6; max-width: 34rem; }
+.pb-pair { display: grid; grid-template-columns: minmax(0, 0.58fr) auto minmax(0, 1.42fr);
+  gap: clamp(0.75rem, 1.6vw, 1.25rem); align-items: stretch; }
+@media (max-width: 900px) { .pb-pair { grid-template-columns: minmax(0, 1fr); } }
+/* THE GATE between the two panels: a lit filament with the squelch sitting on
+   it, the same passband blue the scope's filter curve draws in. The before is
+   everything upstream of it and the after is what comes out, so the divider is
+   the product rather than a gap. Horizontal once the panels stack. */
+.pb-gate { position: relative; width: 3.25rem; display: grid; place-items: center;
+  margin-top: 2rem; /* level with the windows, below the captions */ }
+.pb-gate::before { content: ""; position: absolute; top: 0; bottom: 0; left: 50%; width: 1px;
+  background: linear-gradient(transparent, rgba(78, 155, 234, 0.75) 25%, rgba(78, 155, 234, 0.75) 75%, transparent);
+  box-shadow: 0 0 14px 1px rgba(78, 155, 234, 0.45); }
+.pb-gate span { position: relative; width: 2.6rem; height: 2.6rem; border-radius: 50%; display: grid;
+  place-items: center; color: var(--accent-ink); background: #0d1624;
+  box-shadow: inset 0 0 0 1px rgba(78, 155, 234, 0.55), 0 0 26px -2px rgba(78, 155, 234, 0.55); }
+.pb-gate svg { width: 1.05rem; height: 1.05rem; }
+@media (max-width: 900px) {
+  .pb-gate { width: auto; height: 3.25rem; margin: 0.25rem 0; }
+  .pb-gate::before { top: 50%; bottom: auto; left: 0; right: 0; width: auto; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(78, 155, 234, 0.75) 25%, rgba(78, 155, 234, 0.75) 75%, transparent); }
+  .pb-gate svg { transform: rotate(90deg); }
+}
+.pb-panel { margin: 0; display: flex; flex-direction: column; gap: 0.8rem; min-width: 0; }
+.pb-panel figcaption { display: flex; align-items: baseline; gap: 0.6rem; font-size: 0.82rem; color: var(--faint); }
+.pb-panel figcaption b { font-size: 0.7rem; letter-spacing: 0.14em; text-transform: uppercase;
+  font-weight: 600; color: var(--faintest); }
+.pb-panel figcaption b { font-size: 0.78rem; }
+.pb-after figcaption b { color: var(--accent); }
+.pb-after figcaption { color: var(--dim); }
+/* Before is drained: grey, dim, a world with no signal in it. Only its unread
+   count keeps its colour, which is the point of it. After is lit: edged in
+   passband blue with the glow of the gate it came through. */
+.pb-before .pb-window { filter: saturate(0.25) brightness(0.82); background: #0c1017; }
+.pb-after .pb-window { border-color: rgba(78, 155, 234, 0.45);
+  box-shadow: 0 0 0 1px rgba(78, 155, 234, 0.12), 0 0 60px -12px rgba(78, 155, 234, 0.35),
+    0 30px 80px -20px rgba(0, 0, 0, 0.7); }
+.pb-window { position: relative; flex: 1; border-radius: 14px; overflow: hidden; min-height: 30rem;
+  border: 1px solid var(--hair-strong); background: var(--canvas);
+  box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.04); }
+@media (max-width: 900px) { .pb-before .pb-window { min-height: 18rem; } }
+
+/* The doomscroll. Dimmed and faded at both ends: it is the "before", so it
+   should read as a texture you are drowning in, not as something to read. */
+.pb-inbox { position: absolute; inset: 0; overflow: hidden;
+  -webkit-mask-image: linear-gradient(transparent, #000 14%, #000 80%, transparent);
+          mask-image: linear-gradient(transparent, #000 14%, #000 80%, transparent); }
+.pb-row { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--hair); white-space: nowrap; font-size: 0.8rem; }
+.pb-row-sender { width: 7.5rem; flex-shrink: 0; font-weight: 600; color: #b9c2cd;
+  overflow: hidden; text-overflow: ellipsis; }
+.pb-row-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--faintest); }
+.pb-row-text span { color: #9aa5b3; }
+.pb-row-time { flex-shrink: 0; font-size: 0.7rem; color: var(--faintest); }
+.pb-unread { margin-left: auto; font-size: 0.72rem; font-weight: 600;
+  padding: 0.2rem 0.55rem; border-radius: 99px; color: #fff; background: #c7433a;
+  font-variant-numeric: tabular-nums; }
+
+/* THE AFTER: a fake screenshot of the sitrep, built in HTML rather than shipped
+   as a PNG so it stays sharp at every size and every word in it is real text.
+
+   Measured off the real app (the practice board, shot at 1440pt) and written
+   in the app's own POINTS: every "Npt" below is rewritten to a multiple of
+   --pt, which is the window's width over the width the mock is laid out at (1040pt, about the app's smallest window).
+   So the mock is the app at one fixed layout, scaled as a picture would be,
+   rather than a web page that reflows into something the app never draws.
+   Colours are sampled from the same shot. */
+.pb-after .pb-window { container-type: inline-size; min-height: 0; background: #262c35; }
+.pb-app { --pt: calc(100cqw / 1040); display: grid; grid-template-columns: 58pt minmax(0, 1fr);
+  grid-template-rows: 40pt auto; font-size: 12pt; color: var(--ink); line-height: 1.25; }
+.pb-app-bar { grid-column: 1 / -1; display: flex; align-items: center; gap: 14pt; padding: 0 18pt 0 16pt; }
+.pb-lights { display: flex; gap: 8pt; }
+.pb-lights i { width: 12pt; height: 12pt; border-radius: 50%; background: #ec6a5e; }
+.pb-lights i:nth-child(2) { background: #f4bf4f; } .pb-lights i:nth-child(3) { background: #61c554; }
+.pb-app-title { display: flex; align-items: baseline; gap: 8pt; margin-left: 12pt; }
+.pb-app-title b { font-family: var(--serif); font-weight: 500; font-size: 19pt; }
+.pb-app-title small { font-size: 10pt; font-weight: 500; letter-spacing: 0.06em; color: var(--faintest); }
+.pb-app-tools { margin-left: auto; display: flex; align-items: center; gap: 12pt; font-size: 10pt;
+  font-weight: 500; color: var(--faint); }
+.pb-app-tools svg { width: 10pt; height: 10pt; vertical-align: -1pt; margin-right: 3pt; }
+.pb-need { display: inline-flex; align-items: center; gap: 5pt; color: var(--danger); font-size: 11pt;
+  font-weight: 500; padding: 3pt 9pt; border-radius: 99pt; background: rgba(255, 122, 104, 0.14);
+  box-shadow: inset 0 0 0 0.75pt rgba(255, 122, 104, 0.45); }
+.pb-need::before { content: ""; width: 5pt; height: 5pt; border-radius: 50%; background: var(--danger); }
+.pb-side { background: #2c323f; border-right: 1px solid #363b48; border-top-right-radius: 10pt;
+  display: flex; flex-direction: column; align-items: center; gap: 13pt; padding: 12pt 0 16pt; }
+.pb-side span { width: 36pt; height: 30pt; display: grid; place-items: center; border-radius: 8pt; color: #9aa6b6; }
+.pb-side span.on { background: rgba(78, 155, 234, 0.2); color: var(--accent); }
+.pb-side svg { width: 18pt; height: 18pt; }
+.pb-side .pb-side-gap { flex: 1; }
+.pb-side .pb-me { width: 20pt; height: 20pt; border-radius: 50%; background: #24384F; color: #A9CBF0;
+  font-size: 10pt; font-weight: 600; }
+.pb-page { padding: 6pt 22pt 22pt 30pt; display: grid; grid-template-columns: minmax(0, 1fr) 252pt;
+  column-gap: 14pt; align-items: start; }
+.pb-dash-hero { grid-column: 1 / -1; margin-bottom: 16pt; }
+.pb-dash-hero small { display: block; font-size: 10pt; font-weight: 500; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--accent); margin-bottom: 2pt; }
+.pb-dash-hero b { font-family: var(--serif); font-weight: 500; font-size: 36pt; letter-spacing: -0.01em; line-height: 1.08; }
+.pb-col { display: flex; flex-direction: column; gap: 14pt; min-width: 0; }
+.pb-zone { border-radius: 16pt; padding: 12pt 12pt 10pt; background: #1f2c3a;
+  box-shadow: inset 0 0 0 0.75pt #2f4459; }
+.pb-zone-h { display: flex; align-items: center; gap: 7pt; padding: 0 4pt 7pt; font-size: 13pt; font-weight: 600; }
+.pb-zone-h svg { width: 14pt; height: 14pt; color: var(--zone, var(--accent)); flex: none; }
+.pb-zone-h em { font-style: normal; font-size: 10pt; font-weight: 500; color: var(--faint);
+  background: rgba(233, 238, 245, 0.08); border-radius: 99pt; padding: 1pt 6pt; }
+.pb-zone-h small { font-size: 10pt; font-weight: 500; color: var(--faintest); margin-left: 2pt; }
+.pb-eye { position: relative; display: flex; align-items: center; gap: 9pt; padding: 7pt 10pt; border-radius: 8pt;
+  white-space: nowrap; }
+.pb-eye.cursor { background: rgba(78, 155, 234, 0.1); }
+.pb-eye.overdue::before { content: ""; position: absolute; left: 0; top: 5pt; bottom: 5pt; width: 2pt;
+  border-radius: 1pt; background: var(--danger); }
+.pb-avatar { width: 22pt; height: 22pt; border-radius: 50%; flex: none; display: grid; place-items: center;
+  font-size: 9pt; font-weight: 600; }
+.pb-eye b { font-weight: 500; flex: none; }
+.pb-eye span.line { color: var(--dim); overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+.pb-chip { flex: none; font-size: 10pt; font-weight: 500; padding: 2.5pt 7pt; border-radius: 99pt; color: var(--c);
+  box-shadow: inset 0 0 0 0.75pt color-mix(in srgb, var(--c) 30%, transparent); }
+.pb-chip.filled { background: color-mix(in srgb, var(--c) 16%, transparent); }
+.pb-reading { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8pt; }
+.pb-read { display: flex; gap: 10pt; padding: 8pt; border-radius: 12pt; background: #283647; min-width: 0; }
+.pb-logo { width: 46pt; height: 46pt; border-radius: 8pt; flex: none; display: grid; place-items: center;
+  font-weight: 700; font-size: 17pt; }
+.pb-read-text { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3pt; }
+.pb-read-top { display: flex; justify-content: space-between; gap: 6pt; }
+.pb-read-top b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pb-read-top span { font-size: 10pt; color: var(--faintest); white-space: nowrap; }
+.pb-read p { margin: 0; font-size: 10.5pt; line-height: 1.3; color: var(--faint);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* The records rail: one TINTED card per zone, the zone's own hue washed into
+   its ground and its border, which is the single biggest thing that makes the
+   sitrep read as the sitrep. */
+.pb-rail { display: flex; flex-direction: column; gap: 12pt; min-width: 0; }
+.pb-rec { border-radius: 16pt; padding: 11pt 11pt 9pt; background: var(--bg-c); box-shadow: inset 0 0 0 0.75pt var(--edge); }
+.pb-rec .pb-zone-h { padding: 0 3pt 5pt; }
+.pb-rec-cal { --bg-c: #253341; --edge: #3b5673; --zone: var(--accent); }
+.pb-rec-ship { --bg-c: #35332d; --edge: #6a5a3e; --zone: var(--warn); }
+.pb-rec-bill { --bg-c: #2a3540; --edge: #3f566d; --zone: var(--accent); }
+.pb-rec-rcpt { --bg-c: #233635; --edge: #2f5a49; --zone: var(--positive); }
+.pb-rec-row { display: flex; justify-content: space-between; align-items: center; gap: 8pt; padding: 4.5pt 3pt;
+  font-size: 11.5pt; white-space: nowrap; }
+.pb-rec-row b { font-weight: 400; color: #cdd5df; overflow: hidden; text-overflow: ellipsis; }
+.pb-rec-row span { font-size: 10pt; color: var(--faintest); font-variant-numeric: tabular-nums; }
+.pb-rec-row .pb-chip { --c: var(--faint); }
+.pb-rec-rcpt .pb-rec-row span { font-size: 11.5pt; font-weight: 600; color: var(--positive); }
+.pb-ship { background: #3f3d38; border-radius: 10pt; padding: 7pt 8pt; margin-bottom: 6pt;
+  display: flex; flex-direction: column; gap: 6pt; }
+.pb-ship-top { display: flex; align-items: center; gap: 7pt; white-space: nowrap; }
+.pb-ship-top i { width: 14pt; height: 14pt; border-radius: 3pt; flex: none; background: #5a4631;
+  display: grid; place-items: center; font-style: normal; font-size: 8pt; font-weight: 700; color: #f4c47a; }
+.pb-ship-top b { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.pb-ship .pb-chip.eta { --c: var(--faint); align-self: flex-start; }
+
+/* No phone layout, on purpose: a phone gets the same window at the same
+   aspect ratio, just smaller. An accurate picture of the app beats a legible
+   one of a layout the app never draws. */
+
+/* THE TRUST ROW. Three facts, no icons: the claims are specific enough to
+   carry themselves, and an icon beside each is how a list becomes slop. */
+.pb-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(1.5rem, 4vw, 3.5rem);
+  border-top: 1px solid var(--hair); padding-top: clamp(2rem, 4vw, 3rem); }
+@media (max-width: 760px) { .pb-facts { grid-template-columns: minmax(0, 1fr); row-gap: 2rem; } }
+.pb-fact h3 { margin: 0 0 0.55rem; font-size: 0.98rem; font-weight: 600; }
+.pb-fact p { margin: 0; color: var(--dim); font-size: 0.93rem; line-height: 1.6; }
+.pb-fact a { color: var(--accent-ink); text-decoration: none; }
+.pb-fact a:hover { text-decoration: underline; }
+
+.pb-close { text-align: center; display: flex; flex-direction: column; align-items: center; gap: 1.4rem; }
+.pb-close .pb-h2 { margin: 0; }
+/* No meter behind this one, so no clearance for it under the label. */
+.pb-close .pb-cta { padding: 0.9rem 1.9rem; }
+.pb-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem;
+  padding: 1.75rem var(--gutter) 2.25rem; border-top: 1px solid var(--hair); font-size: 0.85rem; color: var(--faintest); }
+.pb-foot nav { display: flex; flex-wrap: wrap; gap: 1.25rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pb-beat, .pb-cue { transition-duration: 0.01ms; }
+  .pb-slot .pb-rig { animation: none; }
+  .pb-cue::after { animation: none; }
+}
+`;
+
+// The mock's "Npt" lengths are the app's points: rewritten to multiples of
+// --pt, which scales the whole mock with its window (see THE AFTER above).
+const PAGE_CSS_RESOLVED = PAGE_CSS.replace(
+  /(\d*\.?\d+)pt\b/g,
+  "calc($1 * var(--pt))",
+);
 
 function FakeInbox() {
   // One randomized batch of rows, rendered twice so the scroll can wrap
   // seamlessly: when the offset passes one copy's height it resets mod that
   // height and the second copy is pixel-identical to where the first began.
+  // The mail that mattered is dealt in every dozen rows or so, unmarked.
   const rows = useMemo(
     () =>
-      Array.from({ length: 60 }, () => {
+      Array.from({ length: 60 }, (_, i) => {
         const [sender, subject, snippet] =
-          FAKE_EMAILS[Math.floor(Math.random() * FAKE_EMAILS.length)];
+          i % 13 === 5
+            ? BURIED[Math.floor(i / 13) % BURIED.length]
+            : FAKE_EMAILS[Math.floor(Math.random() * FAKE_EMAILS.length)];
         const h = Math.floor(Math.random() * 12) + 1;
         const m = String(Math.floor(Math.random() * 60)).padStart(2, "0");
-        const ampm = Math.random() < 0.5 ? "AM" : "PM";
-        return { sender, subject, snippet, time: `${h}:${m} ${ampm}` };
+        return { sender, subject, snippet, time: `${h}:${m}` };
       }),
     [],
   );
@@ -214,25 +397,26 @@ function FakeInbox() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Fake doomscroll: a flick of random distance and speed, a random pause,
-  // repeat forever. rAF drives each flick; timeouts space them out.
+  // repeat forever. rAF drives each flick; timeouts space them out. It only
+  // runs while the panel is on screen.
   useEffect(() => {
     if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const el = scrollRef.current;
     if (!el) return;
     let offset = 0;
     let raf = 0;
-    let timer: ReturnType<typeof setTimeout>;
-    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let running = false;
     const easeOut = (t: number) => 1 - Math.pow(1 - t, 3);
 
     const flick = () => {
-      if (cancelled) return;
+      if (!running) return;
       const distance = 40 + Math.random() * 280;
       const duration = 800 + Math.random() * 1400;
       const from = offset;
       const start = performance.now();
       const frame = (now: number) => {
-        if (cancelled) return;
+        if (!running) return;
         const t = Math.min(1, (now - start) / duration);
         offset = from + distance * easeOut(t);
         const wrap = el.scrollHeight / 2 || 1;
@@ -243,23 +427,35 @@ function FakeInbox() {
       raf = requestAnimationFrame(frame);
     };
 
-    timer = setTimeout(flick, 600);
+    const io = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting && !running) {
+        running = true;
+        timer = setTimeout(flick, 300);
+      } else if (!entry.isIntersecting && running) {
+        running = false;
+        cancelAnimationFrame(raf);
+        clearTimeout(timer);
+      }
+    });
+    io.observe(el.parentElement!);
     return () => {
-      cancelled = true;
+      running = false;
+      io.disconnect();
       cancelAnimationFrame(raf);
       clearTimeout(timer);
     };
   }, []);
 
   return (
-    <div style={styles.inbox} aria-hidden="true">
+    <div className="pb-inbox" aria-hidden="true">
       <div ref={scrollRef} style={{ willChange: "transform" }}>
         {[...rows, ...rows].map(({ sender, subject, snippet, time }, i) => (
-          <div key={i} style={styles.row}>
-            <span style={styles.sender}>{sender}</span>
-            <span style={styles.subject}>{subject}</span>
-            <span style={styles.snippet}>{snippet}</span>
-            <span style={styles.time}>{time}</span>
+          <div key={i} className="pb-row">
+            <span className="pb-row-sender">{sender}</span>
+            <span className="pb-row-text">
+              <span>{subject}</span> {snippet}
+            </span>
+            <span className="pb-row-time">{time}</span>
           </div>
         ))}
       </div>
@@ -267,10 +463,9 @@ function FakeInbox() {
   );
 }
 
-// Brass and steel lifted off the app icon. Nothing else on the page carries a
-// hue, so this accent belongs to the button alone and reads as the one lit
-// instrument in a dark room.
-const BRASS = "240, 204, 128";
+// Passband blue, the app's own dark-mode accent (Palette.accent, 4E9BEA).
+// The rig is the one lit instrument on a page that is otherwise the scene.
+const ACCENT = "78, 155, 234";
 
 // The passband's half-width when the filter is fully open. Everything narrower
 // is this times the opening, which is what keeps the hump one shape instead of
@@ -297,9 +492,9 @@ const CTA_CSS = `
   letter-spacing: 0.015em;
   cursor: pointer;
   appearance: none;
-  color: #e9e2d4;
-  background: linear-gradient(180deg, #1e1e22, #131315);
-  border: 1px solid rgba(${BRASS}, 0.22);
+  color: #dfe8f3;
+  background: linear-gradient(180deg, #152032, #0c121c);
+  border: 1px solid rgba(${ACCENT}, 0.22);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.07),
     0 12px 30px rgba(0, 0, 0, 0.5);
@@ -311,17 +506,17 @@ const CTA_CSS = `
 }
 .pb-cta:hover,
 .pb-cta:focus-visible {
-  color: #fff6e4;
+  color: #f4f8fd;
   transform: translateY(-2px);
-  border-color: rgba(${BRASS}, 0.62);
+  border-color: rgba(${ACCENT}, 0.62);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.14),
-    0 0 34px -6px rgba(${BRASS}, 0.45),
+    0 0 34px -6px rgba(${ACCENT}, 0.45),
     0 16px 38px rgba(0, 0, 0, 0.55);
 }
 .pb-cta:active { transform: translateY(0) scale(0.995); }
 .pb-cta:focus-visible {
-  outline: 2px solid rgba(${BRASS}, 0.75);
+  outline: 2px solid rgba(${ACCENT}, 0.75);
   outline-offset: 3px;
 }
 /* Machined top edge: a filament that comes up with the rest of the hardware. */
@@ -332,7 +527,7 @@ const CTA_CSS = `
   height: 1px;
   z-index: 2;
   opacity: 0.45;
-  background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
+  background: linear-gradient(90deg, transparent, rgba(${ACCENT}, 0.8), transparent);
   transition: opacity 0.4s ease;
 }
 .pb-cta:hover::before,
@@ -356,10 +551,9 @@ const CTA_CSS = `
    hardware rather than a form on a card.
    The card that used to be here was a translucent rounded rectangle with a
    hairline white border, which is the single most templated component on the
-   web and belonged to no part of this page. This page has exactly one material
-   in it: the dark brushed ground of the button above, edged in the icon's
-   brass. So the waitlist is built out of THAT, with a slot cut in it for the
-   address. The rig owns the material and the enclosure; the button inside it
+   web and belonged to no part of this page. The page has exactly one material
+   for controls: a dark machined ground edged in passband blue. So the
+   waitlist is built out of THAT, with slots cut in it. The rig owns the material and the enclosure; the button inside it
    keeps only its meter and its label. */
 .pb-rig {
   position: relative;
@@ -375,8 +569,8 @@ const CTA_CSS = `
   margin-top: 0.65rem;
   border-radius: 0.9rem;
   overflow: hidden;
-  background: linear-gradient(180deg, #1e1e22, #131315);
-  border: 1px solid rgba(${BRASS}, 0.22);
+  background: linear-gradient(180deg, #152032, #0c121c);
+  border: 1px solid rgba(${ACCENT}, 0.22);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.07),
     0 12px 30px rgba(0, 0, 0, 0.5);
@@ -387,10 +581,10 @@ const CTA_CSS = `
    the half under the cursor would say the two are separate things. */
 .pb-rig:hover,
 .pb-rig:focus-within {
-  border-color: rgba(${BRASS}, 0.62);
+  border-color: rgba(${ACCENT}, 0.62);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.14),
-    0 0 34px -6px rgba(${BRASS}, 0.45),
+    0 0 34px -6px rgba(${ACCENT}, 0.45),
     0 16px 38px rgba(0, 0, 0, 0.55);
 }
 /* The same machined top edge the standalone button wears. */
@@ -401,7 +595,7 @@ const CTA_CSS = `
   height: 1px;
   z-index: 2;
   opacity: 0.45;
-  background: linear-gradient(90deg, transparent, rgba(${BRASS}, 0.8), transparent);
+  background: linear-gradient(90deg, transparent, rgba(${ACCENT}, 0.8), transparent);
   transition: opacity 0.4s ease;
 }
 .pb-rig:hover::before,
@@ -427,13 +621,13 @@ const CTA_CSS = `
   border: 0;
   outline: none;
   background: none;
-  color: #f5f5f7;
+  color: #E9EEF5;
   font-family: inherit;
   font-size: 0.95rem;
   line-height: 1.2;
 }
-.pb-rig-field::placeholder { color: #6b6b70; }
-.pb-rig-field:disabled { color: #a9a49a; }
+.pb-rig-field::placeholder { color: #62707F; }
+.pb-rig-field:disabled { color: #808E9F; }
 /* WHICH SLOT IS LIVE. The rig lights as one instrument on :focus-within,
    which said everything worth saying while there was one opening in it and
    nothing at all once there were two: tabbing between them changed no pixel
@@ -445,7 +639,7 @@ const CTA_CSS = `
    outline: none above is why this is a shadow: the outline is the affordance
    this design gave up, and an inset edge is the one that belongs on a slot cut
    into a face. */
-.pb-rig-field:focus { box-shadow: inset 2px 0 0 rgba(${BRASS}, 0.7); }
+.pb-rig-field:focus { box-shadow: inset 2px 0 0 rgba(${ACCENT}, 0.7); }
 /* Chrome recognises name beside email as an address profile and paints its
    own opaque ground into both slots, which on a rig whose whole premise is that
    the slots have no ground of their own is the one thing that breaks the
@@ -453,13 +647,13 @@ const CTA_CSS = `
 .pb-rig-field:-webkit-autofill,
 .pb-rig-field:-webkit-autofill:hover,
 .pb-rig-field:-webkit-autofill:focus {
-  -webkit-text-fill-color: #f5f5f7;
-  caret-color: #f5f5f7;
-  box-shadow: inset 0 0 0 100vw #17171a;
+  -webkit-text-fill-color: #E9EEF5;
+  caret-color: #E9EEF5;
+  box-shadow: inset 0 0 0 100vw #101826;
   transition: background-color 9999s;
 }
 .pb-rig-field:-webkit-autofill:focus {
-  box-shadow: inset 0 0 0 100vw #17171a, inset 2px 0 0 rgba(${BRASS}, 0.7);
+  box-shadow: inset 0 0 0 100vw #101826, inset 2px 0 0 rgba(${ACCENT}, 0.7);
 }
 /* The name slot. Divided off from the row below by a hairline, so the two
    openings read as machined out of one face rather than as one box with two
@@ -472,7 +666,7 @@ const CTA_CSS = `
   /* Brighter than the button's own divider, and it has to be: that one runs
      down the lit half of the instrument, with the meter's glow behind it,
      while this one crosses dark ground where the same 0.18 vanishes. */
-  border-bottom: 1px solid rgba(${BRASS}, 0.3);
+  border-bottom: 1px solid rgba(${ACCENT}, 0.3);
 }
 /* The button, once the rig owns the material: no ground, no shell, no lift.
    What is left of it is the half that lights up, divided off by one hairline.
@@ -482,7 +676,7 @@ const CTA_CSS = `
   flex: none;
   margin-top: 0;
   border: 0;
-  border-left: 1px solid rgba(${BRASS}, 0.18);
+  border-left: 1px solid rgba(${ACCENT}, 0.18);
   border-radius: 0;
   background: none;
   box-shadow: none;
@@ -492,18 +686,18 @@ const CTA_CSS = `
 .pb-cta-in-rig:focus-visible {
   transform: none;
   box-shadow: none;
-  border-color: rgba(${BRASS}, 0.35);
+  border-color: rgba(${ACCENT}, 0.35);
 }
 /* Drawn inside, because the rig clips anything outside it. */
 .pb-cta-in-rig:focus-visible { outline-offset: -3px; }
 /* In flight. The meter keeps running (the request is the thing being waited
    on) but the hardware stops answering the pointer. */
-.pb-cta[disabled] { cursor: progress; color: #a9a49a; }
+.pb-cta[disabled] { cursor: progress; color: #808E9F; }
 .pb-cta[disabled]:hover,
 .pb-cta[disabled]:hover .pb-cta-arrow { transform: none; }
-.pb-cta[disabled]:hover { border-color: rgba(${BRASS}, 0.22); box-shadow:
+.pb-cta[disabled]:hover { border-color: rgba(${ACCENT}, 0.22); box-shadow:
   inset 0 1px 0 rgba(255, 255, 255, 0.07), 0 12px 30px rgba(0, 0, 0, 0.5); }
-.pb-cta-in-rig[disabled]:hover { box-shadow: none; border-color: rgba(${BRASS}, 0.18); }
+.pb-cta-in-rig[disabled]:hover { box-shadow: none; border-color: rgba(${ACCENT}, 0.18); }
 @media (prefers-reduced-motion: reduce) {
   .pb-cta,
   .pb-cta-arrow { transition-duration: 0.01ms; }
@@ -514,11 +708,10 @@ const CTA_CSS = `
 }
 `;
 
-// The one piece of hardware in the product, and now it appears twice: on the
-// homepage as the call to action and on the waitlist form as its submit. At
-// rest the meter shows a noise floor (the same slop scrolling behind the
-// frost); on hover the filter closes and only the passband survives, lit in the
-// icon's brass. The animation is the product's own metaphor, which is the price
+// The one piece of hardware on the page: the meter behind the waitlist rig. At
+// rest it shows a noise floor; on hover the filter closes and only the
+// passband survives, lit in passband blue. It is the scene behind it, shrunk to
+// the size of a button. The animation is the product's own metaphor, which is the price
 // of putting motion here at all.
 //
 // A HOOK RATHER THAN A COMPONENT because the pointer handlers have to sit on
@@ -590,15 +783,15 @@ function useMeter() {
         for (let x = 0; x <= width; x += 2) ctx.lineTo(x, top(x));
         ctx.lineTo(width, height);
         const fill = ctx.createLinearGradient(0, height - maxH, 0, height);
-        fill.addColorStop(0, `rgba(${BRASS}, ${0.16 * gate})`);
-        fill.addColorStop(1, `rgba(${BRASS}, 0)`);
+        fill.addColorStop(0, `rgba(${ACCENT}, ${0.16 * gate})`);
+        fill.addColorStop(1, `rgba(${ACCENT}, 0)`);
         ctx.fillStyle = fill;
         ctx.fill();
 
         ctx.beginPath();
         ctx.moveTo(0, top(0));
         for (let x = 2; x <= width; x += 2) ctx.lineTo(x, top(x));
-        ctx.strokeStyle = `rgba(${BRASS}, ${0.45 * gate})`;
+        ctx.strokeStyle = `rgba(${ACCENT}, ${0.45 * gate})`;
         ctx.lineWidth = 1;
         ctx.stroke();
       }
@@ -620,9 +813,9 @@ function useMeter() {
         const warm = gate * response;
         const mix = (cold: number, hot: number) =>
           Math.round(cold + (hot - cold) * warm);
-        ctx.fillStyle = `rgba(${mix(124, 240)}, ${mix(124, 204)}, ${mix(134, 128)}, ${0.4 + 0.55 * warm})`;
+        ctx.fillStyle = `rgba(${mix(128, 130)}, ${mix(142, 186)}, ${mix(159, 245)}, ${0.4 + 0.55 * warm})`;
         ctx.shadowBlur = warm > 0.25 ? 10 * warm : 0;
-        ctx.shadowColor = `rgba(${BRASS}, ${0.7 * warm})`;
+        ctx.shadowColor = `rgba(${ACCENT}, ${0.7 * warm})`;
         const bx = i * step + (step - barW) / 2;
         ctx.beginPath();
         ctx.roundRect(bx, height - barH, barW, barH, barW / 2);
@@ -739,10 +932,8 @@ function useMeter() {
   };
 }
 
-// The arrow both buttons wear. It points the way the press goes, which is
-// onward now rather than down: the homepage leads to the waitlist, and the
-// waitlist form sends. Label first, arrow second, so the two read left to right
-// in the order they happen.
+// The arrow the buttons wear. It points the way the press goes. Label first,
+// arrow second, so the two read left to right in the order they happen.
 function Arrow() {
   return (
     <svg
@@ -770,6 +961,28 @@ function Arrow() {
 // STILL AN ANCHOR with a real `href`, even though the click is handled: it is a
 // link to a URL that exists, so cmd-click, middle-click, and "copy link" all
 // have to keep meaning what they mean.
+function SubmitButton({ busy }: { busy: boolean }) {
+  return (
+    <button className="pb-cta pb-cta-in-rig" type="submit" disabled={busy}>
+      <span className="pb-cta-label">{busy ? "sending" : "join"}</span>
+      {!busy && <Arrow />}
+    </button>
+  );
+}
+
+// The control plane answers 200 for a fresh address and for one already on the
+// list, so this page can never become a membership oracle.
+const WAITLIST_URL = "https://signup.passband.app/waitlist";
+
+// The path the waitlist state answers to. A real URL, deep-linkable and
+// shareable, even though reaching it from the button never loads a document.
+const WAITLIST_PATH = "/waitlist";
+
+// THE HERO'S ONE ACTION, until it is pressed; then the rig takes its slot.
+//
+// STILL AN ANCHOR with a real `href`, even though the click is handled: it is a
+// link to a URL that exists, so cmd-click, middle-click, and "copy link" all
+// have to keep meaning what they mean.
 function JoinButton({
   onClick,
 }: {
@@ -785,64 +998,17 @@ function JoinButton({
   );
 }
 
-// The rig's submit half. NO METER OF ITS OWN: the rig carries one meter across
-// its whole width, so this is the label and the divider and nothing else.
-// Squeezed into a button this narrow the meter read as a squiggle rather than
-// an instrument, and it had nothing to say about the half of the bar where the
-// typing happens.
-//
-// `busy` is the request in flight. The rig's meter keeps running, because that
-// is the part that is honestly still happening; the button stops answering.
-function SubmitButton({ busy }: { busy: boolean }) {
-  return (
-    <button className="pb-cta pb-cta-in-rig" type="submit" disabled={busy}>
-      <span className="pb-cta-label">{busy ? "sending" : "join"}</span>
-      {!busy && <Arrow />}
-    </button>
-  );
-}
-
-// Same corner links in both of the page's states, so joining the list never
-// reads as having left the site.
-function CornerLinks() {
-  return (
-    <>
-      <footer style={{ ...styles.corner, left: "1.5rem" }}>
-        <a style={styles.link} href="https://github.com/braelyn-ai/squelch">
-          GitHub
-        </a>
-      </footer>
-      <footer style={{ ...styles.corner, right: "1.5rem" }}>
-        <a style={styles.link} href="/about">
-          About
-        </a>
-        <a style={styles.link} href="/privacy">
-          Privacy
-        </a>
-        <a style={styles.link} href="/terms">
-          Terms
-        </a>
-      </footer>
-    </>
-  );
-}
-
-// The control plane answers 200 for a fresh address and for one already on the
-// list, so this page can never become a membership oracle.
-const WAITLIST_URL = "https://signup.passband.app/waitlist";
-
-// The path the waitlist state answers to. A real URL, deep-linkable and
-// shareable, even though reaching it from the homepage never loads a document.
-const WAITLIST_PATH = "/waitlist";
-
-// The waitlist, as a state of the homepage rather than a page of its own.
-//
-// It renders into the slot THE BUTTON occupies, and nothing above it moves: the
-// mark, the wordmark and the tagline are the page's constants in every state,
-// so joining the list swaps exactly one element and the rest of the page holds
-// perfectly still.
+// The waitlist rig, in the slot the button held. The beats crossfade above it
+// and it never moves, so a half-typed address stays exactly where it was while
+// the scope resolves behind it.
 function Waitlist() {
   const { chrome, handlers } = useMeter();
+  const nameRef = useRef<HTMLInputElement>(null);
+  // The button that opened this is gone from under the cursor, so the first
+  // field takes the focus it left behind: press join, start typing. Not
+  // autoFocus: that scrolls the field into view, which from the closing
+  // button would cut the smooth scroll back up short.
+  useEffect(() => nameRef.current?.focus({ preventScroll: true }), []);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [state, setState] = useState<"idle" | "busy" | "done" | "error">("idle");
@@ -884,10 +1050,10 @@ function Waitlist() {
     const first = word.length <= 20 ? word : "";
     return (
       <>
-        <p style={styles.confirm}>
+        <p className="pb-confirm">
           {first ? `you're on the list, ${first}.` : "you're on the list."}
         </p>
-        <p style={styles.status}>
+        <p className="pb-status">
           you will receive an email when a spot opens. it walks you through
           setup, and the app is waiting at the end of it.
         </p>
@@ -899,6 +1065,7 @@ function Waitlist() {
     <>
       <form className="pb-rig" onSubmit={submit} {...handlers}>
         <input
+          ref={nameRef}
           className="pb-rig-field pb-rig-name"
           type="text"
           name="name"
@@ -911,10 +1078,6 @@ function Waitlist() {
           // the stricter of them on astral ones. Deliberately the stricter
           // side: a name stopped at the field beats one cut on the way in.
           maxLength={128}
-          // The button that opened this is gone from under the cursor, so the
-          // first field takes the focus it left behind: press join, start
-          // typing.
-          autoFocus
           value={name}
           disabled={state === "busy"}
           onChange={(event) => setName(event.target.value)}
@@ -937,7 +1100,7 @@ function Waitlist() {
         </div>
       </form>
       {state === "error" && (
-        <p style={{ ...styles.status, color: "#d8a39a" }}>
+        <p className="pb-status pb-status-error">
           that didn't go through. give it a second and try again.
         </p>
       )}
@@ -945,73 +1108,476 @@ function Waitlist() {
   );
 }
 
-export function App() {
-  // THE WAITLIST IS A STATE OF THIS PAGE, not a document of its own. It was a
-  // second page at /waitlist, and clicking through re-parsed the bundle and
-  // re-rolled the random inbox behind the frost, so the one thing on screen
-  // that should never move flickered on every click. The URL still changes, so
-  // the link stays real and the back button still goes back; nothing remounts.
-  const [joining, setJoining] = useState(
-    () => location.pathname === WAITLIST_PATH,
-  );
 
-  // The browser's own history is the source of truth, so back and forward land
-  // where they should rather than leaving the page arguing with its address.
+// MARK: - the "after": a fake sitrep
+
+// Stand-ins for the SF Symbols the app draws: gauge, envelope, key, sliders,
+// people and waveform in the side rail; eye, envelope.open, calendar,
+// shippingbox, building.columns and receipt on the zones.
+const GLYPHS = {
+  sitrep: "M8 14.2A6.2 6.2 0 1 0 8 1.8a6.2 6.2 0 0 0 0 12.4Zm0-3.6 2.8-5M3.8 8h1M8 3.8v1m4.2 3.2h-1",
+  mail: "M2 3.8h12v8.4H2V3.8Zm0 0 6 4.6 6-4.6",
+  key: "M8 6.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2Zm0 0v7.8l1.6-1.3M8 10.4h1.6",
+  sliders: "M2 4.5h12M2 8h12M2 11.5h12M5 3.3v2.4M10.5 6.8v2.4M6.5 10.3v2.4",
+  people: "M6 7.2a2.4 2.4 0 1 0 0-4.8 2.4 2.4 0 0 0 0 4.8Zm-4.2 6.4c.3-2.6 2-4 4.2-4s3.9 1.4 4.2 4M11 7.2a2 2 0 1 0 0-4m1.6 6.6c1 .5 1.6 1.7 1.8 3.8",
+  pulse: "M1.5 8.5h3l1.6-4.4 3 8.4 1.8-4h3.6",
+  gear: "M8 10.3a2.3 2.3 0 1 0 0-4.6 2.3 2.3 0 0 0 0 4.6ZM8 2v2m0 8v2M2 8h2m8 0h2M3.8 3.8l1.4 1.4m5.6 5.6 1.4 1.4m0-8.4-1.4 1.4m-5.6 5.6-1.4 1.4",
+  eye: "M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Zm6.5 2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z",
+  reading: "M2 6.5 8 2.5l6 4v7H2v-7Zm0 0 6 4 6-4",
+  calendar: "M2.5 3.5h11v10h-11v-10Zm0 3h11M5 2v2.5M11 2v2.5",
+  box: "M8 1.8 14 4.6v6.8L8 14.2 2 11.4V4.6L8 1.8ZM2 4.6 8 7.4l6-2.8M8 7.4v6.8",
+  bank: "M2 6 8 2.5 14 6H2Zm1.2 0v6m3.2-6v6m3.2-6v6M12.8 6v6M2 13.5h12",
+  receipt: "M3.5 1.8h9v12.4l-1.5-1-1.5 1-1.5-1-1.5 1-1.5-1-1.5 1V1.8Zm2.5 4h4m-4 3h4",
+  retriage: "M13.5 8a5.5 5.5 0 1 1-1.6-3.9M12.5 1.8v2.6H9.9",
+};
+
+function Glyph({ name }: { name: keyof typeof GLYPHS }) {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.25"
+      strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={GLYPHS[name]} />
+    </svg>
+  );
+}
+
+function ZoneHead({ glyph, title, count, sub }: {
+  glyph: keyof typeof GLYPHS; title: string; count: number; sub?: string;
+}) {
+  return (
+    <div className="pb-zone-h">
+      <Glyph name={glyph} />
+      {title} <em>{count}</em>
+      {sub && <small>{sub}</small>}
+    </div>
+  );
+}
+
+// The app's avatar palette, dark halves (Palette.avatarPalette).
+const AVATAR = {
+  blue: ["#24384F", "#A9CBF0"], green: ["#22392E", "#9AD3B6"], rust: ["#442C26", "#EBA894"],
+  violet: ["#2F2A4A", "#B8ACF2"], ochre: ["#3E2E1B", "#E2C078"], rose: ["#3E2839", "#E0A6CD"],
+} as const;
+
+// The mail from the "before" panel's scroll, as the sitrep has it: a name, the
+// model's one-line abstraction of what the thread wants, and a chip only where
+// there is a date. Overdue is the filled red chip plus the bar at the row's
+// edge, exactly as SitrepView draws it; upcoming is an amber outline.
+const EYES: Array<{
+  who: string; initials: string; tone: keyof typeof AVATAR; line: string;
+  chip?: string; overdue?: boolean;
+}> = [
+  { who: "Parkline Properties", initials: "PP", tone: "ochre", line: "Your lease renewal still needs a signature before the new rate lapses.", chip: "3d PAST DUE", overdue: true },
+  { who: "Dr. Ortiz's Office", initials: "DO", tone: "green", line: "Confirm Thursday's 2:30 appointment or call to reschedule.", chip: "due today" },
+  { who: "Jamie Chen", initials: "JC", tone: "blue", line: "Needs your pick between two offsite venues so they can hold the date.", chip: "due Fri" },
+  { who: "Alex Rivera", initials: "AR", tone: "violet", line: "Replied to your offsite dates: the 14th works for everyone." },
+  { who: "Mom", initials: "M", tone: "rose", line: "Sent photos from the weekend." },
+];
+
+// Newsletters from the scroll, one card per sender. Lettered tiles rather
+// than anybody's real logo.
+const READING: Array<[sender: string, count: number, blurb: string, tile: [bg: string, fg: string, mark: string]]> = [
+  ["Medium Daily Digest", 7, "10 Habits of Highly Effective Engineers, and six more stories picked for you.", ["#f2f2ee", "#111", "M"]],
+  ["Product Hunt Daily", 5, "An AI notetaker for your AI notetaker, and eight more launches.", ["#3a2a22", "#f08a5d", "P"]],
+  ["Substack", 3, "Three new posts from writers you follow.", ["#f3eee6", "#c2531f", "S"]],
+];
+
+function AppMock() {
+  return (
+    <div
+      className="pb-app"
+      role="img"
+      aria-label="The Passband sitrep. Two items for your eyes: a lease renewal three days past due and an appointment to confirm today, then three more conversations. Newsletters wait on a reading shelf, and a rail beside it holds the calendar, shipments, billing and receipts."
+    >
+      <div className="pb-app-bar">
+        <div className="pb-lights" aria-hidden="true"><i /><i /><i /></div>
+        <div className="pb-app-title">
+          <b>passband</b>
+          <small>SITREP</small>
+        </div>
+        <div className="pb-app-tools">
+          <span className="pb-retriage"><Glyph name="retriage" />re-triage 7d</span>
+          <span className="pb-need">2 need you now</span>
+        </div>
+      </div>
+
+      <nav className="pb-side" aria-hidden="true">
+        <span className="on"><Glyph name="sitrep" /></span>
+        <span><Glyph name="mail" /></span>
+        <span><Glyph name="key" /></span>
+        <span><Glyph name="sliders" /></span>
+        <span><Glyph name="people" /></span>
+        <i className="pb-side-gap" />
+        <span><Glyph name="pulse" /></span>
+        <span><Glyph name="gear" /></span>
+        <span className="pb-me">Y</span>
+      </nav>
+
+      <div className="pb-page">
+        <div className="pb-dash-hero">
+          <small>Good morning</small>
+          <b>Two items for your eyes.</b>
+        </div>
+
+        <div className="pb-col">
+          <section className="pb-zone">
+            <ZoneHead glyph="eye" title="For your eyes" count={EYES.length} />
+            {EYES.map(({ who, initials, tone, line, chip, overdue }, i) => {
+              const [bg, fg] = AVATAR[tone];
+              return (
+                <div key={who} className={`pb-eye${overdue ? " overdue" : ""}${i === 0 ? " cursor" : ""}`}>
+                  <span className="pb-avatar" style={{ background: bg, color: fg }}>{initials}</span>
+                  <b>{who}</b>
+                  <span className="line">{line}</span>
+                  {chip && (
+                    <span
+                      className={`pb-chip${overdue ? " filled" : ""}`}
+                      style={{ ["--c" as string]: overdue ? "var(--danger)" : "var(--warn)" }}
+                    >
+                      {chip}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </section>
+
+          <section className="pb-zone">
+            <ZoneHead glyph="reading" title="Reading" count={READING.length}
+              sub="newsletters, announcements, and offers" />
+            <div className="pb-reading">
+              {READING.map(([sender, count, blurb, [bg, fg, mark]]) => (
+                <div key={sender} className="pb-read">
+                  <span className="pb-logo" style={{ background: bg, color: fg }}>{mark}</span>
+                  <div className="pb-read-text">
+                    <div className="pb-read-top">
+                      <b>{sender}</b>
+                      <span>{count} emails</span>
+                    </div>
+                    <p>{blurb}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <aside className="pb-rail">
+          <section className="pb-rec pb-rec-cal">
+            <ZoneHead glyph="calendar" title="Calendar" count={2} />
+            <div className="pb-rec-row"><b>Dr. Ortiz · checkup</b><span>Sep 26</span></div>
+            <div className="pb-rec-row"><b>Team offsite</b><span>Oct 14</span></div>
+          </section>
+          <section className="pb-rec pb-rec-ship">
+            <ZoneHead glyph="box" title="Shipments" count={2} />
+            <div className="pb-ship">
+              <div className="pb-ship-top">
+                <i>UPS</i>
+                <b>Keychron Q1</b>
+                <span className="pb-chip filled" style={{ ["--c" as string]: "var(--warn)" }}>out for delivery</span>
+              </div>
+            </div>
+            <div className="pb-ship">
+              <div className="pb-ship-top">
+                <i>a</i>
+                <b>Linen notebooks</b>
+                <span className="pb-chip filled" style={{ ["--c" as string]: "var(--accent)" }}>shipped</span>
+              </div>
+              <span className="pb-chip eta">arrives Sat</span>
+            </div>
+          </section>
+          <section className="pb-rec pb-rec-bill">
+            <ZoneHead glyph="bank" title="Billing" count={2} />
+            <div className="pb-rec-row"><b>Chase ··4417</b><span className="pb-chip">statement</span></div>
+            <div className="pb-rec-row"><b>Con Edison</b><span className="pb-chip">update</span></div>
+          </section>
+          <section className="pb-rec pb-rec-rcpt">
+            <ZoneHead glyph="receipt" title="Receipts" count={3} />
+            <div className="pb-rec-row"><b>Blue Bottle</b><span>$6.50</span></div>
+            <div className="pb-rec-row"><b>DoorDash</b><span>$23.18</span></div>
+            <div className="pb-rec-row"><b>Berghain Klubnacht</b><span>€25.00</span></div>
+          </section>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+// MARK: - the page
+
+// Where the analyzer draws, as fractions of the stage. Wide screens tune the
+// band to the right of the copy; narrow ones centre it under the copy, low.
+//
+// On a phone the scope sits BETWEEN the copy and the waitlist, so its band is
+// measured off them rather than guessed: the trace's baseline just above the
+// slot, full scale reaching just under the beats. Phone heights vary too much
+// for fixed fractions to clear both on every one.
+function scopeLayout(): ScopeLayout {
+  if (innerWidth > 820) return { center: 0.7, base: 0.82, scale: 0.5, spread: 1 };
+  const stage = document.querySelector(".pb-stage")?.getBoundingClientRect();
+  const beats = document.querySelector(".pb-beats")?.getBoundingClientRect();
+  const slot = document.querySelector(".pb-slot")?.getBoundingClientRect();
+  if (!stage || !beats || !slot || stage.height < 1) {
+    return { center: 0.5, base: 0.7, scale: 0.3, spread: 1.9 };
+  }
+  const top = beats.bottom - stage.top + 12;
+  const bottom = slot.top - stage.top - 18;
+  return {
+    center: 0.5,
+    base: bottom / stage.height,
+    scale: Math.max(0.08, (bottom - top) / stage.height),
+    spread: 1.9,
+  };
+}
+
+// The carriers' names in the marker table, in the scope's order.
+const MARKERS: Array<[who: string, status: string, tone: string]> = [
+  ["Parkline Properties", "past due", "late"],
+  ["Dr. Ortiz's Office", "today", "soon"],
+  ["Jamie Chen", "due Fri", "soon"],
+];
+
+export function App() {
+  const storyRef = useRef<HTMLElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [beat, setBeat] = useState(0);
+  const [scrolled, setScrolled] = useState(false);
+  const [locked, setLocked] = useState(false);
+  const readoutRef = useRef<HTMLElement>(null);
+  const [layout, setLayout] = useState<ScopeLayout>(() => scopeLayout());
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const story = storyRef.current;
+    if (!canvas || !story) return;
+    const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const scene = createScope(canvas, {
+      reduceMotion,
+      layout: scopeLayout,
+      // Written straight to the DOM: it changes every frame, and a re-render
+      // per frame would buy nothing.
+      onReadout: (squelch) => {
+        if (readoutRef.current) readoutRef.current.textContent = `${Math.round(squelch * 100)}%`;
+      },
+    });
+
+    // Progress through the story, 0 at the top to 1 where the stage releases.
+    // The copy turns as the filter starts to close; the markers come up once
+    // it has closed, when there is something left to point at.
+    const onScroll = () => {
+      const rect = story.getBoundingClientRect();
+      const travel = Math.max(1, rect.height - innerHeight);
+      const p = Math.min(1, Math.max(0, -rect.top / travel));
+      scene?.setProgress(p);
+      setBeat(p > 0.3 ? 1 : 0);
+      setLocked(p > 0.58);
+      setScrolled(p > 0.03);
+    };
+    const onResize = () => {
+      setLayout(scopeLayout());
+      onScroll();
+    };
+    // The phone layout is measured off the copy, which only has its real
+    // height once mounted and again once the serif has loaded.
+    onResize();
+    document.fonts?.ready.then(onResize);
+    addEventListener("scroll", onScroll, { passive: true });
+    addEventListener("resize", onResize);
+
+    // Nothing to draw once the stage has scrolled away.
+    const io = new IntersectionObserver(([entry]) => scene?.setVisible(entry.isIntersecting));
+    io.observe(stageRef.current!);
+
+    return () => {
+      removeEventListener("scroll", onScroll);
+      removeEventListener("resize", onResize);
+      io.disconnect();
+      scene?.destroy();
+    };
+  }, []);
+
+  // THE WAITLIST IS A STATE OF THIS PAGE, not a document of its own: the URL
+  // changes, so the link stays real and back still goes back, but nothing
+  // remounts and the scope behind it never restarts.
+  const [joining, setJoining] = useState(() => location.pathname === WAITLIST_PATH);
   useEffect(() => {
     const sync = () => setJoining(location.pathname === WAITLIST_PATH);
     addEventListener("popstate", sync);
     return () => removeEventListener("popstate", sync);
   }, []);
+  const open = (next: boolean) => {
+    if (next === joining) return;
+    history.pushState(null, "", next ? WAITLIST_PATH : "/");
+    setJoining(next);
+  };
+  const go = (next: boolean) => (event: MouseEvent<HTMLAnchorElement>) => {
+    // Anything but a plain left click is asking for a new document: a new
+    // tab, a new window, a saved link. Let the browser have those.
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    event.preventDefault();
+    open(next);
+  };
 
-  const go =
-    (path: string, next: boolean) => (event: MouseEvent<HTMLAnchorElement>) => {
-      // Anything but a plain left click is asking for a new document: a new
-      // tab, a new window, a saved link. Let the browser have those.
-      if (
-        event.metaKey ||
-        event.ctrlKey ||
-        event.shiftKey ||
-        event.altKey ||
-        event.button !== 0
-      ) {
-        return;
-      }
-      event.preventDefault();
-      history.pushState(null, "", path);
-      setJoining(next);
-    };
-
-  // The mark on its own, no tile: the page is already a dark field, so the
-  // icon's ground would just be a lighter rectangle sitting on it.
-  const masthead = (
-    <>
-      <img src="/mark.svg" alt="Passband" width={180} height={98} />
-      <h1 style={styles.title}>Passband</h1>
-    </>
-  );
+  // The closing button goes back up to the hero and opens the rig there, so
+  // there is only ever one form on the page.
+  const backToTop = () => {
+    const smooth = !matchMedia("(prefers-reduced-motion: reduce)").matches;
+    scrollTo({ top: 0, behavior: smooth ? "smooth" : "auto" });
+    open(true);
+  };
 
   return (
-    <main style={styles.page}>
-      <FakeInbox />
-      <div style={styles.frost} />
-      <div style={styles.content}>
-        {joining ? (
-          <a href="/" onClick={go("/", false)} style={styles.homeLink}>
-            {masthead}
-          </a>
-        ) : (
-          masthead
-        )}
-        <p style={styles.tagline}>fuck email. lets make it bearable</p>
-        <div style={styles.slot}>
-          {joining ? (
-            <Waitlist />
-          ) : (
-            <JoinButton onClick={go(WAITLIST_PATH, true)} />
-          )}
+    <main className="pb">
+      <style href="pb-page" precedence="default">{PAGE_CSS_RESOLVED}</style>
+
+      <section ref={storyRef} className="pb-story">
+        <div
+          ref={stageRef}
+          className="pb-stage"
+          data-locked={locked || undefined}
+          data-scrolled={scrolled || undefined}
+        >
+          <canvas ref={canvasRef} className="pb-scene" aria-hidden="true" />
+          <div className="pb-grat" />
+          {CARRIERS.map((_, i) => {
+            const { x, y } = markerPoint(i, layout);
+            return (
+              <span key={i} className="pb-mkr" style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
+                aria-hidden="true">{i + 1}</span>
+            );
+          })}
+          <div className="pb-scrim" />
+          <div className="pb-mkrs" aria-label="What made it through">
+            <div><span>MKR</span><span>SENDER</span><span>STATUS</span></div>
+            {MARKERS.map(([who, status, tone], i) => (
+              <div key={who}>
+                <b>{i + 1}</b>
+                <span>{who}</span>
+                <span className={tone}>{status}</span>
+              </div>
+            ))}
+          </div>
+          <span className="pb-read-l" aria-hidden="true">SPAN&nbsp;&nbsp;your inbox&nbsp;&nbsp;·&nbsp;&nbsp;4,312 msgs</span>
+          <span className="pb-read-r" aria-hidden="true">SQUELCH&nbsp;<b ref={readoutRef}>0%</b></span>
+
+          <header className="pb-top">
+            <a className="pb-brand" href="/" onClick={go(false)}>
+              <img src="/mark.svg" alt="" width={42} height={23} />
+              <span>passband</span>
+            </a>
+            <nav className="pb-nav">
+              <a href="/about">About</a>
+              <a href="/self-host">Self-host</a>
+              <a className="pb-keep" href="https://github.com/braelyn-ai/squelch">GitHub</a>
+            </nav>
+          </header>
+
+          <div className="pb-copy">
+            <div className="pb-beats" data-beat={beat}>
+              <div className="pb-beat pb-beat-0" aria-hidden={beat !== 0}>
+                <p className="pb-lede">Inbox zero every day was never realistic.</p>
+                <h1 className="pb-hero">You’re only human.</h1>
+                <p className="pb-sub">
+                  Your attention is valuable. You deserve an inbox that treats it that way.
+                </p>
+              </div>
+              <div className="pb-beat pb-beat-1" aria-hidden={beat !== 1}>
+                <h2 className="pb-hero">Know what needs you.</h2>
+                <p className="pb-sub">
+                  Passband brings the important things forward, so you can give them your
+                  attention and get on with your day.
+                </p>
+              </div>
+            </div>
+            <div className="pb-slot">
+              {joining ? <Waitlist /> : <JoinButton onClick={go(true)} />}
+              <p className="pb-fine">For Gmail, on Mac and iPhone.</p>
+            </div>
+          </div>
+
+          <div className="pb-cue" aria-hidden="true">scroll</div>
         </div>
-      </div>
-      <CornerLinks />
+      </section>
+
+      <section className="pb-section">
+        <h2 className="pb-h2">
+          Same inbox. <em>Squelched.</em>
+        </h2>
+        <p className="pb-intro">
+          Every email still arrives. Passband reads each one, pulls forward the few that
+          need you, and files the rest where you can find them when you want to.
+        </p>
+        <div className="pb-pair">
+          <figure className="pb-panel pb-before">
+            <figcaption>
+              <b>Before</b> everything, in the order it arrived
+              <span className="pb-unread" aria-label="4,312 unread">4,312</span>
+            </figcaption>
+            <div className="pb-window">
+              <FakeInbox />
+            </div>
+          </figure>
+          <div className="pb-gate" aria-hidden="true">
+            <span>
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6"
+                strokeLinecap="round" strokeLinejoin="round">
+                <path d="M2.5 8h11m0 0L9.5 4m4 4-4 4" />
+              </svg>
+            </span>
+          </div>
+          <figure className="pb-panel pb-after">
+            <figcaption><b>After</b> what Passband shows you</figcaption>
+            <div className="pb-window">
+              <AppMock />
+            </div>
+          </figure>
+        </div>
+      </section>
+
+      <section className="pb-section" style={{ paddingTop: 0 }}>
+        <div className="pb-facts">
+          <div className="pb-fact">
+            <h3>Open source</h3>
+            <p>
+              MIT licensed. Every line is <a href="https://github.com/braelyn-ai/squelch">on GitHub</a>,
+              the threat model included.
+            </p>
+          </div>
+          <div className="pb-fact">
+            <h3>Run it where you like</h3>
+            <p>
+              <a href="/self-host">Self-host</a> the daemon on your own machine, or let us run an
+              isolated instance for you.
+            </p>
+          </div>
+          <div className="pb-fact">
+            <h3>Reading can’t send</h3>
+            <p>
+              Sync holds a read-only Google credential. The one that can write lives apart,
+              and the sync path can’t load it.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section className="pb-section pb-close">
+        <h2 className="pb-h2">Find a little breathing room.</h2>
+        <button className="pb-cta" type="button" onClick={backToTop}>
+          <span className="pb-cta-label">join the waitlist</span>
+          <Arrow />
+        </button>
+      </section>
+
+      <footer className="pb-foot">
+        <span>Passband</span>
+        <nav>
+          <a href="/about">About</a>
+          <a href="/self-host">Self-host</a>
+          <a href="/privacy">Privacy</a>
+          <a href="/terms">Terms</a>
+          <a href="https://github.com/braelyn-ai/squelch">GitHub</a>
+        </nav>
+      </footer>
     </main>
   );
 }

@@ -147,7 +147,7 @@ enum Analytics {
             // compose_send / compose_opened
             "new", "reply", "forward", "sent", "guard_blocked", "forbidden", "failure",
             // undo_fired kinds
-            "archive", "done", "label", "ruleDelete", "groupDelete", "remind",
+            "archive", "done", "label", "ruleDelete", "groupDelete", "remind", "send",
             // group_* modes — how an audience is addressed. "individual" is the
             // only one that is not also a header name.
             "to", "bcc", "individual",

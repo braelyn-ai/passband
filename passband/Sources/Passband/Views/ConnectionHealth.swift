@@ -34,7 +34,10 @@ struct DaemonDownPane: View {
                 HStack(spacing: 10) {
                     if !auth { RetryButton() }
                     Button {
-                        store.setView(.settings)
+                        // A rejected token is fixed on the Account pane; an
+                        // unreachable daemon is too (its server URL lives in
+                        // the same fields).
+                        store.openCredentials()
                     } label: {
                         Label("open settings", systemImage: "gearshape")
                             .font(.system(size: 12, weight: .medium))
@@ -85,7 +88,7 @@ struct ConnectionBanner: View {
                     .truncationMode(.tail)
                     Spacer(minLength: 8)
                     if auth {
-                        Button("settings") { store.setView(.settings) }
+                        Button("settings") { store.openCredentials() }
                             .buttonStyle(.plain)
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(Palette.accent)

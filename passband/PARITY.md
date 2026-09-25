@@ -83,7 +83,7 @@ backdrop bleeds through enough that light mode reads as a muddy dark one.
 | Rules | **done** | Dense table, client-side match counts, undo-first delete |
 | Audit | **done** | Verb-phrase actions, resolved sender·subject, per-row undo |
 | Usage | **done** | Per-category (stage1/stage2) sections + daily bars, assistant tally |
-| Settings | **done** | General / Mail / Triage / Assistant / Account, sub-nav persisted |
+| Settings | **done** | General / Mail / Assistant / Privacy / Audit / Account, sub-nav persisted |
 | Connect (first run) | **done** | Serif wordmark on tinted glass |
 
 ## Surfaces
