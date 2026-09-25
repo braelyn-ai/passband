@@ -64,16 +64,18 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         }
     }
 
+    /// A key in braces, `{e}`, renders as an inline keycap in the guide card,
+    /// and `**For Your Eyes**` marks a section name to set in bold.
     var explanation: String {
         switch self {
         case .welcome:
             "Let’s try a few things in this practice inbox. The mail is fictional, but the mailbox is the real Passband experience."
         case .needsYou:
-            "Think of For Your Eyes as your to-do list. Reading a message keeps it here. Marking it done clears it from your board."
+            "Think of **For Your Eyes** as your to-do list. Reading a message keeps it here. Marking it done clears it from your board."
         case .openMaya:
-            "Maya has a short update for you. Click her message in For Your Eyes to read it."
+            "Maya has a short update for you. Click her message in **For Your Eyes** to read it."
         case .done:
-            "Maya’s note needs a read, not a reply. Press e when you’re done. It leaves your board and stays in your mail."
+            "Maya’s note needs a read, not a reply. Press {e} when you’re done. It leaves your board and stays in your mail."
         case .undo:
             "That message is off your board. Now that the reader is closed, you can undo to bring it right back."
         case .calendar:
@@ -89,7 +91,7 @@ enum PracticeTourStep: Int, CaseIterable, Sendable {
         case .openBrightly:
             "The sender is required to notify you of legal updates. You can’t unsubscribe, but most people never read these updates. Click Brightly’s highlighted message."
         case .rule:
-            "Press t to write a smart rule. Try “I don’t need terms-of-service updates.” Keep Mute selected and save."
+            "Press {t} to write a smart rule. Try “I don’t need terms-of-service updates.” Keep Mute selected and save."
         case .ruleSaved:
             "Your preference is saved for this practice sender. You can change smart rules whenever you need to."
         case .wrap:

@@ -14,6 +14,54 @@ struct OnboardingIntroView: View {
     private var organized: Bool { page > 0 }
 
     var body: some View {
+        if !SquelchScene.shared.isUnavailable {
+            squelchLayout
+        } else {
+            cardLayout
+        }
+    }
+
+    /// The radio beats: raw noise pours through a dormant gate, then the
+    /// continue button closes the squelch and only the passband comes out.
+    /// Night draws the waves as glow, day as ink on paper.
+    private var squelchLayout: some View {
+        GeometryReader { geometry in
+            let wide = geometry.size.width >= 820
+            ZStack(alignment: .topLeading) {
+                SquelchSceneView(engaged: organized)
+                    .ignoresSafeArea()
+                LinearGradient(
+                    stops: [
+                        .init(color: IntroNight.backdrop.opacity(0.92), location: 0),
+                        .init(color: IntroNight.backdrop.opacity(0.6), location: wide ? 0.32 : 0.4),
+                        .init(color: .clear, location: wide ? 0.62 : 0.75),
+                    ],
+                    startPoint: wide ? .leading : .top,
+                    endPoint: wide ? .trailing : .bottom)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                // Keeps the controls legible over the nearest, brightest bands.
+                LinearGradient(
+                    colors: [.clear, IntroNight.backdrop.opacity(0.85)],
+                    startPoint: UnitPoint(x: 0.5, y: 0.72), endPoint: .bottom)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                VStack(alignment: .leading, spacing: 0) {
+                    masthead
+                        .modifier(IntroEntrance(delay: 0, distance: 4))
+                    Spacer(minLength: 24)
+                    story(wide: wide)
+                        .frame(maxWidth: wide ? 480 : .infinity, alignment: .leading)
+                    Spacer(minLength: wide ? 24 : 260)
+                    controls
+                }
+                .padding(wide ? 44 : 24)
+            }
+        }
+    }
+
+    /// The fallback when Metal is unavailable: illustrated example mail.
+    private var cardLayout: some View {
         GeometryReader { geometry in
             let wide = geometry.size.width >= 820
             ScrollView {
@@ -187,6 +235,12 @@ struct OnboardingIntroView: View {
         }
         .padding(.bottom, 24)
     }
+}
+
+/// The scene's own backdrop color, so the scrim behind the copy melts into it
+/// rather than tinting it.
+private enum IntroNight {
+    static let backdrop = SquelchSceneView.backdrop
 }
 
 /// A single quiet entrance per view identity. No timers or repeating motion;

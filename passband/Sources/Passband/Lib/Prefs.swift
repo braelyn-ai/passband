@@ -93,7 +93,8 @@ enum NotificationSound: String, CaseIterable, Sendable {
 // (Lib/DeeperSearch.swift), which is pure so test.sh can assert what `off`
 // does to a lane that is already running. This file is only its storage.
 
-/// Two palettes selected explicitly; `system` follows the OS and is the default.
+/// Two palettes selected explicitly, or `system` to follow the OS. Dark is the
+/// default (see the registered defaults in `Prefs.init`).
 enum ThemeChoice: String, CaseIterable, Sendable {
     case system, light, dark
 
@@ -149,7 +150,9 @@ final class Prefs {
             Key.settingsSection: SettingsSection.general.rawValue,
             Key.developerMode: false,
             Key.tourCompleted: false,
-            Key.theme: ThemeChoice.system.rawValue,
+            // Dark by default: the app (and its onboarding scene) is designed
+            // night-first. A stored choice, including an explicit Auto, wins.
+            Key.theme: ThemeChoice.dark.rawValue,
             Key.zoom: 1.0,
             Key.threadStyle: ThreadStyleDefault.auto.rawValue,
             Key.searchIncludeRelated: false,
@@ -165,7 +168,7 @@ final class Prefs {
         _developerMode = defaults.bool(forKey: Key.developerMode)
         _tourCompleted = defaults.bool(forKey: Key.tourCompleted)
         _lastSeenReleaseNotes = defaults.string(forKey: Key.lastSeenReleaseNotes)
-        _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .system
+        _theme = ThemeChoice(rawValue: defaults.string(forKey: Key.theme) ?? "") ?? .dark
         _zoom = Zoom.clamp(defaults.double(forKey: Key.zoom))
         _threadStyle =
             ThreadStyleDefault(rawValue: defaults.string(forKey: Key.threadStyle) ?? "") ?? .auto

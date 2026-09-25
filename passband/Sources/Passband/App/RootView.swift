@@ -27,8 +27,11 @@ struct RootView: View {
                     continueHint: "Continue to the guided product tour")
                     .id(rehearsal.runID)
                     .task(id: rehearsal.runID) { await rehearsal.prepareMailbox() }
+                    // No blur on this side: the intro is a live Metal layer,
+                    // and re-blurring it every frame of the flight cost the
+                    // compositor a dozen dropped frames. Zoom and fade only.
                     .transition(reduceMotion ? .opacity : .modifier(
-                        active: IntroMailboxFlight(scale: 1.22, blur: 20, opacity: 0),
+                        active: IntroMailboxFlight(scale: 1.22, blur: 0, opacity: 0),
                         identity: IntroMailboxFlight(scale: 1, blur: 0, opacity: 1)))
                     .zIndex(1)
             } else {
