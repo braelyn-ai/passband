@@ -9,7 +9,8 @@ const CANONICAL_MAIL_CTE: &str = "WITH classified AS (
     SELECT m.*, CASE
       WHEN a.message_id IS NULL THEN COALESCE(t.tier,'pending')
       WHEN d.message_id IS NULL THEN 'pending'
-      WHEN COALESCE(pref.show_in_fye,json_extract(att.attention_json,'$.show_in_fye'),0)=1 THEN 'signal'
+      WHEN COALESCE(pref.show_in_fye,CASE WHEN json_array_length(d.decision_json,'$.auth.kinds')>0 THEN 0
+        ELSE json_extract(att.attention_json,'$.show_in_fye') END,0)=1 THEN 'signal'
       ELSE 'noise' END AS display_tier
     FROM messages m
     LEFT JOIN triage t ON t.account_id=m.account_id AND t.message_id=m.id

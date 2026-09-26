@@ -1179,6 +1179,7 @@ enum SealedKind: LenientRawEnum {
     case passwordReset
     case magicLink
     case loginAlert
+    case securityAlert
     case verification
     case unknown(String)
 
@@ -1188,6 +1189,7 @@ enum SealedKind: LenientRawEnum {
         case .passwordReset: "password_reset"
         case .magicLink: "magic_link"
         case .loginAlert: "login_alert"
+        case .securityAlert: "security_alert"
         case .verification: "verification"
         case .unknown(let raw): raw
         }
@@ -1201,6 +1203,7 @@ enum SealedKind: LenientRawEnum {
         case "password_reset": self = .passwordReset
         case "magic_link": self = .magicLink
         case "login_alert": self = .loginAlert
+        case "security_alert": self = .securityAlert
         case "verification": self = .verification
         default: self = .unknown(rawValue)
         }

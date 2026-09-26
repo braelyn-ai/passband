@@ -1985,6 +1985,9 @@ fn list_items_with_query(
     now: DateTime<Utc>,
     query: &AgentListQuery,
 ) -> Result<Vec<AgentListItem>> {
+    // FYE skips auth mail: it lives on the Auth page's decision rail, and
+    // listing it in both places means ruling on it twice. An explicit thread
+    // preference (the human pinned it) and a fired reminder still win.
     let sql = if destination == "fye" {
         "SELECT
              m.id,m.thread_id,m.from_addr,m.subject,
@@ -1992,8 +1995,10 @@ fn list_items_with_query(
              FROM agent_thread_attention a JOIN messages m ON m.account_id=a.account_id AND
              m.id=a.message_id LEFT JOIN agent_message_decisions d ON d.account_id=m.account_id AND
              d.message_id=m.id LEFT JOIN triage t ON t.account_id=m.account_id AND
-             t.message_id=m.id WHERE a.account_id=?1 AND ?3='fye' AND (a.show_in_fye=1 OR t.reminded_at
-             IS NOT NULL) AND m.is_sent=0 AND m.is_spam=0 AND COALESCE(t.status,'new')!='done' AND
+             t.message_id=m.id LEFT JOIN agent_thread_preferences pref ON pref.account_id=a.account_id AND
+             pref.thread_id=a.thread_id WHERE a.account_id=?1 AND ?3='fye' AND
+             (COALESCE(pref.show_in_fye,CASE WHEN json_array_length(COALESCE(d.decision_json,'{}'),'$.auth.kinds')>0
+             THEN 0 ELSE a.show_in_fye END)=1 OR t.reminded_at IS NOT NULL) AND m.is_sent=0 AND m.is_spam=0 AND COALESCE(t.status,'new')!='done' AND
              (t.remind_at IS NULL OR t.remind_at<=?2) AND ?4 IS ?4 AND ?5 IS ?5"
     } else if destination == "records" {
         "SELECT m.id,m.thread_id,m.from_addr,m.subject,
@@ -2764,6 +2769,68 @@ mod tests {
             .unwrap();
         projection["sources"] = serde_json::json!(sources);
         projection
+    }
+
+    /// A sign-in alert is auth the agent may still read: `restricted` is
+    /// false and must stay false. It belongs on the Auth page's decision rail
+    /// and NOT in FYE, even when the model asked for FYE. Regression: every
+    /// unrestricted login alert used to land in FYE and never on the Auth page.
+    #[test]
+    fn unrestricted_auth_lists_on_auth_page_not_fye() {
+        use crate::triage::decision::{AuthAssessment, AuthKind};
+        let store = fixture();
+        let (job, context) = claim(&store, 1);
+        let mut alert = decision(1);
+        alert.auth = AuthAssessment {
+            kinds: vec![AuthKind::LoginAlert],
+            evidence: vec![],
+        };
+        assert!(!alert.external_access.restricted);
+        assert!(alert.attention.show_in_fye);
+        store
+            .commit_agent_decision(
+                &job,
+                &context,
+                &alert,
+                std::slice::from_ref(&context.message.source),
+            )
+            .unwrap();
+        let (job, context) = claim(&store, 2);
+        store
+            .commit_agent_decision(
+                &job,
+                &context,
+                &decision(2),
+                std::slice::from_ref(&context.message.source),
+            )
+            .unwrap();
+
+        let fye_threads = |store: &SqliteStore| {
+            store
+                .agent_fye(1, 10, &RankingConfig::default(), Utc::now())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.thread_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fye_threads(&store), vec!["two".to_string()]);
+        let sealed = store.sealed_messages(1).unwrap();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].id, 1);
+        assert_eq!(sealed[0].sealed_kind.as_deref(), Some("login_alert"));
+        assert!(store.sealed_body(1, 1).is_ok());
+        assert!(matches!(
+            store.sealed_body(1, 2).unwrap_err(),
+            CoreError::NotFound
+        ));
+
+        // The human pinning the thread overrides the auth exclusion.
+        store
+            .correct_agent_triage(1, 1, "show_in_fye", &serde_json::json!(true), Utc::now())
+            .unwrap();
+        let mut pinned = fye_threads(&store);
+        pinned.sort();
+        assert_eq!(pinned, vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]

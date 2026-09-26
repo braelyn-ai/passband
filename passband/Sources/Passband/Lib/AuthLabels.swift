@@ -22,6 +22,7 @@ enum AuthCopy {
         case .passwordReset: "Password reset"
         case .magicLink: "Sign-in link"
         case .loginAlert: "Sign-in alert"
+        case .securityAlert: "Security alert"
         case .verification: "Verification"
         // A kind we don't know stays generic — its raw string is never shown.
         case .unknown, nil: "Auth message"

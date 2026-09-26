@@ -1179,7 +1179,11 @@ impl SqliteStore {
     }
 
     pub(super) fn sealed_messages(&self, account_id: AccountId) -> Result<Vec<SealedMessage>> {
-        // Human Auth lookup: canonical actionable auth plus unmigrated legacy rows.
+        // Human Auth lookup: every message the agent classified as auth, plus
+        // unmigrated legacy rows. `access` is deliberately NOT consulted: it
+        // answers whether the agent door may read the mail, not whether it is
+        // auth. An informational sign-in alert is readable (`allowed`) and is
+        // still exactly what the Auth page's decision rail exists for.
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT m.id, m.account_id, m.thread_id, m.from_addr, m.subject,
@@ -1188,7 +1192,7 @@ impl SqliteStore {
              LEFT JOIN triage t ON t.message_id = m.id AND t.account_id=m.account_id
              LEFT JOIN agent_message_state s ON s.message_id=m.id AND s.account_id=m.account_id
              LEFT JOIN agent_message_decisions d ON d.message_id=m.id AND d.account_id=m.account_id
-             WHERE m.account_id = ?1 AND ((s.access='restricted' AND json_array_length(d.decision_json,'$.auth.kinds')>0) OR (s.message_id IS NULL AND t.sensitivity='sealed'))
+             WHERE m.account_id = ?1 AND (json_array_length(COALESCE(d.decision_json,'{}'),'$.auth.kinds')>0 OR (s.message_id IS NULL AND t.sensitivity='sealed'))
              ORDER BY m.received_at DESC",
         )?;
         let out = stmt
@@ -1208,7 +1212,7 @@ impl SqliteStore {
     }
 
     pub(super) fn sealed_body(&self, account_id: AccountId, message_id: i64) -> Result<SealedBody> {
-        // Human Auth lookup detail. Ordinary email reads remain unrestricted.
+        // Human Auth lookup detail: same membership as `sealed_messages`.
         let conn = self.lock()?;
         let row = conn
             .query_row(
@@ -1218,7 +1222,7 @@ impl SqliteStore {
                  LEFT JOIN triage t ON t.message_id = m.id AND t.account_id=m.account_id
              LEFT JOIN agent_message_state s ON s.message_id=m.id AND s.account_id=m.account_id
              LEFT JOIN agent_message_decisions d ON d.message_id=m.id AND d.account_id=m.account_id
-                 WHERE m.account_id = ?1 AND m.id = ?2 AND ((s.access='restricted' AND json_array_length(d.decision_json,'$.auth.kinds')>0) OR (s.message_id IS NULL AND t.sensitivity='sealed'))",
+                 WHERE m.account_id = ?1 AND m.id = ?2 AND (json_array_length(COALESCE(d.decision_json,'{}'),'$.auth.kinds')>0 OR (s.message_id IS NULL AND t.sensitivity='sealed'))",
                 params![account_id, message_id],
                 |r| {
                     Ok(SealedBody {
