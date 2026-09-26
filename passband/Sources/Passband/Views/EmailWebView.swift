@@ -102,6 +102,7 @@ struct EmailWebViewRepresentable: NSViewRepresentable {
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
+        EmailFrame.pinLightAppearance(webView)
         return WebFramePool.Entry(webView: webView, relay: relay)
     }
 
