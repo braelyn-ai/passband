@@ -83,3 +83,18 @@ groundless marks stay SVG — which is the correct format for a logo regardless.
 knob and builds a warm-paper, brass-hairline design language on top of it. The
 download button on the live site is brass for the same reason. Neither has been
 changed — the icon moved to ice, and the rest of the brand has not followed yet.
+
+## The social preview card
+
+`og/` renders `passband-site/og.png`, the 1200x630 image every page names in
+its `og:image` tag. It is the landing page's own analyzer (`scope.ts`, imported,
+not redrawn) closed on the hero's three carriers, screenshotted in the system
+Chrome after it has animated for a few seconds.
+
+```sh
+./brand/og/build.sh
+```
+
+The trace's spikes are random, so a re-render is never byte-identical. Link
+unfurlers cache hard: after replacing the image, re-scrape with each platform's
+debugger (or bump the URL) or the old card keeps showing.
