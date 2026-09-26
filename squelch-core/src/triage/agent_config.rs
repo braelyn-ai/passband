@@ -83,6 +83,9 @@ pub struct RankingConfig {
     pub recency_weight: f64,
     pub waiting_weight: f64,
     pub importance_weight: f64,
+    /// Maximum points subtracted for machine-written mail. Scaled down by the
+    /// thread's action need or personal relevance, whichever is higher.
+    pub ai_generated_penalty_weight: f64,
     pub recency_half_life_hours: f64,
     pub waiting_saturation_days: f64,
 }
@@ -95,6 +98,7 @@ impl Default for RankingConfig {
             recency_weight: 20.0,
             waiting_weight: 5.0,
             importance_weight: 2.0,
+            ai_generated_penalty_weight: 15.0,
             recency_half_life_hours: 24.0,
             waiting_saturation_days: 7.0,
         }
@@ -126,6 +130,7 @@ impl RankingConfig {
             self.recency_weight,
             self.waiting_weight,
             self.importance_weight,
+            self.ai_generated_penalty_weight,
         ]
         .iter()
         .any(|v| !v.is_finite() || *v < 0.0)

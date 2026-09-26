@@ -87,6 +87,7 @@ personal_relevance_weight = 20.0
 recency_weight = 20.0
 waiting_weight = 5.0
 importance_weight = 2.0
+ai_generated_penalty_weight = 15.0
 recency_half_life_hours = 24.0
 waiting_saturation_days = 7.0
 ```
@@ -97,7 +98,12 @@ Environment overrides: `SQUELCH_TRIAGE_MODEL`, `SQUELCH_TRIAGE_REVIEW_MODEL`,
 `SQUELCH_TRIAGE_DAILY_RUN_CAP`, `SQUELCH_TRIAGE_BACKGROUND_DAILY_RUN_CAP`,
 `SQUELCH_TRIAGE_MAX_ATTEMPTS`, and
 `SQUELCH_TRIAGE_OUTAGE_RETRY_SECS`. Other agent levers are configured in TOML. Scores order only agent-selected FYE threads;
-no weight or importance threshold can add a thread to FYE. Recency uses relevant
+no weight or importance threshold can add a thread to FYE. Likewise no
+AI-authorship score can remove one: `ai_generated` (the model's
+machine-written likelihood, informed by the stylometric hints in
+`triage/ai_text.rs`) only subtracts up to `ai_generated_penalty_weight`
+points, scaled by `1 - max(action_need, personal_relevance)`, so AI-drafted
+mail that needs the user keeps its rank. Recency uses relevant
 message activity, never the time a background job ran.
 
 ### Spend and revisit limits

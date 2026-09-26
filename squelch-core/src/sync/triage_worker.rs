@@ -220,6 +220,8 @@ fn snapshot(context: &AgentContext, job: &AgentJob, limit: usize) -> ContextSnap
             "attention": context.attention,
             "sender_preferences": context.matched_rules,
             "sender_is_contact": context.sender_is_contact,
+            // Heuristic hints only; the model owns the ai_generated judgement.
+            "ai_text_signals": crate::triage::ai_text::assess(&context.message.body),
             "user_corrections": context.corrections,
             "trigger": job.trigger,
             "access_only": context.message.is_sent || context.message.is_spam,
@@ -817,6 +819,7 @@ mod budget_tests {
             serde_json::json!([{"id":10}])
         );
         assert_eq!(snapshot.initial["sender_is_contact"], true);
+        assert_eq!(snapshot.initial["ai_text_signals"]["score"], 0.0);
     }
 
     #[test]

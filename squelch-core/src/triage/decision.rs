@@ -84,6 +84,12 @@ pub struct AttentionFactors {
     pub personal_relevance: f64,
     pub importance: f64,
     pub attention_at: Option<SupportedTime>,
+    /// Likelihood on [0, 1] that the text driving this attention was
+    /// machine-written. A ranking signal only: it never decides placement,
+    /// because people send AI-drafted mail too. Decisions stored before this
+    /// field existed read as 0.
+    #[serde(default)]
+    pub ai_generated: f64,
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AttentionAction {

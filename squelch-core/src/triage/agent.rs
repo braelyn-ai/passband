@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const PROMPT_VERSION: &str = "agent-triage-v3";
+pub const PROMPT_VERSION: &str = "agent-triage-v4";
 const SYSTEM: &str = include_str!("prompts/agent-v1.txt");
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
@@ -524,6 +524,7 @@ pub fn validate_decision(
             a.factors.action_need,
             a.factors.personal_relevance,
             a.factors.importance,
+            a.factors.ai_generated,
         ]
         .iter()
         .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
@@ -656,6 +657,7 @@ fn attention_schema() -> Value {
                 ("personal_relevance", number()),
                 ("importance", number()),
                 ("attention_at", nullable(time_schema())),
+                ("ai_generated", number()),
             ]),
         ),
         ("relevant_message_ids", array(integer())),

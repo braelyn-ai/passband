@@ -261,6 +261,7 @@ score = 30 * urgency
       + 20 * recency
       +  5 * waiting
       +  2 * importance
+      - 15 * ai_generated * (1 - max(action_need, personal_relevance))
 
 recency = 2 ^ (-hours_since_relevant_activity / recency_half_life_hours)
 waiting = min(unresolved_wait_days / waiting_saturation_days, 1)
@@ -270,7 +271,7 @@ Starting `recency_half_life_hours = 24`, `waiting_saturation_days = 7`. Waiting 
 
 `RankBreakdown` includes raw values, weighted contributions, total, config version, and evaluation time. Return it in human diagnostics; the ordinary UI needs only the useful explanation. Tie-break by relevant activity descending then stable item ID. Pagination freezes ranking time/config and candidate revisions in a short-lived snapshot so changing recency does not duplicate or skip rows between pages. Refresh creates a new snapshot. No semantic ranking SQL scattered across endpoints.
 
-The numeric defaults must be tested on actual examples before shipping. Importance's maximum contribution is deliberately small; configuring it to dominate should require an explicit documented policy change rather than happen accidentally.
+The numeric defaults must be tested on actual examples before shipping. `ai_generated` is the model's likelihood that the text was machine-written, informed by stylometric hints (`triage/ai_text.rs`) passed in its context. It is a penalty only, never a membership rule: people send AI-drafted mail too, so the penalty vanishes as action need or personal relevance approach 1, and the prompt forbids hiding a thread from FYE on authorship alone. Importance's maximum contribution is deliberately small; configuring it to dominate should require an explicit documented policy change rather than happen accidentally.
 
 ## 8. Records and external access
 
@@ -345,6 +346,7 @@ personal_relevance_weight = 20
 recency_weight = 20
 waiting_weight = 5
 importance_weight = 2
+ai_generated_penalty_weight = 15
 recency_half_life_hours = 24
 waiting_saturation_days = 7
 
