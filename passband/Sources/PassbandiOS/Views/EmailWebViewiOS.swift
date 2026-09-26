@@ -131,7 +131,8 @@ struct EmailWebViewRepresentable: UIViewRepresentable {
     @MainActor
     static func buildFrame() -> WebFramePool.Entry {
         let (config, relay) = EmailFrame.makeConfiguration()
-        return WebFramePool.Entry(
-            webView: WKWebView(frame: .zero, configuration: config), relay: relay)
+        let webView = WKWebView(frame: .zero, configuration: config)
+        EmailFrame.pinLightAppearance(webView)
+        return WebFramePool.Entry(webView: webView, relay: relay)
     }
 }

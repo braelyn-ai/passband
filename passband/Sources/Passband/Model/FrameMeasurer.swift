@@ -295,6 +295,7 @@ final class FrameMeasurer {
                 height: viewportHeight),
             configuration: config)
         view.navigationDelegate = relay
+        EmailFrame.pinLightAppearance(view)
         self.frame = view
         self.relay = relay
         return view

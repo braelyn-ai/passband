@@ -481,6 +481,23 @@ enum EmailFrame {
     @MainActor
     static let sharedDataStore: WKWebsiteDataStore = .nonPersistent()
 
+    /// Every email frame answers `prefers-color-scheme: light`, whatever the
+    /// app's appearance. The canvas `document` paints is ALWAYS white, and a
+    /// frame that inherited dark mode would fire the sender's dark stylesheet
+    /// on top of it. Greptile's is the case that caught it: its dark rules turn
+    /// the copy #FEFEFE and darken only `body`, while the inline #FEFEFE on
+    /// its wrapper div stays put, so the whole message was white on white. The
+    /// measuring frame gets the same pin, because the dark rules can also swap
+    /// which logo is displayed and so change the height.
+    @MainActor
+    static func pinLightAppearance(_ view: WKWebView) {
+        #if os(macOS)
+            view.appearance = NSAppearance(named: .aqua)
+        #else
+            view.overrideUserInterfaceStyle = .light
+        #endif
+    }
+
     /// A configuration with all five layers wired, plus the relay that will be
     /// the built frame's permanent hinge. Returned together because the relay is
     /// registered INTO the configuration — a frame cannot be handed one later.
