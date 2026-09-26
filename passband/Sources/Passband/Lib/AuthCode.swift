@@ -101,6 +101,7 @@ extension AuthCopy {
         case .passwordReset: "lock.rotation"
         case .magicLink: "envelope.badge.shield.half.filled"
         case .loginAlert: "exclamationmark.shield.fill"
+        case .securityAlert: "exclamationmark.shield.fill"
         case .verification: "checkmark.seal.fill"
         case .unknown, nil: "key.fill"
         }
@@ -125,11 +126,27 @@ final class AuthDecisions {
     static let shared = AuthDecisions()
 
     /// Kinds that ask the human a question rather than handing them a code.
-    static let decisionKinds: Set<SealedKind> = [.loginAlert, .passwordReset, .magicLink]
+    static let decisionKinds: Set<SealedKind> = [
+        .loginAlert, .securityAlert, .passwordReset, .magicLink,
+    ]
+
+    /// How long an unruled alert stays a question. A sign-in from three weeks
+    /// ago is history, not a decision, and counting it would pin the rail badge
+    /// on a number nobody can work down.
+    static let openWindow: TimeInterval = 7 * 24 * 3600
 
     static func needsDecision(_ kind: SealedKind?) -> Bool {
         guard let kind else { return false }
         return decisionKinds.contains(kind)
+    }
+
+    /// THE definition of an open decision, shared by the Auth page's rail and
+    /// the badge on the Auth rail button so the two can never disagree.
+    func isOpen(_ m: SealedMeta, now: Date = Date()) -> Bool {
+        guard Self.needsDecision(m.kind), decision(m.id) == nil,
+            let received = Fmt.date(m.received_at)
+        else { return false }
+        return now.timeIntervalSince(received) <= Self.openWindow
     }
 
     /// Base name of the stored map; the live key is this scoped to the account.

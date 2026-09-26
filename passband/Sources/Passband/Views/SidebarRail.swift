@@ -338,7 +338,10 @@ private struct RailButton: View {
                         $0.frame(in: .named(railSpace))
                     } action: { onSlot($0) }
 
-                if showRings { AuthRingsOverlay() }
+                if showRings {
+                    AuthRingsOverlay()
+                    AuthDecisionBadge()
+                }
             }
             // THE WHOLE TILE IS THE TARGET. Without this the hit region is the
             // GLYPH, and every rail symbol is an OUTLINE — a click through the
@@ -398,6 +401,37 @@ private struct PracticeRailShake: GeometryEffect {
 
     func effectValue(size: CGSize) -> ProjectionTransform {
         ProjectionTransform(CGAffineTransform(translationX: 3 * sin(progress * .pi * 4), y: 0))
+    }
+}
+
+/// OPEN AUTH DECISIONS — how many sign-in alerts and resets are still waiting
+/// on "was this you?". Counted by `AuthDecisions.isOpen`, the same predicate the
+/// Auth page's rail lists by, so the number here is the number of cards there.
+/// Nothing drawn at zero: an empty badge is noise on the one icon that should
+/// only ever get loud for a reason.
+private struct AuthDecisionBadge: View {
+    @Environment(AppStore.self) private var store
+    private var decisions = AuthDecisions.shared
+
+    private var count: Int { store.sitrep.sealed.count { decisions.isOpen($0) } }
+
+    var body: some View {
+        let count = count
+        if count > 0 {
+            Text(count > 9 ? "9+" : "\(count)")
+                .font(.system(size: 9, weight: .bold).monospacedDigit())
+                .foregroundStyle(.white)
+                .padding(.horizontal, 4)
+                .frame(minWidth: 15, minHeight: 15)
+                .background(Capsule().fill(Palette.lock))
+                .frame(
+                    width: SidebarRail.iconWidth, height: SidebarRail.iconHeight,
+                    alignment: .topTrailing
+                )
+                .offset(x: -3, y: -1)
+                .allowsHitTesting(false)
+                .accessibilityLabel(count == 1 ? "1 decision open" : "\(count) decisions open")
+        }
     }
 }
 

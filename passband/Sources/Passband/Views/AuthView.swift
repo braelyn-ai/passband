@@ -48,7 +48,7 @@ struct AuthView: View {
     private var live: [SealedMeta] { shown.filter { age($0.received_at) <= Self.liveWindow } }
     private var archive: [SealedMeta] { shown.filter { age($0.received_at) > Self.liveWindow } }
     private var openDecisions: [SealedMeta] {
-        visible.filter { AuthDecisions.needsDecision($0.kind) && decisions.decision($0.id) == nil }
+        visible.filter { decisions.isOpen($0) }
     }
 
     /// Seconds since an ISO stamp; huge when missing/invalid (=> treated old).
