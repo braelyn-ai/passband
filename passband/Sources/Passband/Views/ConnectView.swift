@@ -117,8 +117,8 @@ struct ConnectView: View {
     @State private var linkArmed = false
     @State private var arrivedViaPairLink = false
     @State private var showingPairingDetails = false
-    /// The gate was mounted because a saved connection could not be restored
-    /// after the practice inbox. Fixed at mount: the retry it offers is about
+    /// The gate was mounted because a saved connection could not be restored,
+    /// at launch or after the practice inbox. Fixed at mount: the retry it offers is about
     /// the keychain, not about whatever error the form shows later, so it
     /// must outlive the form's own habit of clearing `store.connError`.
     @State private var savedConnectionFailed = false
@@ -169,7 +169,7 @@ struct ConnectView: View {
             // Commit the initial route before the form can edit/clear an
             // error. Later error changes must never send it back to welcome.
             if purpose == .gate {
-                if case .introduction = gateStep, store.tour.hasLeftPractice, store.connError != nil {
+                if case .introduction = gateStep, isReturning, store.connError != nil {
                     // The saved account's own host goes in the form, so a
                     // hosted person is not handed a localhost self-host form
                     // with a pairing-link instruction for a link that never came.
@@ -192,9 +192,23 @@ struct ConnectView: View {
         }
     }
 
-    /// A practice exit may need credentials, but never the intro again.
+    /// Somebody the intro is not for: they left the practice inbox this
+    /// session, or they have a saved account that failed to restore at launch.
+    /// `hasLeftPractice` alone is session-only, so without the second arm every
+    /// launch whose restore failed (a revoked token, a keychain panel denied
+    /// after an update, a daemon too old for this build) showed a long-time
+    /// user the first-run cold open and a welcome screen with no error on it.
+    /// A fresh install has no active account and loadSettings clears
+    /// `connError` for it, so the intro stays theirs.
+    private var isReturning: Bool {
+        store.tour.hasLeftPractice
+            || (AccountManager.shared.active != nil && store.connError != nil)
+    }
+
+    /// A practice exit or a failed restore may need credentials, but never the
+    /// intro again.
     private var effectiveGateStep: ConnectGateStep {
-        if case .introduction = gateStep, store.tour.hasLeftPractice {
+        if case .introduction = gateStep, isReturning {
             // A saved connection that failed to restore needs the form and
             // its existing error, not the first-time hosting introduction —
             // and the form for the KIND of daemon that account was.
