@@ -12,6 +12,35 @@ updates itself, the phone comes through TestFlight, and the daemon is
 rolled onto hosted accounts or pulled as an image on a self-host box,
 so every note says which one it landed in.
 
+## 0.0.8 (2026-09-25)
+
+Biggest update by far. Now we're a real product?
+
+### Mac
+
+- Rebuilt onboarding
+- Attach files to emails
+- Undo send for 5s
+- New email composer
+- Completely overhauled search functionality
+- Automatic agentic search
+- "Newsletters" is now named "Reading"
+- Better reading experience
+- New compose and search buttons
+- Better package tracking
+- Zoom with Cmd+, Cmd- and Cmd-0
+- Audit log is moved to settings
+
+### Daemon
+
+- Rebuilt triage from the ground up
+- Instant notifications for important emails only
+- For Your Eyes is ranked with importance AND recency
+- Shipments record the item name, merchant and order numbers
+- Login-code emails produce "Your <service> login code is <code>" pushes when the code appears verbatim in the email
+- get_inbox_updates and get_thread include the sender's standing instruction (your sender rule's text) with the mail it applies to
+- Plus substantial performance improvements and plenty of bug fixes!
+
 ## 0.0.7 (2026-09-08)
 
 Deeper search, gmail spam, and 2FA codes the moment they land.
